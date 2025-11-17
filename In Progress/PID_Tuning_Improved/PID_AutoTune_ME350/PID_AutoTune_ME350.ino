@@ -67,7 +67,7 @@ float derivative = 0;
 
 const long DEADBAND = 5;  // Encoder counts
 const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz)
-const float TEST_MAX_VOLTAGE = 5.0;  // Base max drive during manual tests to reduce slam
+const float TEST_MAX_VOLTAGE = 6.0;  // Base max drive during manual tests
 const unsigned long LOG_INTERVAL_MS = 30; // Logging cadence for manual tests/moves
 
 // ============================================================================
@@ -700,9 +700,9 @@ void autoTuneZieglerNichols() {
   // Relay parameters
   const float TEST_VOLTAGE = 5.0;  // Relay amplitude
   const long HYSTERESIS = TOTAL_RANGE / 6;  // Oscillation band
-  const int TARGET_PEAKS = 20;       // desired peaks for better averaging
-  const int MIN_PEAKS = 16;          // minimum acceptable
-  const unsigned long TIMEOUT = 120000;  // 120 seconds
+  const int TARGET_PEAKS = 24;       // desired peaks for better averaging
+  const int MIN_PEAKS = 18;          // minimum acceptable
+  const unsigned long TIMEOUT = 140000;  // 140 seconds
 
   Serial.println(F("\nStarting relay oscillation test..."));
   Serial.print(F("Test voltage: "));
@@ -1045,6 +1045,14 @@ void manualPositionTest() {
   while (millis() - startTime < 5000) {  // 5 second test
     // Update PID
     float voltage = updatePID(targetPosition);
+    // Reduce integral when the sign of the error flips to limit overshoot
+    if ((error != 0) && (error * lastError < 0)) {
+      integral *= 0.5;  // soften windup on zero crossing
+    }
+    // Soften integral accumulation when far from target to reduce big swings
+    if (abs(error) > 600) {
+      integral *= 0.95;  // bleed off a bit when very far
+    }
     float applied = cappedVoltageForError(voltage, error);
     setMotorVoltage(applied);
 
@@ -1166,6 +1174,12 @@ void manualMoveTo(long targetPosition) {
 
   while (millis() - startTime < 5000) {  // 5 second window
     float voltage = updatePID(targetPosition);
+    if ((error != 0) && (error * lastError < 0)) {
+      integral *= 0.5;
+    }
+    if (abs(error) > 600) {
+      integral *= 0.95;
+    }
     float applied = cappedVoltageForError(voltage, error);
     setMotorVoltage(applied);
 
@@ -1421,10 +1435,12 @@ void clearCalibration() {
 }
 float cappedVoltageForError(float voltage, long error) {
   long absErr = abs(error);
-  float cap = TEST_MAX_VOLTAGE;
-  if (absErr > 800) cap = min(cap, 4.5f);
-  else if (absErr > 400) cap = min(cap, 4.0f);
-  else if (absErr > 200) cap = min(cap, 3.5f);
-  else cap = min(cap, 3.0f);
+  float cap;
+  if (absErr > 800) cap = 5.0f;
+  else if (absErr > 600) cap = 4.5f;
+  else if (absErr > 400) cap = 4.0f;
+  else if (absErr > 200) cap = 3.5f;
+  else cap = 3.0f;
+  cap = min(cap, TEST_MAX_VOLTAGE);
   return constrain(voltage, -cap, cap);
 }
