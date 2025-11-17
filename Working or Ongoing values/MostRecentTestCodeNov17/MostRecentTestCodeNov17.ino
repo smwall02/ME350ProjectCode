@@ -17,6 +17,9 @@
 #define PROX_SENSOR_3 A2
 #define PROX_SENSOR_4 A3
 
+// Flip (enable) switch
+#define ON_OFF_SWITCH_PIN 5  // HIGH = enabled, LOW = stop
+
 Encoder encoder(ENCODER_A, ENCODER_B);
 
 #define EEPROM_FRICTION_RIGHT 0
@@ -436,13 +439,15 @@ void setup() {
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_IN3, OUTPUT);
   
-  pinMode(LIMIT_LEFT, INPUT_PULLUP);
-  pinMode(LIMIT_RIGHT, INPUT_PULLUP);
+  pinMode(LIMIT_LEFT, INPUT_PULLUP);  // active HIGH per hardware wiring
+  pinMode(LIMIT_RIGHT, INPUT_PULLUP); // active HIGH per hardware wiring
   
   pinMode(PROX_SENSOR_1, INPUT);
   pinMode(PROX_SENSOR_2, INPUT);
   pinMode(PROX_SENSOR_3, INPUT);
   pinMode(PROX_SENSOR_4, INPUT);
+
+  pinMode(ON_OFF_SWITCH_PIN, INPUT_PULLUP);
   
   stopMotor();
   delay(500);
@@ -479,7 +484,16 @@ void setup() {
 
 void loop() {
   unsigned long currentTime = millis();
-  
+
+  // Flip switch safety: if off, stop and skip control
+  if (digitalRead(ON_OFF_SWITCH_PIN) == LOW) {
+    stopMotor();
+    systemEnabled = false;
+    errorIntegral = 0;
+    voltageBoost = 0;
+    return;
+  }
+
   if (Serial.available() > 0) {
     processCommand();
   }
@@ -844,6 +858,11 @@ void runPIDControl() {
 }
 
 void setMotor(float voltage) {
+  if (digitalRead(ON_OFF_SWITCH_PIN) == LOW) {
+    stopMotor();
+    return;
+  }
+
   voltage = constrain(voltage, -10.0, 10.0);
   int pwm = abs(voltage) * 25.5;
   
@@ -868,11 +887,11 @@ void stopMotor() {
 }
 
 bool leftPressed() {
-  return digitalRead(LIMIT_LEFT) == LOW;
+  return digitalRead(LIMIT_LEFT) == HIGH;
 }
 
 bool rightPressed() {
-  return digitalRead(LIMIT_RIGHT) == LOW;
+  return digitalRead(LIMIT_RIGHT) == HIGH;
 }
 
 void checkLimitSwitches() {

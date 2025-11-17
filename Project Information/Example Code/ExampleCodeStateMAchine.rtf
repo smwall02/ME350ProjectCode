@@ -1,0 +1,722 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2865
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\froman\fcharset0 Times-Italic;}
+{\colortbl;\red255\green255\blue255;\red128\green128\blue128;}
+{\*\expandedcolortbl;;\csgenericrgb\c50196\c50196\c50196;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\deftab720
+\pard\pardeftab720\partightenfactor0
+
+\f0\i\fs20 \cf2 1 \cf0 // ME350 Zombie Defense Sketch - Version 05.1 by Spencer Dickhudt\
+\cf2 2 \cf0 // updated 12-5-2024\
+\cf2 3 \cf0 //\
+\cf2 4 \cf0 //\
+\cf2 5\
+6 \cf0 //////////////////////////////////////////////\
+\cf2 7 \cf0 // DEFINE CONSTANTS AND GLOBAL VARIABLES: //\
+\cf2 8 \cf0 //////////////////////////////////////////////\
+\cf2 9\
+10 \cf0 //** State Machine: **//\
+\cf2 11 \cf0 // CONSTANTS:\
+\cf2 12 \cf0 // Definition of states in the state machine\
+\cf2 13 \cf0 const int CALIBRATE = 1;\
+\cf2 14 \cf0 const int CHOOSE_ACTIVE_TARGET = 2;\
+\cf2 15 \cf0 const int MOVE_TO_TARGET = 3;\
+\cf2 16\
+17 \cf0 // VARIABLES:\
+\cf2 18 \cf0 // Global variable that keeps track of the state:\
+\cf2 19 \cf0 // Start the state machine in calibration state:\
+\cf2 20 \cf0 int state = CALIBRATE;\
+\cf2 21\
+22 \cf0 //** Proximity Sensors or Potentiometer: **//\
+\cf2 23 \cf0 // CONSTANTS:\
+\cf2 24 \cf0 // Definition of proximity sensor Limits for each target:\
+\cf2 25 \cf0 const int PROXIMITYSENSE1_MAX = 0; // [proximity sensor counts] Value of prox sensor\
+1 when zombie is closest to photosensor\
+\cf2 26 \cf0 const int PROXIMITYSENSE1_MIN = 0; // [proximity sensor counts] Value of prox sensor\
+1 when zombie is closest to prox sensor\
+\cf2 27 \cf0 const int PROXIMITYSENSE2_MAX = 0; // [proximity sensor counts] Value of prox sensor\
+2 when zombie is closest to photosensor\
+\cf2 28 \cf0 const int PROXIMITYSENSE2_MIN = 0; // [proximity sensor counts] Value of prox sensor\
+2 when zombie is closest to prox sensor\
+\cf2 29 \cf0 const int PROXIMITYSENSE3_MAX = 0; // [proximity sensor counts] Value of prox sensor\
+3 when zombie is closest to photosensor\
+\cf2 30 \cf0 const int PROXIMITYSENSE3_MIN = 0; // [proximity sensor counts] Value of prox sensor\
+3 when zombie is closest to prox sensor\
+\cf2 31 \cf0 const int PROXIMITYSENSE4_MAX = 0; // [proximity sensor counts] Value of prox sensor\
+4 when zombie is closest to photosensor\
+\cf2 32 \cf0 const int PROXIMITYSENSE4_MIN = 0; // [proximity sensor counts] Value of prox sensor\
+4 when zombie is closest to prox sensor\
+\cf2 33\
+34 \cf0 const int ProxRange[4][2] = \{\{PROXIMITYSENSE1_MAX, PROXIMITYSENSE1_MIN\},\
+\cf2 35 \cf0 \{PROXIMITYSENSE2_MAX, PROXIMITYSENSE2_MIN\},\
+\cf2 36 \cf0 \{PROXIMITYSENSE3_MAX, PROXIMITYSENSE3_MIN\},\
+\cf2 37 \cf0 \{PROXIMITYSENSE4_MAX, PROXIMITYSENSE4_MIN\}\}; // Array\
+holding prox sensor bounds to improve code readability\
+\cf2 38\
+39 \cf0 // Definition of target variables for array indexing\
+\cf2 40 \cf0 const int TARGET1 = 0; // For indexing into activeTargets array, activeTargets[0]\
+corresponds to Target 1\
+\cf2 41 \cf0 const int TARGET2 = 1; // For indexing into activeTargets array, activeTargets[1]\
+corresponds to Target 2\
+\cf2 42 \cf0 const int TARGET3 = 2; // For indexing into activeTargets array, activeTargets[2]\
+corresponds to Target 3\
+\cf2 43 \cf0 const int TARGET4 = 3; // For indexing into activeTargets array, activeTargets[3]\
+corresponds to Target 4\
+\cf2 44\
+45 \cf0 const int targetArr[4] = \{ TARGET1, TARGET2, TARGET3, TARGET4 \}; // List of target\
+indices to reduce redundant code\
+\cf2 46\
+47 \cf0 // Direction variables to represent the movement of each zombie\
+\cf2 48 \cf0 const int FORWARD = 1; // representing the zombie moving towards the photosensor\
+\cf2 49 \cf0 const int BACKWARD = -1; // representing the zombie moving away from the photosensor\
+\cf2 50 \cf0 const int STOPPED = 0; // representing the zombie stalled\
+\cf2 51\
+52 \cf0 // VARIABLES:\
+\cf2 53 \cf0 // Variables for updating sensor readings\
+\cf2 54 \cf0 const float alpha = 0.925; // filter parameter used to weight current and\
+past readings\
+\cf2 55 \cf0 int stopTimeout = 250; // [millis] time needed to declare a zombie stopped\
+\cf2 56 \cf0 int noiseLimit = 8; // average spread of proximity readings for a\
+stopped zombie\
+\cf2 57 \cf0 const int lowerNoiseLimit = 5; // noise limit for near the photosensors\
+\cf2 58 \cf0 const int upperNoiseLimit = 8; // noise limit for near the prox sensors\
+\cf2 59 \cf0 const int noiseThreshold = 225; // prox sensor reading at which noise limit\
+switches from upper to lower\
+\cf2 60\
+61 \cf0 // A data structure to hold proximity sensor information:\
+\cf2 62 \cf0 struct Sensor\{\
+\cf2 63 \cf0 float currVal; // the most recent proximity sensor reading\
+\cf2 64 \cf0 float prevVal; // the last update of proximity sensor reading\
+\cf2 65 \cf0 unsigned long prevChangeTime; // [millis] the time at which prevVal last changed\
+\cf2 66 \cf0 int pin; // the input pin of the desired prox sensor\
+\cf2 67 \cf0 int direction; // the direction at which the zombie on the rail is\
+traveling\
+\cf2 68 \cf0 int forwardCount; // number of readings which indicate the zombie is\
+moving forward\
+\cf2 69 \cf0 int backwardCount; // number of readings which indicate the zombie is\
+moving backward\
+\cf2 70 \cf0 \};\
+\cf2 71\
+72 \cf0 Sensor ProxSensors[4]; // An array which holds Sensor objects, representing\
+each of the prox sensors\
+\cf2 73 \cf0 int potValue = 0; // Used to hold the reading of the potentiometer\
+\cf2 74\
+75 \cf0 int activeTargetIndex = -1; // index (in the activeTargets array) of the closest\
+target to the plants\
+\cf2 76 \cf0 int activeTargetPosition = -1; // [encoder counts] Encoder count of the active target\
+the linkage is moving toward\
+\cf2 77\
+78 \cf0 int minIndex = -1; // tracking index of the zombie who is closest to the\
+plants\
+\cf2 79 \cf0 float closestZombieDist = 2; // [percentage] records the lowest percentage of rail\
+remaining for any of the zombies\
+\cf2 80 \cf0 int idx = -1; // index of target, based on targetArr\
+\cf2 81\
+82 \cf0 bool WAIT_POS = true; // tracking if the linkage is moving to the wait position\
+\cf2 83\
+84 \cf0 unsigned long arrivalTime; // timer for tracking a wait period upon reaching\
+a desired position\
+\cf2 85 \cf0 const int targetActivateTime = 350; // time to activate a target\
+\cf2 86 \cf0 float Zombies[4]; // An array to hold information on locations of\
+all zombies in play\
+\cf2 87\
+88 \cf0 // float sampleTime = 1.5 // sample time in ms\
+\cf2 89\
+90 \cf0 //** Computation of position and velocity: **//\
+\cf2 91 \cf0 // CONSTANTS:\
+\cf2 92 \cf0 // Settings for velocity computation:\
+\cf2 93 \cf0 const int MIN_VEL_COMP_COUNT = 2; // [encoder counts] Minimal change in motor\
+position that must happen between two velocity measurements\
+\cf2 94 \cf0 const long MIN_VEL_COMP_TIME = 10000; // [microseconds] Minimal time that must pass\
+between two velocity measurements\
+\cf2 95 \cf0 // VARIABLES:\
+\cf2 96 \cf0 volatile int motorPosition = 0; // [encoder counts] Current motor position (Declared\
+'volatile', since it is updated in a function called by interrupts)\
+\cf2 97 \cf0 volatile int encoderStatus = 0; // [binary] Past and Current A&B values of the encoder\
+(Declared 'volatile', since it is updated in a function called by interrupts)\
+\cf2 98 \cf0 // The rightmost two bits of encoderStatus will store the encoder values from the\
+current iteration (A and B).\
+\cf2 99 \cf0 // The two bits to the left of those will store the encoder values from the previous\
+iteration (A_old and B_old).\
+\cf2 100 \cf0 float motorVelocity = 0; // [encoder counts / seconds] Current motor velocity\
+\cf2 101 \cf0 int previousMotorPosition = 0; // [encoder counts] Motor position the last time a\
+velocity was computed\
+\cf2 102 \cf0 long previousVelCompTime = 0; // [microseconds] System clock value the last time a\
+velocity was computed\
+\cf2 103\
+104 \cf0 //** High-level behavior of the controller: **//\
+\cf2 105 \cf0 // CONSTANTS:\
+\cf2 106 \cf0 // Target positions:\
+\cf2 107 \cf0 const int CALIBRATION_VOLTAGE = 0; // [Volt] Motor voltage used during the calibration\
+process\
+\cf2 108 \cf0 const int TARGET_1_POSITION = 0; // [encoder counts] Motor position corresponding to\
+first target\
+\cf2 109 \cf0 const int TARGET_2_POSITION = 0; // [encoder counts] Motor position corresponding to\
+second target\
+\cf2 110 \cf0 const int TARGET_3_POSITION = 0; // [encoder counts] Motor position corresponding to\
+third target\
+\cf2 111 \cf0 const int TARGET_4_POSITION = 0; // [encoder counts] Motor position corresponding to\
+fourth target\
+\cf2 112 \cf0 const int WAIT_POSITION = TARGET_3_POSITION; // [encoder counts] Motor position\
+corresponding to a wait position (when no targets are active)\
+\cf2 113 \cf0 const int LOWER_BOUND = TARGET_1_POSITION; // [encoder counts] Position of the\
+left end stop\
+\cf2 114 \cf0 const int UPPER_BOUND = TARGET_4_POSITION; // [encoder counts] Position of the\
+right end stop\
+\cf2 115 \cf0 const int TARGET_BAND = 5; // [encoder counts] "Close enough" range when moving\
+towards a target.\
+\cf2 116\
+117 \cf0 // List of target positions to reduce redundant code\
+\cf2 118 \cf0 const int targetPos[4] = \{TARGET_1_POSITION, TARGET_2_POSITION, TARGET_3_POSITION,\
+TARGET_4_POSITION\};\
+\cf2 119\
+120 \cf0 // Timing:\
+\cf2 121 \cf0 //const long WAIT_TIME = 0; // [microseconds] Time waiting for the target to\
+drop.\
+\cf2 122 \cf0 // TBD - implement a timer so if the target\
+doesn't drop, the linkage moves to a different\
+target\
+\cf2 123 \cf0 // VARIABLES:\
+\cf2 124 \cf0 //unsigned long startWaitTime; // [microseconds] System clock value\
+\cf2 125\
+126 \cf0 //** PID Controller **//\
+\cf2 127 \cf0 // CONSTANTS:\
+\cf2 128 \cf0 const float KP = 0; // [Volt / encoder counts] P-Gain\
+\cf2 129 \cf0 const float KI = 0; // [Volt / (encoder counts *\
+seconds)] I-Gain\
+\cf2 130 \cf0 const float KD = 0; // [Volt * seconds / encoder\
+counts] D-Gain\
+\cf2 131 \cf0 const float SUPPLY_VOLTAGE = 0; // [Volt] Supply voltage at the\
+HBridge\
+\cf2 132 \cf0 const float FRICTION_COMP_VOLTAGE = 0; // [Volt] Voltage needed to\
+overcome friction\
+\cf2 133 \cf0 // VARIABLES:\
+\cf2 134 \cf0 int desiredPosition = 0; // [encoder counts] desired motor position\
+\cf2 135 \cf0 float positionError = 0; // [encoder counts] Position error\
+\cf2 136 \cf0 float integralError = 0; // [encoder counts * seconds] Integrated position error\
+\cf2 137 \cf0 float velocityError = 0; // [encoder counts / seconds] Velocity error\
+\cf2 138 \cf0 float desiredVoltage = 0; // [Volt] Desired motor voltage\
+\cf2 139 \cf0 int motorCommand = 0; // [0-255] PWM signal sent to the motor\
+\cf2 140 \cf0 unsigned long executionDuration = 0; // [microseconds] Time between this and the\
+previous loop execution. Variable used for integrals and derivatives\
+\cf2 141 \cf0 unsigned long lastExecutionTime = 0; // [microseconds] System clock value at the moment\
+the loop was started the last time\
+\cf2 142\
+143 \cf0 //** Pin assignment: **//\
+\cf2 144 \cf0 // CONSTANTS:\
+\cf2 145 \cf0 const int PIN_NR_ENCODER_A = 2; // Never change these, since the interrupts are\
+attached to pins 2 and 3\
+\cf2 146 \cf0 const int PIN_NR_ENCODER_B = 3; // Never change these, since the interrupts are\
+attached to pins 2 and 3\
+\cf2 147 \cf0 const int PIN_NR_ON_OFF_SWITCH = 5; // Connected to toggle switch (turns mechanism\
+on and off)\
+\cf2 148 \cf0 const int PIN_NRL_LIMIT_SWITCH = 8; // Connected to limit switch (mechanism\
+calibration)\
+\cf2 149 \cf0 const int PIN_NR_PWM_OUTPUT = 11; // Connected to H Bridge (controls motor speed)\
+\cf2 150 \cf0 const int PIN_NR_PWM_DIRECTION_1 = 12; // Connected to H Bridge (controls motor\
+direction)\
+\cf2 151 \cf0 const int PIN_NR_PWM_DIRECTION_2 = 13; // Connected to H Bridge (controls motor\
+direction)\
+\cf2 152 \cf0 const int PIN_PROXSENSE1 = A0; // Connected to proximity sensor 1\
+\cf2 153 \cf0 const int PIN_PROXSENSE2 = A1; // Connected to proximity sensor 2\
+\cf2 154 \cf0 const int PIN_PROXSENSE3 = A2; // Connected to proximity sensor 3\
+\cf2 155 \cf0 const int PIN_PROXSENSE4 = A3; // Connected to proximity sensor 4\
+\cf2 156 \cf0 const int PIN_POTENTIOMETER = A4; // Connected to potentiometer used to test\
+target positions\
+\cf2 157\
+158\
+159 \cf0 // Add this line of code if you want to use two limit switches; const int\
+PIN_NRL_LIMIT_SWITCH_2 = 11\
+\cf2 160 \cf0 // ^KEEP IN MIND THAT YOU HAVE TO ADD CODE DOWNSTREAM (FOR EXAMPLE YOU NEED TO ADD THIS\
+VARIABLE IN THE DECLARATION SECTION\
+\cf2 161\
+162 \cf0 // End of CONSTANTS AND GLOBAL VARIABLES\
+\cf2 163\
+164\
+165 \cf0 /////////////////////////////////////////////////////////////////////////////////////////\
+/\
+\cf2 166 \cf0 // The setup() function is called when a sketch starts. Use it to initialize variables,\
+//\
+\cf2 167 \cf0 // pin modes, start using libraries, etc. The setup function will only run once, after\
+//\
+\cf2 168 \cf0 // each powerup or reset of the Arduino board:\
+//\
+\cf2 169 \cf0 /////////////////////////////////////////////////////////////////////////////////////////\
+/\
+\cf2 170 \cf0 void setup() \{\
+\cf2 171 \cf0 // Declare which digital pins are inputs and which are outputs:\
+\cf2 172 \cf0 pinMode(PIN_NR_ENCODER_A, INPUT_PULLUP);\
+\cf2 173 \cf0 pinMode(PIN_NR_ENCODER_B, INPUT_PULLUP);\
+\cf2 174 \cf0 pinMode(PIN_NR_ON_OFF_SWITCH, INPUT);\
+\cf2 175 \cf0 pinMode(PIN_NRL_LIMIT_SWITCH, INPUT);\
+\cf2 176 \cf0 pinMode(PIN_PROXSENSE1, INPUT);\
+\cf2 177 \cf0 pinMode(PIN_PROXSENSE2, INPUT);\
+\cf2 178 \cf0 pinMode(PIN_PROXSENSE3, INPUT);\
+\cf2 179 \cf0 pinMode(PIN_PROXSENSE4, INPUT);\
+\cf2 180 \cf0 pinMode(PIN_NR_PWM_OUTPUT, OUTPUT);\
+\cf2 181 \cf0 pinMode(PIN_NR_PWM_DIRECTION_1, OUTPUT);\
+\cf2 182 \cf0 pinMode(PIN_NR_PWM_DIRECTION_2, OUTPUT);\
+\cf2 183 \cf0 pinMode(PIN_POTENTIOMETER, INPUT);\
+\cf2 184\
+185 \cf0 // Turn on the pullup resistors on the encoder channels\
+\cf2 186 \cf0 digitalWrite(PIN_NR_ENCODER_A, HIGH);\
+\cf2 187 \cf0 digitalWrite(PIN_NR_ENCODER_B, HIGH);\
+\cf2 188\
+189 \cf0 // Activate interrupt for encoder pins.\
+\cf2 190 \cf0 // If either of the two pins changes, the function 'updateMotorPosition' is called:\
+\cf2 191 \cf0 attachInterrupt(0, updateMotorPosition, CHANGE); // Interrupt 0 is always attached to\
+digital pin 2\
+\cf2 192 \cf0 attachInterrupt(1, updateMotorPosition, CHANGE); // Interrupt 1 is always attached to\
+digital pin 3\
+\cf2 193\
+194 \cf0 // Begin serial communication for monitoring.\
+\cf2 195 \cf0 Serial.begin(115200);\
+\cf2 196 \cf0 Serial.println("Start Executing Program.");\
+\cf2 197\
+198 \cf0 // Initialize sensor values\
+\cf2 199 \cf0 ProxSensors[TARGET1].prevVal = analogRead(PIN_PROXSENSE1);\
+\cf2 200 \cf0 ProxSensors[TARGET2].prevVal = analogRead(PIN_PROXSENSE2);\
+\cf2 201 \cf0 ProxSensors[TARGET3].prevVal = analogRead(PIN_PROXSENSE3);\
+\cf2 202 \cf0 ProxSensors[TARGET4].prevVal = analogRead(PIN_PROXSENSE4);\
+\cf2 203\
+204 \cf0 // Initialize prox sensor pins\
+\cf2 205 \cf0 ProxSensors[TARGET1].pin = PIN_PROXSENSE1;\
+\cf2 206 \cf0 ProxSensors[TARGET2].pin = PIN_PROXSENSE2;\
+\cf2 207 \cf0 ProxSensors[TARGET3].pin = PIN_PROXSENSE3;\
+\cf2 208 \cf0 ProxSensors[TARGET4].pin = PIN_PROXSENSE4;\
+\cf2 209\
+210 \cf0 // Set initial output to the motor to 0\
+\cf2 211 \cf0 analogWrite(PIN_NR_PWM_OUTPUT, 0);\
+\cf2 212 \cf0 \}\
+\cf2 213 \cf0 // End of function setup()\
+\cf2 214\
+215\
+216 \cf0 /////////////////////////////////////////////////////////////////////////////////////////\
+///////\
+\cf2 217 \cf0 // After going through the setup() function, which initializes and sets the initial\
+values, //\
+\cf2 218 \cf0 // the loop() function does precisely what its name suggests, and loops\
+consecutively, //\
+\cf2 219 \cf0 // allowing your program to sense and respond. Use it to actively control the Arduino\
+board. //\
+\cf2 220 \cf0 /////////////////////////////////////////////////////////////////////////////////////////\
+///////\
+\cf2 221 \cf0 void loop() \{\
+\cf2 222 \cf0 // Determine the duration it took to execute the last loop. This time is used\
+\cf2 223 \cf0 // for integration and for monitoring the loop time via the serial monitor.\
+\cf2 224 \cf0 executionDuration = micros() - lastExecutionTime;\
+\cf2 225 \cf0 lastExecutionTime = micros();\
+\cf2 226\
+227 \cf0 // Speed Computation:\
+\cf2 228 \cf0 if ((abs(motorPosition - previousMotorPosition) > MIN_VEL_COMP_COUNT) || (micros() -\
+previousVelCompTime) > MIN_VEL_COMP_TIME)\{\
+\cf2 229 \cf0 // If at least a minimum time interval has elapsed or\
+\cf2 230 \cf0 // the motor has travelled through at least a minimum angle ...\
+\cf2 231 \cf0 // .. compute a new value for speed:\
+\cf2 232 \cf0 // (speed = delta angle [encoder counts] divided by delta time [seconds])\
+\cf2 233 \cf0 motorVelocity = (double)(motorPosition - previousMotorPosition) * 1000000 /\
+\cf2 234 \cf0 (micros() - previousVelCompTime);\
+\cf2 235 \cf0 // Remember this encoder count and time for the next iteration:\
+\cf2 236 \cf0 previousMotorPosition = motorPosition;\
+\cf2 237 \cf0 previousVelCompTime = micros();\
+\cf2 238 \cf0 \}\
+\cf2 239 \cf0 // *****************************************************************************//\
+\cf2 240 \cf0 // We first update the sensors so our direction information stays accurate\
+\cf2 241\
+242 \cf0 // Loop through each of the sensors\
+\cf2 243 \cf0 for (int i = 0; i < sizeof(targetArr)/sizeof(int); i++) \{\
+\cf2 244\
+245 \cf0 idx = targetArr[i];\
+\cf2 246 \cf0 // Updates the current sensor reading using a low pass filter\
+\cf2 247 \cf0 ProxSensors[idx].currVal = alpha * ProxSensors[idx].currVal + (1 - alpha) *\
+analogRead(ProxSensors[idx].pin);\
+\cf2 248\
+249 \cf0 // Adjusts the noise Limit based on distance to sensor (since values are not linear)\
+\cf2 250 \cf0 if (ProxSensors[idx].currVal >= noiseThreshold) \{\
+\cf2 251 \cf0 noiseLimit = upperNoiseLimit;\
+\cf2 252 \cf0 \} else \{\
+\cf2 253 \cf0 noiseLimit = lowerNoiseLimit;\
+\cf2 254 \cf0 \}\
+\cf2 255\
+256 \cf0 // Check if sensor is stopped\
+\cf2 257 \cf0 if (abs(ProxSensors[idx].currVal - ProxSensors[idx].prevVal) < noiseLimit) \{\
+\cf2 258 \cf0 // if not enough time has passed to declare stopped or already stopped continue\
+loop\
+\cf2 259 \cf0 if (millis() - ProxSensors[idx].prevChangeTime < stopTimeout ||\
+ProxSensors[idx].direction == STOPPED) \{\
+\cf2 260 \cf0 ProxSensors[i].forwardCount = 0;\
+\cf2 261 \cf0 ProxSensors[i].backwardCount = 0;\
+\cf2 262 \cf0 continue;\
+\cf2 263 \cf0 \} else \{\
+\cf2 264 \cf0 // the prox sensor has been stopped for long enough that we know it is stopped\
+\cf2 265 \cf0 ProxSensors[idx].direction = STOPPED;\
+\cf2 266 \cf0 \}\
+\cf2 267 \cf0 \} else if (ProxSensors[idx].currVal - ProxSensors[idx].prevVal < 0)\{\
+\cf2 268 \cf0 // Target is moving forward, as readings decrease moving further away from the\
+sensor\
+\cf2 269 \cf0 ProxSensors[i].forwardCount += 1;\
+\cf2 270 \cf0 // Target is moving forward\
+\cf2 271 \cf0 if (ProxSensors[i].forwardCount > 3)\{\
+\cf2 272 \cf0 ProxSensors[i].direction = FORWARD;\
+\cf2 273\
+274 \cf0 ProxSensors[i].prevVal = ProxSensors[i].currVal;\
+\cf2 275 \cf0 ProxSensors[i].prevChangeTime = millis();\
+\cf2 276 \cf0 \}\
+\cf2 277 \cf0 \} else \{\
+\cf2 278 \cf0 // Target must be moving backward\
+\cf2 279 \cf0 ProxSensors[i].backwardCount += 1;\
+\cf2 280 \cf0 // Target is moving forward\
+\cf2 281 \cf0 if (ProxSensors[i].backwardCount > 3)\{\
+\cf2 282 \cf0 ProxSensors[i].direction = BACKWARD;\
+\cf2 283\
+284 \cf0 ProxSensors[i].prevVal = ProxSensors[i].currVal;\
+\cf2 285 \cf0 ProxSensors[i].prevChangeTime = millis();\
+\cf2 286 \cf0 \}\
+\cf2 287 \cf0 \}\
+\cf2 288 \cf0 \}\
+\cf2 289 \cf0 // *****************************************************************************//\
+\cf2 290\
+291 \cf0 //******************************************************************************//\
+\cf2 292 \cf0 // The state machine:\
+\cf2 293 \cf0 switch (state) \{\
+\cf2 294 \cf0 //****************************************************************************//\
+\cf2 295 \cf0 // In the CALIBRATE state, we move the mechanism to a position outside of the\
+\cf2 296 \cf0 // work space (towards the limit switch). Once the limit switch is on and\
+\cf2 297 \cf0 // the motor has stopped turning, we know that we are against the end stop\
+\cf2 298 \cf0 case CALIBRATE:\
+\cf2 299 \cf0 // We don't have to do anything here since this state is only used to set\
+\cf2 300 \cf0 // a fixed output voltage. This happens further below.\
+\cf2 301\
+302 \cf0 // Decide what to do next:\
+\cf2 303 \cf0 if (digitalRead(PIN_NRL_LIMIT_SWITCH)==HIGH && motorVelocity==0) \{\
+\cf2 304 \cf0 // We reached the endstop. Update the motor position to the limit:\
+\cf2 305 \cf0 // (NOTE: If the limit switch is on the right, this must be UPPER_BOUND)\
+\cf2 306 \cf0 motorPosition = LOWER_BOUND;\
+\cf2 307 \cf0 // Reset the error integrator:\
+\cf2 308 \cf0 integralError = 0;\
+\cf2 309 \cf0 // Calibration is finalized. Transition into DETERMINE_ACTIVE_TARGETS state\
+\cf2 310 \cf0 Serial.println("State transition from CALIBRATE to CHOOSE_ACTIVE_TARGET");\
+\cf2 311 \cf0 state = CHOOSE_ACTIVE_TARGET;\
+\cf2 312 \cf0 \}\
+\cf2 313\
+314 \cf0 // Otherwise we continue calibrating\
+\cf2 315 \cf0 break;\
+\cf2 316\
+317 \cf0 //****************************************************************************//\
+\cf2 318 \cf0 // In the DETERMINE_ACTIVE_TARGETS state, we use the most recent reading of the\
+photosensors to\
+\cf2 319 \cf0 // calculate the location of each zombie.\
+\cf2 320 \cf0 // We then select an active target to move toward based on which zombie is closest\
+to the plants.\
+\cf2 321 \cf0 // We default to WAIT_POSITION if no targets are active.\
+\cf2 322 \cf0 case CHOOSE_ACTIVE_TARGET:\
+\cf2 323\
+324 \cf0 // Decide what zombie is closest to the photosensor\
+\cf2 325 \cf0 // Current closest zombie is out of bounds\
+\cf2 326 \cf0 minIndex = -1;\
+\cf2 327 \cf0 // Set distance to 2 to be above any possible percentage values + noise\
+\cf2 328 \cf0 closestZombieDist = 2;\
+\cf2 329\
+330 \cf0 for (int i = 0; i < sizeof(targetArr)/sizeof(int); i++) \{\
+\cf2 331 \cf0 // Use the target array for the proper indexes into other arrays\
+\cf2 332 \cf0 idx = targetArr[i];\
+\cf2 333\
+334 \cf0 // Calculate the distance to the front of the rail by taking a percentage of how\
+much rail\
+\cf2 335 \cf0 // the zombie has left to travel.\
+\cf2 336 \cf0 Zombies[idx] = (ProxSensors[idx].currVal - ProxRange[idx][1]) /\
+(ProxRange[idx][0] - ProxRange[idx][1]);\
+\cf2 337\
+338 \cf0 // Check to see if the zombie is traveling forward and it is closer than the\
+previous zombie\
+\cf2 339 \cf0 if (ProxSensors[idx].direction == FORWARD && Zombies[idx] < closestZombieDist) \{\
+\cf2 340 \cf0 // update the newest minimum value\
+\cf2 341 \cf0 closestZombieDist = Zombies[idx];\
+\cf2 342 \cf0 // update the index of the active target (in the targetArr array)\
+\cf2 343 \cf0 minIndex = i;\
+\cf2 344 \cf0 \}\
+\cf2 345 \cf0 \}\
+\cf2 346\
+347 \cf0 // if the min index points to a valid target, move to that target\
+\cf2 348 \cf0 if (minIndex >= 0) \{\
+\cf2 349 \cf0 activeTargetIndex = targetArr[minIndex];\
+\cf2 350 \cf0 activeTargetPosition = targetPos[activeTargetIndex];\
+\cf2 351 \cf0 WAIT_POS = false;\
+\cf2 352 \cf0 // Serial.println("Setting position to something other than wait");\
+\cf2 353 \cf0 \} else \{\
+\cf2 354 \cf0 activeTargetPosition = WAIT_POSITION;\
+\cf2 355 \cf0 WAIT_POS = true;\
+\cf2 356 \cf0 // Serial.println("Setting position to wait position");\
+\cf2 357 \cf0 \}\
+\cf2 358\
+359 \cf0 state = MOVE_TO_TARGET;\
+\cf2 360 \cf0 // Serial.println("Switching state to MOVE_TO_TARGET");\
+\cf2 361\
+362 \cf0 // Otherwise, we stay in DETERMINE_ACTIVE_TARGETS\
+\cf2 363 \cf0 break;\
+\cf2 364\
+365\
+366 \cf0 //****************************************************************************//\
+\cf2 367 \cf0 // In the MOVE_TO_TARGET state, we select an active target and move toward it, or\
+\cf2 368 \cf0 // move toward Target 3 (a default position) if there is no active target\
+\cf2 369 \cf0 case MOVE_TO_TARGET:\
+\cf2 370 \cf0 // Serial.println("Inside MOVE_TO_TARGET");\
+\cf2 371 \cf0 desiredPosition = activeTargetPosition;\
+\cf2 372\
+373 \cf0 if (motorPosition <= activeTargetPosition + TARGET_BAND && motorPosition >=\
+activeTargetPosition - TARGET_BAND) \{\
+\cf2 374\
+375 \cf0 if (millis() - arrivalTime > targetActivateTime || WAIT_POS)\{\
+\cf2 376 \cf0 state = CHOOSE_ACTIVE_TARGET;\
+\cf2 377 \cf0 \}\
+\cf2 378 \cf0 \} else \{\
+\cf2 379 \cf0 arrivalTime = millis();\
+\cf2 380 \cf0 \}\
+\cf2 381\
+382 \cf0 break;\
+\cf2 383\
+384 \cf0 //****************************************************************************//\
+\cf2 385 \cf0 //****************************************************************************//\
+\cf2 386 \cf0 // We should never reach the next bit of code, which would mean that the state\
+\cf2 387 \cf0 // we are currently in doesn't exist. So if it happens, throw an error and\
+\cf2 388 \cf0 // stop the program:\
+\cf2 389 \cf0 default:\
+\cf2 390 \cf0 Serial.println("Statemachine reached at state that it cannot handle. ABORT!!!!");\
+\cf2 391 \cf0 Serial.print("Found the following unknown state: ");\
+\cf2 392 \cf0 Serial.println(state);\
+\cf2 393 \cf0 while (1); // infinite loop to halt the program\
+\cf2 394 \cf0 break;\
+\cf2 395 \cf0 \}\
+\cf2 396 \cf0 // End of the state machine.\
+\cf2 397 \cf0 //******************************************************************************//\
+\cf2 398\
+399 \cf0 //******************************************************************************//\
+\cf2 400 \cf0 // Recalibrate if we are in the leftmost position\
+\cf2 401 \cf0 if (digitalRead(PIN_NRL_LIMIT_SWITCH)==HIGH && motorVelocity==0) \{\
+\cf2 402 \cf0 // We reached the endstop. Update the motor position to the limit:\
+\cf2 403 \cf0 // (NOTE: If the limit switch is on the right, this must be UPPER_BOUND)\
+\cf2 404 \cf0 motorPosition = LOWER_BOUND;\
+\cf2 405 \cf0 // Reset the error integrator:\
+\cf2 406 \cf0 integralError = 0;\
+\cf2 407 \cf0 Serial.println("Limit Switch hit");\
+\cf2 408 \cf0 \}\
+\cf2 409\
+410\
+411 \cf0 //******************************************************************************//\
+\cf2 412 \cf0 // Position Controller\
+\cf2 413 \cf0 if (digitalRead(PIN_NR_ON_OFF_SWITCH)==HIGH) \{\
+\cf2 414 \cf0 // If the toggle switch is on, run the controller:\
+\cf2 415\
+416 \cf0 //** PID control: **//\
+\cf2 417 \cf0 // Compute the position error [encoder counts]\
+\cf2 418 \cf0 positionError = desiredPosition - motorPosition;\
+\cf2 419 \cf0 // Compute the integral of the position error [encoder counts * seconds]\
+\cf2 420 \cf0 integralError = integralError + positionError * (float)(executionDuration) /\
+1000000;\
+\cf2 421 \cf0 // Compute the velocity error (desired velocity is 0) [encoder counts / seconds]\
+\cf2 422 \cf0 velocityError = 0 - motorVelocity;\
+\cf2 423 \cf0 // This is the actual controller function that uses the error in\
+\cf2 424 \cf0 // position and velocity and the integrated error and computes a\
+\cf2 425 \cf0 // desired voltage that should be sent to the motor:\
+\cf2 426 \cf0 desiredVoltage = KP * positionError +\
+\cf2 427 \cf0 KI * integralError +\
+\cf2 428 \cf0 KD * velocityError;\
+\cf2 429\
+430 \cf0 //** Feedforward terms: **//\
+\cf2 431 \cf0 // Compensate for friction. That is, if we now the direction of\
+\cf2 432 \cf0 // desired motion, add a base command that helps with moving in this\
+\cf2 433 \cf0 // direction:\
+\cf2 434 \cf0 if (positionError < -5) \{\
+\cf2 435 \cf0 desiredVoltage = desiredVoltage - FRICTION_COMP_VOLTAGE;\
+\cf2 436 \cf0 \}\
+\cf2 437 \cf0 if (positionError > +5) \{\
+\cf2 438 \cf0 desiredVoltage = desiredVoltage + FRICTION_COMP_VOLTAGE;\
+\cf2 439 \cf0 \}\
+\cf2 440\
+441 \cf0 // Anti-Wind-Up\
+\cf2 442 \cf0 if (abs(desiredVoltage)>SUPPLY_VOLTAGE) \{\
+\cf2 443 \cf0 // If we are already saturating our output voltage, it does not make\
+\cf2 444 \cf0 // sense to keep integrating the error (and thus ask for even higher\
+\cf2 445 \cf0 // and higher output voltages). Instead, stop the integrator if the\
+\cf2 446 \cf0 // output saturates. We do this by reversing the summation at the\
+\cf2 447 \cf0 // beginning of this function block:\
+\cf2 448 \cf0 integralError = integralError - positionError * (float)(executionDuration) /\
+1000000;\
+\cf2 449 \cf0 \}\
+\cf2 450 \cf0 // End of 'if(onOffSwitch==HIGH)'\
+\cf2 451\
+452 \cf0 // Override the computed voltage during calibration. In this state, we simply apply\
+a\
+\cf2 453 \cf0 // fixed voltage to move against one of the end-stops.\
+\cf2 454 \cf0 if (state==CALIBRATE) \{\
+\cf2 455 \cf0 // add calibration code here\
+\cf2 456\
+457 \cf0 \}\
+\cf2 458 \cf0 \} else \{\
+\cf2 459 \cf0 // Otherwise, the toggle switch is off, so do not run the controller,\
+\cf2 460 \cf0 // stop the motor...\
+\cf2 461 \cf0 desiredVoltage = 0;\
+\cf2 462 \cf0 // .. and reset the integrator of the error:\
+\cf2 463 \cf0 integralError = 0;\
+\cf2 464 \cf0 // Produce some debugging output:\
+\cf2 465 \cf0 Serial.println("The toggle switch is off. Motor Stopped.");\
+\cf2 466 \cf0 \}\
+\cf2 467 \cf0 // End of else onOffSwitch==HIGH\
+\cf2 468\
+469 \cf0 //** Send signal to motor **//\
+\cf2 470 \cf0 // Convert from voltage to PWM cycle:\
+\cf2 471 \cf0 motorCommand = int(abs(desiredVoltage * 255 / SUPPLY_VOLTAGE));\
+\cf2 472 \cf0 // Clip values larger than 255\
+\cf2 473 \cf0 if (motorCommand > 255) \{\
+\cf2 474 \cf0 motorCommand = 255;\
+\cf2 475 \cf0 \}\
+\cf2 476 \cf0 // Send motor signals out\
+\cf2 477 \cf0 analogWrite(PIN_NR_PWM_OUTPUT, motorCommand);\
+\cf2 478 \cf0 // Determine rotation direction\
+\cf2 479 \cf0 if (desiredVoltage >= 0) \{\
+\cf2 480 \cf0 // If voltage is positive ...\
+\cf2 481 \cf0 // ... turn forward\
+\cf2 482 \cf0 digitalWrite(PIN_NR_PWM_DIRECTION_1,LOW); // rotate forward\
+\cf2 483 \cf0 digitalWrite(PIN_NR_PWM_DIRECTION_2,HIGH); // rotate forward\
+\cf2 484 \cf0 \} else \{\
+\cf2 485 \cf0 // ... otherwise turn backward:\
+\cf2 486 \cf0 digitalWrite(PIN_NR_PWM_DIRECTION_1,HIGH); // rotate backward\
+\cf2 487 \cf0 digitalWrite(PIN_NR_PWM_DIRECTION_2,LOW); // rotate backward\
+\cf2 488 \cf0 \}\
+\cf2 489 \cf0 // End of Position Controller\
+\cf2 490 \cf0 //*********************************************************************//\
+\cf2 491\
+492 \cf0 // Print out current controller state to Serial Monitor.\
+\cf2 493 \cf0 printStateToSerial();\
+\cf2 494 \cf0 \}\
+\cf2 495 \cf0 // End of main loop\
+\cf2 496 \cf0 //***********************************************************************//\
+\cf2 497\
+498\
+499 \cf0 //////////////////////////////////////////////////////////////////////\
+\cf2 500 \cf0 // This is a function to update the encoder count in the Arduino. //\
+\cf2 501 \cf0 // It is called via an interrupt whenever the value on encoder //\
+\cf2 502 \cf0 // channel A or B changes. //\
+\cf2 503 \cf0 //////////////////////////////////////////////////////////////////////\
+\cf2 504 \cf0 void updateMotorPosition() \{\
+\cf2 505 \cf0 // Bitwise shift left by one bit, to make room for a bit of new data:\
+\cf2 506 \cf0 encoderStatus <<= 1;\
+\cf2 507 \cf0 // Use a compound bitwise OR operator (|=) to read the A channel of the encoder (pin 2)\
+\cf2 508 \cf0 // and put that value into the rightmost bit of encoderStatus:\
+\cf2 509 \cf0 encoderStatus |= digitalRead(2);\
+\cf2 510 \cf0 // Bitwise shift left by one bit, to make room for a bit of new data:\
+\cf2 511 \cf0 encoderStatus <<= 1;\
+\cf2 512 \cf0 // Use a compound bitwise OR operator (|=) to read the B channel of the encoder (pin\
+3)\
+\cf2 513 \cf0 // and put that value into the rightmost bit of encoderStatus:\
+\cf2 514 \cf0 encoderStatus |= digitalRead(3);\
+\cf2 515 \cf0 // encoderStatus is truncated to only contain the rightmost 4 bits by using a\
+\cf2 516 \cf0 // bitwise AND operator on mstatus and 15(=1111):\
+\cf2 517 \cf0 encoderStatus &= 15;\
+\cf2 518 \cf0 if (encoderStatus==2 || encoderStatus==4 || encoderStatus==11 || encoderStatus==13) \{\
+\cf2 519 \cf0 // the encoder status matches a bit pattern that requires counting up by one\
+\cf2 520 \cf0 motorPosition++; // increase the encoder count by one\
+\cf2 521 \cf0 \}\
+\cf2 522 \cf0 else if (encoderStatus == 1 || encoderStatus == 7 || encoderStatus == 8 ||\
+encoderStatus == 14) \{\
+\cf2 523 \cf0 // the encoder status does not match a bit pattern that requires counting up by\
+one.\
+\cf2 524 \cf0 // Since this function is only called if something has changed, we have to count\
+downwards\
+\cf2 525 \cf0 motorPosition--; // decrease the encoder count by one\
+\cf2 526 \cf0 \}\
+\cf2 527 \cf0 \}\
+\cf2 528 \cf0 // End of function updateMotorPosition()\
+\cf2 529\
+530\
+531 \cf0 //////////////////////////////////////////////////////////////////////\
+\cf2 532 \cf0 // This function sends a status of the controller to the serial //\
+\cf2 533 \cf0 // monitor. Each character will take 85 microseconds to send, so //\
+\cf2 534 \cf0 // be selective in what you write out: //\
+\cf2 535 \cf0 //////////////////////////////////////////////////////////////////////\
+\cf2 536 \cf0 void printStateToSerial() \{\
+\cf2 537 \cf0 //*********************************************************************//\
+\cf2 538 \cf0 // Send a status of the controller to the serial monitor.\
+\cf2 539 \cf0 // Each character will take 85 microseconds to send, so be selective\
+\cf2 540 \cf0 // in what you write out:\
+\cf2 541\
+542 \cf0 //Serial.print("State Number: [CALIBRATE = 1; DETERMINE_ACTIVE_TARGETS = 2;\
+MOVE_TO_TARGET = 3]: ");\
+\cf2 543 \cf0 Serial.print("State#: ");\
+\cf2 544 \cf0 Serial.print(state);\
+\cf2 545\
+546 \cf0 //Serial.print("Power switch [on/off]: ");\
+\cf2 547 \cf0 //Serial.print(" PWR: ");\
+\cf2 548 \cf0 //Serial.print(digitalRead(PIN_NR_ON_OFF_SWITCH));\
+\cf2 549\
+550 \cf0 //Serial.print(" Motor Position [encoder counts]: ");\
+\cf2 551 \cf0 Serial.print(" MP: ");\
+\cf2 552 \cf0 Serial.print(motorPosition);\
+\cf2 553\
+554 \cf0 //Serial.print(" Motor Velocity [encoder counts / seconds]: ");\
+\cf2 555 \cf0 Serial.print(" MV: ");\
+\cf2 556 \cf0 Serial.print(motorVelocity);\
+\cf2 557\
+558 \cf0 //Serial.print(" Encoder Status [4 bit value]: ");\
+\cf2 559 \cf0 //Serial.print(" ES: ");\
+\cf2 560 \cf0 //Serial.print(encoderStatus);\
+\cf2 561\
+562 \cf0 //Serial.print(" Target Position [encoder counts]: ");\
+\cf2 563 \cf0 Serial.print(" DP: ");\
+\cf2 564 \cf0 Serial.print(desiredPosition);\
+\cf2 565\
+566 \cf0 // //Serial.print(" Position Error [encoder counts]: ");\
+\cf2 567 \cf0 // Serial.print(" PE: ");\
+\cf2 568 \cf0 // Serial.print(positionError);\
+\cf2 569\
+570 \cf0 // //Serial.print(" Integrated Error [encoder counts * seconds]: ");\
+\cf2 571 \cf0 // Serial.print(" IE: ");\
+\cf2 572 \cf0 // Serial.print(integralError);\
+\cf2 573\
+574 \cf0 // //Serial.print(" Velocity Error [encoder counts / seconds]: ");\
+\cf2 575 \cf0 // Serial.print(" VE: ");\
+\cf2 576 \cf0 // Serial.print(velocityError);\
+\cf2 577\
+578 \cf0 //Serial.print(" Desired Output Voltage [Volt]: ");\
+\cf2 579 \cf0 Serial.print(" DV: ");\
+\cf2 580 \cf0 Serial.print(desiredVoltage);\
+\cf2 581\
+582 \cf0 //Serial.print(" Motor Command [0-255]: ");\
+\cf2 583 \cf0 //Serial.print(" MC: ");\
+\cf2 584 \cf0 //Serial.print(motorCommand);\
+\cf2 585\
+586 \cf0 //Serial.print(" Execution Duration [microseconds]: ");\
+\cf2 587 \cf0 //Serial.print(" ED: ");\
+\cf2 588 \cf0 //Serial.print(executionDuration);\
+\cf2 589\
+590 \cf0 //Serial.print(" Zombie Location [% of rail left to travel]: ");\
+\cf2 591 \cf0 Serial.print(" ZL: ");\
+\cf2 592 \cf0 for (int i = 0; i < sizeof(Zombies)/sizeof(float); i++) \{\
+\cf2 593 \cf0 Serial.print(Zombies[i]);\
+\cf2 594 \cf0 Serial.print(" ");\
+\cf2 595 \cf0 \}\
+\cf2 596\
+597 \cf0 //Serial.print(" Proxsensor Direction[STOPPED or FORWARD or BACKWARD]: ");\
+\cf2 598 \cf0 Serial.print(" DR: ");\
+\cf2 599 \cf0 for (int i = 0; i < sizeof(Zombies)/sizeof(float); i++) \{\
+\cf2 600 \cf0 Serial.print(ProxSensors[i].direction);\
+\cf2 601 \cf0 Serial.print(" ");\
+\cf2 602 \cf0 \}\
+\cf2 603\
+604 \cf0 // ALWAYS END WITH A NEWLINE. SERIAL MONITOR WILL CRASH IF NOT\
+\cf2 605 \cf0 Serial.println(); // new line\
+\cf2 606 \cf0 \}\
+\cf2 607 \cf0 // End of Serial Out\
+\cf2 608\
+609 \cf0 //////////////////////////////////////////////////////////////////////\
+\cf2 610 \cf0 // This function returns the average of the integer array //\
+\cf2 611 \cf0 // pointed to by array_ptr and of length len. //\
+\cf2 612 \cf0 //////////////////////////////////////////////////////////////////////\
+\cf2 613 \cf0 float average (int * array_ptr, int len) \{\
+\cf2 614 \cf0 long sum = 0L;\
+\cf2 615 \cf0 for (int i = 0; i < len; i++) \{\
+\cf2 616 \cf0 sum += array_ptr[i];\
+\cf2 617 \cf0 \}\
+\cf2 618 \cf0 return ((float) sum)/len;\
+\cf2 619 \cf0 \}\
+\cf2 620 \cf0 // End of average}

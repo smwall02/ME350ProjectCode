@@ -19,6 +19,9 @@
 #define PROX_SENSOR_3 A2
 #define PROX_SENSOR_4 A3
 
+// Flip (enable) switch
+#define ON_OFF_SWITCH_PIN 5  // HIGH = enabled, LOW = override/stop
+
 Encoder encoder(ENCODER_A, ENCODER_B);
 
 // ============================================
@@ -68,13 +71,15 @@ void setup() {
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_IN3, OUTPUT);
   
-  pinMode(LIMIT_LEFT, INPUT_PULLUP);
-  pinMode(LIMIT_RIGHT, INPUT_PULLUP);
+  pinMode(LIMIT_LEFT, INPUT_PULLUP);  // active HIGH per hardware wiring
+  pinMode(LIMIT_RIGHT, INPUT_PULLUP); // active HIGH per hardware wiring
   
   pinMode(PROX_SENSOR_1, INPUT);
   pinMode(PROX_SENSOR_2, INPUT);
   pinMode(PROX_SENSOR_3, INPUT);
   pinMode(PROX_SENSOR_4, INPUT);
+
+  pinMode(ON_OFF_SWITCH_PIN, INPUT_PULLUP);
   
   stopMotor();
   delay(500);
@@ -165,6 +170,12 @@ void runPIDControl() {
 // MOTOR CONTROL (FROM WORKING CODE)
 // ============================================
 void setMotor(float voltage) {
+  // Flip switch override
+  if (digitalRead(ON_OFF_SWITCH_PIN) == LOW) {
+    stopMotor();
+    return;
+  }
+
   voltage = constrain(voltage, -10.0, 10.0);
   int pwm = abs(voltage) * 25.5;
   
