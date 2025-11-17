@@ -241,6 +241,17 @@ bool lockMode = false;
 int lockLane = -1;
 bool awaitingReturnAfterHit = false;
 
+// Voltage limiting for smoother moves
+float cappedVoltageForError(float voltage, long error) {
+  long absErr = abs(error);
+  float cap;
+  if (absErr > 800) cap = 4.0f;
+  else if (absErr > 500) cap = 3.5f;
+  else if (absErr > 300) cap = 3.2f;
+  else cap = 3.0f;
+  return constrain(voltage, -cap, cap);
+}
+
 // ============================================================================
 // SETUP
 // ============================================================================
@@ -552,7 +563,12 @@ void stateMoveToTarget() {
 
   // Run PID controller
   float voltage = updatePID(currentTargetPosition);
-  setMotorVoltage(voltage);
+  // Anti-windup on zero crossing
+  if ((error != 0) && (error * lastError < 0)) {
+    integral *= 0.5;
+  }
+  float applied = cappedVoltageForError(voltage, error);
+  setMotorVoltage(applied);
 
   // Check if zombie activated LED (hit detection)
   if (activeTarget >= 0) {
