@@ -37,7 +37,10 @@
 #define MOTOR_IN2 12  // Direction 1
 #define MOTOR_IN3 13  // Direction 2
 
-// Limit Switches (active LOW with INPUT_PULLUP)
+// Flip (enable) switch
+#define ON_OFF_SWITCH_PIN 5  // HIGH = enabled, LOW = override/stop
+
+// Limit Switches (active HIGH with INPUT_PULLUP based on hardware wiring)
 #define LIMIT_LEFT 8   // Zero position
 #define LIMIT_RIGHT 9  // Maximum range
 
@@ -214,6 +217,9 @@ void setup() {
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_IN3, OUTPUT);
 
+  // Flip switch
+  pinMode(ON_OFF_SWITCH_PIN, INPUT_PULLUP);
+
   // Configure limit switches
   pinMode(LIMIT_LEFT, INPUT_PULLUP);
   pinMode(LIMIT_RIGHT, INPUT_PULLUP);
@@ -311,7 +317,7 @@ void stateCalibrate() {
    * 5. Transition to CHOOSE_ACTIVE_TARGET
    */
 
-  if (digitalRead(LIMIT_LEFT) == LOW) {  // Limit switch pressed (active LOW)
+  if (digitalRead(LIMIT_LEFT) == HIGH) {  // Limit switch pressed (active HIGH)
     // Check if motor has stopped (velocity near zero)
     long currentPos = motorEncoder.read();
     long movement = abs(currentPos - lastCalibrationPos);
@@ -683,7 +689,7 @@ void checkRoundTransition() {
 
     case ROUND_3:
       // Round 3 ends when zombie hits front limit switch
-      if (digitalRead(LIMIT_RIGHT) == LOW) {
+      if (digitalRead(LIMIT_RIGHT) == HIGH) {
         // Zombie hit front limit - GAME OVER
         Serial.println(F("\n========================================"));
         Serial.println(F("=== ROUND 3 FAILED ==="));
@@ -739,7 +745,29 @@ void recordHit() {
 // MOTOR CONTROL
 // ============================================================================
 
+bool isSwitchEnabled() {
+  return digitalRead(ON_OFF_SWITCH_PIN) == HIGH;
+}
+
 void setMotorVoltage(float voltage) {
+  // Master override from flip switch
+  static bool lastSwitchState = true;
+  bool enabled = isSwitchEnabled();
+  if (!enabled) {
+    if (lastSwitchState != enabled) {
+      Serial.println(F("Flip switch OFF - motor disabled"));
+    }
+    lastSwitchState = enabled;
+    digitalWrite(MOTOR_IN2, LOW);
+    digitalWrite(MOTOR_IN3, LOW);
+    analogWrite(MOTOR_ENA, 0);
+    return;
+  }
+  if (lastSwitchState != enabled) {
+    Serial.println(F("Flip switch ON - motor enabled"));
+  }
+  lastSwitchState = enabled;
+
   // Constrain voltage to safe range
   voltage = constrain(voltage, -10.0, 10.0);
 
@@ -747,11 +775,11 @@ void setMotorVoltage(float voltage) {
   int pwmValue = abs(voltage) * 25.5;  // 10V -> 255
 
   // Safety: Check limit switches and prevent movement into limits
-  if (digitalRead(LIMIT_LEFT) == LOW && voltage > 0) {
+  if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
     voltage = 0;
     pwmValue = 0;
   }
-  if (digitalRead(LIMIT_RIGHT) == LOW && voltage < 0) {
+  if (digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
     // In Round 3, hitting right limit ends the game
     if (currentRound == ROUND_3) {
       // Let checkRoundTransition handle this

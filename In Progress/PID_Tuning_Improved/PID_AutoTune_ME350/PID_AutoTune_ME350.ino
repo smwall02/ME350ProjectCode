@@ -124,7 +124,7 @@ void setup() {
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_IN3, OUTPUT);
 
-  // Configure limit switches
+  // Configure limit switches (active HIGH per hardware wiring)
   pinMode(LIMIT_LEFT, INPUT_PULLUP);
   pinMode(LIMIT_RIGHT, INPUT_PULLUP);
 
@@ -235,11 +235,11 @@ void setMotorVoltage(float voltage) {
   int pwmValue = abs(voltage) * 25.5;  // 10V -> 255
 
   // Check limit switches and stop if hit
-  if (digitalRead(LIMIT_LEFT) == LOW && voltage > 0) {
+  if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
     voltage = 0;
     pwmValue = 0;
   }
-  if (digitalRead(LIMIT_RIGHT) == LOW && voltage < 0) {
+  if (digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
     voltage = 0;
     pwmValue = 0;
   }
@@ -326,7 +326,7 @@ void calibrateRange() {
   unsigned long startTime = millis();
   long lastPosition = motorEncoder.read();
 
-  while (digitalRead(LIMIT_LEFT) == HIGH) {
+  while (digitalRead(LIMIT_LEFT) == LOW) {
     if (millis() - startTime > 10000) {
       Serial.println(F("ERROR: Timeout waiting for left limit"));
       setMotorVoltage(0);
@@ -353,7 +353,7 @@ void calibrateRange() {
   startTime = millis();
   lastPosition = 0;
 
-  while (digitalRead(LIMIT_RIGHT) == HIGH) {
+  while (digitalRead(LIMIT_RIGHT) == LOW) {
     if (millis() - startTime > 10000) {
       Serial.println(F("ERROR: Timeout waiting for right limit"));
       setMotorVoltage(0);
@@ -446,7 +446,7 @@ void characterizeFriction() {
   // Move to right limit
   Serial.println(F("Moving to right limit..."));
   setMotorVoltage(-6.0);
-  while (digitalRead(LIMIT_RIGHT) == HIGH) {
+  while (digitalRead(LIMIT_RIGHT) == LOW) {
     delay(10);
   }
   setMotorVoltage(0);
