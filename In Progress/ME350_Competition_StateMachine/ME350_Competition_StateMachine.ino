@@ -160,10 +160,10 @@ const int STOPPED = 0;    // Zombie not moving
 // Low-pass filter coefficient for sensor smoothing
 const float ALPHA = 0.925;  // Higher = more filtering (0-1)
 
-// Sensor activation threshold (lowered to be more permissive)
-const int ACTIVATION_THRESHOLD = 300;  // Raw sensor value (0-1023)
-const int ACTIVATION_THRESHOLD_HIGH = 340;  // Hysteresis high
-const int ACTIVATION_THRESHOLD_LOW = 270;   // Hysteresis low
+// Sensor activation threshold (tighter to reduce noise)
+const int ACTIVATION_THRESHOLD = 400;  // Raw sensor value (0-1023)
+const int ACTIVATION_THRESHOLD_HIGH = 430;  // Hysteresis high
+const int ACTIVATION_THRESHOLD_LOW = 370;   // Hysteresis low
 
 // Sensor data structure
 struct SensorData {
@@ -472,7 +472,7 @@ void stateChooseActiveTarget() {
   // Pick the active sensor with the lowest filtered value (farthest/down-rail).
   // Direction check removed; velocity used as tiebreaker. Skip lanes recently hit (cooldown).
   for (int i = 0; i < 4; i++) {
-    if (sensors[i].rawValue > ACTIVATION_THRESHOLD_LOW) {  // active enough
+    if (sensors[i].rawValue > ACTIVATION_THRESHOLD_HIGH) {  // active enough
       if (millis() - lastHitTime[i] < HIT_COOLDOWN) continue;
       float vmag = fabs(sensors[i].velocity);
       if (sensors[i].filteredValue < lowestFiltered - 1.0) {
@@ -509,6 +509,10 @@ void stateChooseActiveTarget() {
     Serial.print(sensors[chosenTarget].filteredValue);
     Serial.print(F(" vel="));
     Serial.println(sensors[chosenTarget].velocity);
+
+    // allow wait message again next time there's no target
+    static bool waitMessagePrinted = false;
+    waitMessagePrinted = false;
   }
   else {
     // No forward-moving zombies, go to wait position
@@ -577,12 +581,23 @@ void stateMoveToTarget() {
       awaitingReturnAfterHit = false;
       currentState = CHOOSE_ACTIVE_TARGET;
       Serial.println(F("Target moving back, reselecting..."));
+    } else if (millis() - lastHitTime[activeTarget] > 2000) {
+      // Timeout: give up waiting after 2s
+      awaitingReturnAfterHit = false;
+      currentState = CHOOSE_ACTIVE_TARGET;
+      Serial.println(F("Timeout waiting for return, reselecting..."));
     } else {
       // Hold position while waiting
       setMotorVoltage(0);
       Serial.println(F("Holding at lane awaiting return..."));
       return;
     }
+  }
+
+  // If no active target (e.g., waiting), hold position quietly
+  if (activeTarget < 0) {
+    setMotorVoltage(0);
+    return;
   }
 
   // Check if position is stable
