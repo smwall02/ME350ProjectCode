@@ -175,6 +175,8 @@ struct SensorData {
   float velocity;         // Change per update (filteredValue/sec)
   bool active;            // Above hysteresis threshold
   bool justActivated;     // Rising edge detection
+  float minObserved;      // For per-lane normalization
+  float maxObserved;      // For per-lane normalization
 };
 
 SensorData sensors[4];
@@ -229,6 +231,9 @@ const int CALIBRATE_STABLE_TICKS = 3;               // stable readings before ze
 // Velocity stop detection
 const float VEL_STOP_THRESH = 2.0;  // counts/sec considered stopped
 
+// Proximity normalization
+const unsigned long PROX_CALIBRATION_WINDOW = 5000;  // ms to learn min/max per sensor after start
+
 // ============================================================================
 // SETUP
 // ============================================================================
@@ -257,6 +262,8 @@ void setup() {
     sensors[i].lastUpdate = 0;
     sensors[i].active = false;
     sensors[i].justActivated = false;
+    sensors[i].minObserved = 1e9;
+    sensors[i].maxObserved = 0;
   }
 
   // Stop motor initially
@@ -441,23 +448,25 @@ void stateChooseActiveTarget() {
    */
 
   int chosenTarget = -1;
-  float bestProx = -1;      // higher = closer to end of rail
+  float bestScore = -1;
   float bestVelMag = -1;
 
-  // Prefer highest proximity (closer to rail end); tie -> highest approaching velocity magnitude
+  // Compute normalized score: higher = closer to end (lower raw -> higher score after normalization)
+  // score = (maxObserved - filtered) / (maxObserved - minObserved)
   for (int i = 0; i < 4; i++) {
     // Check if sensor detects a zombie
     if (sensors[i].active) {
       // Check if zombie is moving FORWARD (toward the sensor)
       if (sensors[i].direction == FORWARD) {
-        float prox = sensors[i].filteredValue;
+        float range = max(1.0f, sensors[i].maxObserved - sensors[i].minObserved);
+        float score = (sensors[i].maxObserved - sensors[i].filteredValue) / range;  // lower reading => closer to end => higher score
         float vmag = fabs(sensors[i].velocity);
-        if (prox > bestProx + 1.0) {  // prioritize closest to end (highest reading)
-          bestProx = prox;
+        if (score > bestScore + 0.01) {
+          bestScore = score;
           bestVelMag = vmag;
           chosenTarget = i;
-        } else if (fabs(prox - bestProx) <= 1.0 && vmag > bestVelMag + 0.01) {
-          // tie on proximity -> faster approach
+        } else if (fabs(score - bestScore) <= 0.01 && vmag > bestVelMag + 0.01) {
+          // tie on score -> faster approach
           bestVelMag = vmag;
           chosenTarget = i;
         }
@@ -470,7 +479,7 @@ void stateChooseActiveTarget() {
     currentTargetPosition = targetPositions[chosenTarget];
     activeTarget = chosenTarget;
 
-    Serial.print(F("Target selected (closest to end): "));
+    Serial.print(F("Target selected (normalized farthest): "));
     Serial.print(chosenTarget + 1);
     Serial.print(F(" at position "));
     Serial.println(currentTargetPosition);
@@ -652,6 +661,12 @@ void updateSensors() {
     sensors[i].rawValue = raw;
     sensors[i].lastFilteredValue = sensors[i].filteredValue;
     sensors[i].lastUpdate = millis();
+
+    // Track min/max during initial calibration window
+    if (millis() < PROX_CALIBRATION_WINDOW) {
+      if (sensors[i].filteredValue < sensors[i].minObserved) sensors[i].minObserved = sensors[i].filteredValue;
+      if (sensors[i].filteredValue > sensors[i].maxObserved) sensors[i].maxObserved = sensors[i].filteredValue;
+    }
 
     // Hysteresis-based activation using filtered value
     if (sensors[i].filteredValue >= ACTIVATION_THRESHOLD_HIGH) {
