@@ -889,8 +889,16 @@ void stepResponse() {
   Serial.println(F("This will apply a step voltage and record the response."));
   Serial.println(F("Press 'Y' to continue..."));
 
-  while (!Serial.available()) { }
-  char response = Serial.read();
+  // Flush and wait for a non-newline response
+  while (Serial.available()) { Serial.read(); }
+  char response = 0;
+  while (response == 0) {
+    while (!Serial.available()) { }
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') continue;
+    response = c;
+  }
+
   if (toupper(response) != 'Y') {
     Serial.println(F("Cancelled."));
     return;
