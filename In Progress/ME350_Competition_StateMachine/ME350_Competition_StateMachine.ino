@@ -970,20 +970,15 @@ void loadCalibrationFromEEPROM() {
 }
 
 // ============================================================================
-// COMMAND HANDLING & EEPROM
+// COMMAND HANDLING & EEPROM helpers
 // ============================================================================
-
-#include <EEPROM.h>
-
-const int EEPROM_FLAG = 0;
-const int EEPROM_TARGET_BASE = 4;  // 4*4 bytes for long
 
 void loadTargets() {
   byte flag = EEPROM.read(EEPROM_FLAG);
   if (flag != 0xAA) return;
   for (int i = 0; i < 4; i++) {
     long val;
-    EEPROM.get(EEPROM_TARGET_BASE + i * sizeof(long), val);
+    EEPROM.get(EEPROM_LANES_BASE + i * sizeof(long), val);
     targetPositions[i] = val;
   }
   WAIT_POSITION = targetPositions[2];
@@ -992,7 +987,7 @@ void loadTargets() {
 void saveTargets() {
   EEPROM.write(EEPROM_FLAG, 0xAA);
   for (int i = 0; i < 4; i++) {
-    EEPROM.put(EEPROM_TARGET_BASE + i * sizeof(long), targetPositions[i]);
+    EEPROM.put(EEPROM_LANES_BASE + i * sizeof(long), targetPositions[i]);
   }
   Serial.println(F("Lane positions saved to EEPROM."));
 }
