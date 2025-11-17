@@ -160,10 +160,10 @@ const int STOPPED = 0;    // Zombie not moving
 // Low-pass filter coefficient for sensor smoothing
 const float ALPHA = 0.925;  // Higher = more filtering (0-1)
 
-// Sensor activation threshold
-const int ACTIVATION_THRESHOLD = 400;  // Raw sensor value (0-1023)
-const int ACTIVATION_THRESHOLD_HIGH = 430;  // Hysteresis high
-const int ACTIVATION_THRESHOLD_LOW = 370;   // Hysteresis low
+// Sensor activation threshold (lowered to be more permissive)
+const int ACTIVATION_THRESHOLD = 300;  // Raw sensor value (0-1023)
+const int ACTIVATION_THRESHOLD_HIGH = 340;  // Hysteresis high
+const int ACTIVATION_THRESHOLD_LOW = 270;   // Hysteresis low
 
 // Sensor data structure
 struct SensorData {
@@ -235,7 +235,10 @@ const float VEL_STOP_THRESH = 2.0;  // counts/sec considered stopped
 // Proximity normalization
 const unsigned long PROX_CALIBRATION_WINDOW = 5000;  // ms to learn min/max per sensor after start
 unsigned long lastHitTime[4] = {0, 0, 0, 0};
-const unsigned long HIT_COOLDOWN = 1500;  // ms before retargeting same lane
+const unsigned long HIT_COOLDOWN = 4000;  // ms before retargeting same lane
+bool lockMode = false;
+int lockLane = -1;
+bool awaitingReturnAfterHit = false;
 
 // ============================================================================
 // SETUP
@@ -450,14 +453,27 @@ void stateChooseActiveTarget() {
    * 6. Set target position and transition to MOVE_TO_TARGET
    */
 
+  // If locked to a lane, go straight there without target selection
+  if (lockMode && lockLane >= 0) {
+    currentTargetPosition = targetPositions[lockLane];
+    activeTarget = lockLane;
+    error = lastError = integral = derivative = 0;
+    currentState = MOVE_TO_TARGET;
+    positionReachedTime = millis();
+    Serial.print(F("Lane lock: moving to lane "));
+    Serial.println(lockLane + 1);
+    return;
+  }
+
   int chosenTarget = -1;
   float lowestFiltered = 1e9;
   float bestVelMag = -1;
 
-  // Simplified: pick the active sensor with the lowest filtered value (farthest/down-rail).
-  // Direction check removed to avoid getting stuck; velocity used as tiebreaker.
+  // Pick the active sensor with the lowest filtered value (farthest/down-rail).
+  // Direction check removed; velocity used as tiebreaker. Skip lanes recently hit (cooldown).
   for (int i = 0; i < 4; i++) {
     if (sensors[i].rawValue > ACTIVATION_THRESHOLD_LOW) {  // active enough
+      if (millis() - lastHitTime[i] < HIT_COOLDOWN) continue;
       float vmag = fabs(sensors[i].velocity);
       if (sensors[i].filteredValue < lowestFiltered - 1.0) {
         lowestFiltered = sensors[i].filteredValue;
@@ -487,6 +503,12 @@ void stateChooseActiveTarget() {
     Serial.print(chosenTarget + 1);
     Serial.print(F(" at position "));
     Serial.println(currentTargetPosition);
+    Serial.print(F("  raw="));
+    Serial.print(sensors[chosenTarget].rawValue);
+    Serial.print(F(" filt="));
+    Serial.print(sensors[chosenTarget].filteredValue);
+    Serial.print(F(" vel="));
+    Serial.println(sensors[chosenTarget].velocity);
   }
   else {
     // No forward-moving zombies, go to wait position
@@ -544,15 +566,23 @@ void stateMoveToTarget() {
       Serial.print(activeTarget + 1);
       Serial.println(F(" ***"));
 
-      // Return to target selection
-      currentState = CHOOSE_ACTIVE_TARGET;
-      return;
+      awaitingReturnAfterHit = true;
+      Serial.println(F("Awaiting target return before reselecting..."));
     }
   }
 
-  // Check for closer forward-moving zombie (dynamic switching)
-  if (millis() - lastTargetSwitchTime > TARGET_SWITCH_COOLDOWN) {
-    checkForBetterTarget();
+  // Wait for target to move back toward prox before selecting a new one
+  if (awaitingReturnAfterHit) {
+    if (activeTarget >= 0 && sensors[activeTarget].velocity < -2.0) {
+      awaitingReturnAfterHit = false;
+      currentState = CHOOSE_ACTIVE_TARGET;
+      Serial.println(F("Target moving back, reselecting..."));
+    } else {
+      // Hold position while waiting
+      setMotorVoltage(0);
+      Serial.println(F("Holding at lane awaiting return..."));
+      return;
+    }
   }
 
   // Check if position is stable
@@ -974,6 +1004,15 @@ void printConfig() {
   Serial.print(F("Wait pos: ")); Serial.println(WAIT_POSITION);
   Serial.print(F("Competition enabled: "));
   Serial.println(competitionEnabled ? F("YES") : F("NO"));
+  Serial.print(F("Lock mode: "));
+  Serial.println(lockMode ? F("ON") : F("OFF"));
+  Serial.print(F("Cooling (ms since last hits): "));
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++) {
+    Serial.print(now - lastHitTime[i]);
+    if (i < 3) Serial.print(F(", "));
+  }
+  Serial.println();
 }
 
 void handleCommand(char c) {
@@ -983,8 +1022,9 @@ void handleCommand(char c) {
       Serial.println(F("\nCommands:"));
       Serial.println(F("  C - Calibrate to left limit"));
       Serial.println(F("  1-4 - Set lane position to current encoder reading"));
+      Serial.println(F("  M - Lock/move to lane (enter lane #)"));
       Serial.println(F("  P - Print config"));
-      Serial.println(F("  S - Stop/IDLE"));
+      Serial.println(F("  S - Stop/IDLE (clears lock)"));
       Serial.println(F("  G - Start competition (Round 1)"));
       Serial.println(F("  L - Load lanes from EEPROM"));
       Serial.println(F("  W - Save lanes to EEPROM"));
@@ -1004,6 +1044,24 @@ void handleCommand(char c) {
       break;
     }
 
+    case 'M': {
+      Serial.println(F("Enter lane number (1-4) to lock/move:"));
+      while (!Serial.available()) {}
+      int lane = Serial.parseInt();
+      while (Serial.available()) Serial.read();
+      if (lane < 1 || lane > 4) {
+        Serial.println(F("Invalid lane."));
+        break;
+      }
+      lockLane = lane - 1;
+      lockMode = true;
+      competitionEnabled = false;  // manual mode
+      currentState = CHOOSE_ACTIVE_TARGET;
+      Serial.print(F("Locking to lane "));
+      Serial.println(lane);
+      break;
+    }
+
     case 'P':
       printConfig();
       break;
@@ -1011,6 +1069,8 @@ void handleCommand(char c) {
     case 'S':
       competitionEnabled = false;
       currentState = IDLE;
+      lockMode = false;
+      lockLane = -1;
       setMotorVoltage(0);
       Serial.println(F("Stopped. State=IDLE."));
       break;
@@ -1018,6 +1078,8 @@ void handleCommand(char c) {
     case 'G':
       // Start competition
       competitionEnabled = true;
+      lockMode = false;
+      lockLane = -1;
       currentRound = ROUND_1;
       round1Score = round2Score = round3Score = totalScore = 0;
       roundStartTime = millis();
