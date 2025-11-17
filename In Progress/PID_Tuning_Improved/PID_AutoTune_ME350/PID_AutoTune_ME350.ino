@@ -363,7 +363,7 @@ void calibrateRange() {
   delay(200);
   // Hold against left limit to seat before zeroing; require stability
   unsigned long holdStart = millis();
-  float holdVoltage = max(FRICTION_RIGHT, 2.5);
+  float holdVoltage = max(FRICTION_RIGHT + 0.1, 2.5);
   long lastPos = motorEncoder.read();
   int stableTicks = 0;
   while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
@@ -407,7 +407,7 @@ void calibrateRange() {
   delay(200);
   // Hold on right limit briefly with stability check
   holdStart = millis();
-  float holdVoltageRight = -max(FRICTION_LEFT, 2.5);
+  float holdVoltageRight = -max(FRICTION_LEFT + 0.1, 2.5);
   lastPos = motorEncoder.read();
   stableTicks = 0;
   while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
@@ -1025,7 +1025,7 @@ void homeToLeft() {
 
   // Hold on the switch before zeroing; ensure it settles
   unsigned long holdStart = millis();
-  float holdVoltage = max(FRICTION_RIGHT, 2.5);
+  float holdVoltage = max(FRICTION_RIGHT + 0.1, 2.5);
   long lastPos = motorEncoder.read();
   int stableTicks = 0;
   while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
