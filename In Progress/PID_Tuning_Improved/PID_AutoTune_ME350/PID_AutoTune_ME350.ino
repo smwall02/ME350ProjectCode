@@ -994,6 +994,9 @@ void manualPositionTest() {
   unsigned long settledTime = 0;
   bool hasSettled = false;
 
+  // Clear any pending serial input so we don't abort immediately
+  while (Serial.available()) { Serial.read(); }
+
   while (millis() - startTime < 10000) {  // 10 second test
     // Update PID
     float voltage = updatePID(targetPosition);
@@ -1064,9 +1067,19 @@ void manualLaneMove() {
   }
 
   Serial.println(F("Enter lane number (1-4), or 0 to cancel:"));
-  while (!Serial.available()) { }
-  int lane = Serial.parseInt();
-  while (Serial.available()) Serial.read();  // clear buffer
+  // Flush any pending input
+  while (Serial.available()) Serial.read();
+  int lane = -1;
+  while (lane == -1) {
+    while (!Serial.available()) { }
+    char c = Serial.read();
+    if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+    if (c == '0') { lane = 0; }
+    else if (c >= '1' && c <= '4') { lane = c - '0'; }
+    else { lane = 0; }  // treat invalid as cancel
+    // clear rest of buffer
+    while (Serial.available()) Serial.read();
+  }
 
   if (lane < 1 || lane > 4) {
     Serial.println(F("Cancelled."));
