@@ -177,6 +177,7 @@ struct SensorData {
   bool justActivated;     // Rising edge detection
   float minObserved;      // For per-lane normalization
   float maxObserved;      // For per-lane normalization
+  float normalized;       // 0-1 score (lower raw = closer to end)
 };
 
 SensorData sensors[4];
@@ -448,28 +449,22 @@ void stateChooseActiveTarget() {
    */
 
   int chosenTarget = -1;
-  float bestScore = -1;
+  float lowestFiltered = 1e9;
   float bestVelMag = -1;
 
-  // Compute normalized score: higher = closer to end (lower raw -> higher score after normalization)
-  // score = (maxObserved - filtered) / (maxObserved - minObserved)
+  // Simplified: pick the active sensor with the lowest filtered value (farthest/down-rail).
+  // Direction check removed to avoid getting stuck; velocity used as tiebreaker.
   for (int i = 0; i < 4; i++) {
-    // Check if sensor detects a zombie
-    if (sensors[i].active) {
-      // Check if zombie is moving FORWARD (toward the sensor)
-      if (sensors[i].direction == FORWARD) {
-        float range = max(1.0f, sensors[i].maxObserved - sensors[i].minObserved);
-        float score = (sensors[i].maxObserved - sensors[i].filteredValue) / range;  // lower reading => closer to end => higher score
-        float vmag = fabs(sensors[i].velocity);
-        if (score > bestScore + 0.01) {
-          bestScore = score;
-          bestVelMag = vmag;
-          chosenTarget = i;
-        } else if (fabs(score - bestScore) <= 0.01 && vmag > bestVelMag + 0.01) {
-          // tie on score -> faster approach
-          bestVelMag = vmag;
-          chosenTarget = i;
-        }
+    if (sensors[i].rawValue > ACTIVATION_THRESHOLD_LOW) {  // active enough
+      float vmag = fabs(sensors[i].velocity);
+      if (sensors[i].filteredValue < lowestFiltered - 1.0) {
+        lowestFiltered = sensors[i].filteredValue;
+        bestVelMag = vmag;
+        chosenTarget = i;
+      } else if (fabs(sensors[i].filteredValue - lowestFiltered) <= 1.0 && vmag > bestVelMag + 0.01) {
+        lowestFiltered = sensors[i].filteredValue;
+        bestVelMag = vmag;
+        chosenTarget = i;
       }
     }
   }
@@ -533,9 +528,7 @@ void stateMoveToTarget() {
 
   // Check if zombie activated LED (hit detection)
   if (activeTarget >= 0) {
-    // Consider a hit when we see a rising edge OR a forward-to-backward change with high reading
-    bool directionFlip = (sensors[activeTarget].direction == BACKWARD && sensors[activeTarget].velocity < -2.0 && sensors[activeTarget].rawValue > ACTIVATION_THRESHOLD_LOW);
-    if (sensors[activeTarget].justActivated || directionFlip) {
+    if (sensors[activeTarget].justActivated) {
       recordHit();
 
       Serial.print(F("*** HIT! Target "));
