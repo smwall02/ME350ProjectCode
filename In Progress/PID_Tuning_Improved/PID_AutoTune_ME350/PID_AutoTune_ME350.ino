@@ -1049,6 +1049,9 @@ void manualPositionTest() {
     if ((error != 0) && (error * lastError < 0)) {
       integral *= 0.5;  // soften windup on zero crossing
     }
+    if (abs(error) > 400) {
+      integral *= 0.5;  // bleed integral when far to reduce launch/slam
+    }
     // Soften integral accumulation when far from target to reduce big swings
     if (abs(error) > 600) {
       integral *= 0.95;  // bleed off a bit when very far
@@ -1436,10 +1439,10 @@ void clearCalibration() {
 float cappedVoltageForError(float voltage, long error) {
   long absErr = abs(error);
   float cap;
-  if (absErr > 800) cap = 5.0f;
-  else if (absErr > 600) cap = 4.5f;
-  else if (absErr > 400) cap = 4.0f;
-  else if (absErr > 200) cap = 3.5f;
+  if (absErr > 800) cap = 4.0f;
+  else if (absErr > 600) cap = 3.6f;
+  else if (absErr > 400) cap = 3.3f;
+  else if (absErr > 200) cap = 3.1f;
   else cap = 3.0f;
   cap = min(cap, TEST_MAX_VOLTAGE);
   return constrain(voltage, -cap, cap);
