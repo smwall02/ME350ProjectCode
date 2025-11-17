@@ -640,25 +640,33 @@ void autoTuneZieglerNichols() {
   Serial.print(F("Moving to center position: "));
   Serial.println(centerPosition);
 
-  // Use simple proportional control to get to center
+  // Use staged approach control to tighten to center
   unsigned long moveStart = millis();
-  while (abs(motorEncoder.read() - centerPosition) > 20 && millis() - moveStart < 10000) {
+  // Stage 1: coarse
+  while (abs(motorEncoder.read() - centerPosition) > 20 && millis() - moveStart < 8000) {
     long currentPos = motorEncoder.read();
     long err = centerPosition - currentPos;
     float voltage = constrain(err * 0.01, -6.0, 6.0);
     setMotorVoltage(voltage);
     delay(10);
   }
-  // Tighten center approach with smaller voltage if still off
-  if (abs(motorEncoder.read() - centerPosition) > 10) {
-    moveStart = millis();
-    while (abs(motorEncoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
-      long currentPos = motorEncoder.read();
-      long err = centerPosition - currentPos;
-      float voltage = constrain(err * 0.008, -4.0, 4.0);
-      setMotorVoltage(voltage);
-      delay(10);
-    }
+  // Stage 2: fine
+  moveStart = millis();
+  while (abs(motorEncoder.read() - centerPosition) > 8 && millis() - moveStart < 4000) {
+    long currentPos = motorEncoder.read();
+    long err = centerPosition - currentPos;
+    float voltage = constrain(err * 0.007, -4.0, 4.0);
+    setMotorVoltage(voltage);
+    delay(10);
+  }
+  // Stage 3: micro adjust
+  moveStart = millis();
+  while (abs(motorEncoder.read() - centerPosition) > 5 && millis() - moveStart < 3000) {
+    long currentPos = motorEncoder.read();
+    long err = centerPosition - currentPos;
+    float voltage = constrain(err * 0.004, -3.0, 3.0);
+    setMotorVoltage(voltage);
+    delay(10);
   }
   setMotorVoltage(0);
   delay(500);
