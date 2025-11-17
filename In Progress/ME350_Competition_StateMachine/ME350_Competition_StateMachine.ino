@@ -172,6 +172,7 @@ struct SensorData {
   int direction;          // FORWARD, BACKWARD, or STOPPED
   float lastFilteredValue; // Previous filtered value for derivative
   unsigned long lastUpdate; // Timestamp of last update
+  float velocity;         // Change per update (filteredValue/sec)
   bool active;            // Above hysteresis threshold
   bool justActivated;     // Rising edge detection
 };
@@ -224,6 +225,14 @@ const float CALIBRATE_EXTRA_VOLTAGE = 0.6;          // added to overcome frictio
 const float CALIBRATE_MIN_VOLTAGE = 2.5;            // minimum drive during homing
 const unsigned long CALIBRATE_HOLD_TIME = 300;      // ms hold on limit before zeroing
 const int CALIBRATE_STABLE_TICKS = 3;               // stable readings before zeroing
+
+// Nudge offsets if no hit at a lane
+const int NUDGE_OFFSETS[] = {5, -5, 10, -10};
+const int NUDGE_COUNT = sizeof(NUDGE_OFFSETS) / sizeof(NUDGE_OFFSETS[0]);
+int nudgeIndex = 0;
+
+// Velocity stop detection
+const float VEL_STOP_THRESH = 2.0;  // counts/sec considered stopped
 
 // ============================================================================
 // SETUP
@@ -436,34 +445,37 @@ void stateChooseActiveTarget() {
    * 6. Set target position and transition to MOVE_TO_TARGET
    */
 
-  int closestTarget = -1;
-  long minDistance = 999999;
+  int chosenTarget = -1;
+  float bestVelocity = -1;
+  float bestProx = 1e9;
 
-  // Find closest FORWARD-moving zombie
+  // Prefer highest approaching velocity; if tie/none, prefer farthest (lowest prox)
   for (int i = 0; i < 4; i++) {
     // Check if sensor detects a zombie
     if (sensors[i].active) {
       // Check if zombie is moving FORWARD (toward the sensor)
       if (sensors[i].direction == FORWARD) {
-        // Calculate distance from current position to this target
-        long currentPos = motorEncoder.read();
-        long distance = abs(currentPos - targetPositions[i]);
-
-        if (distance < minDistance) {
-          minDistance = distance;
-          closestTarget = i;
+        float v = sensors[i].velocity;
+        if (v > bestVelocity + 0.01) {
+          bestVelocity = v;
+          bestProx = sensors[i].filteredValue;
+          chosenTarget = i;
+        } else if (fabs(v - bestVelocity) <= 0.01 && sensors[i].filteredValue < bestProx) {
+          // tie on velocity -> pick farthest
+          bestProx = sensors[i].filteredValue;
+          chosenTarget = i;
         }
       }
     }
   }
 
-  if (closestTarget >= 0) {
+  if (chosenTarget >= 0) {
     // Found a target
-    currentTargetPosition = targetPositions[closestTarget];
-    activeTarget = closestTarget;
+    currentTargetPosition = targetPositions[chosenTarget];
+    activeTarget = chosenTarget;
 
-    Serial.print(F("Target selected: "));
-    Serial.print(closestTarget + 1);
+    Serial.print(F("Target selected (farthest forward): "));
+    Serial.print(chosenTarget + 1);
     Serial.print(F(" at position "));
     Serial.println(currentTargetPosition);
   }
@@ -485,6 +497,7 @@ void stateChooseActiveTarget() {
   lastError = 0;
   integral = 0;
   derivative = 0;
+  nudgeIndex = 0;
 
   // Transition to MOVE_TO_TARGET
   currentState = MOVE_TO_TARGET;
@@ -516,8 +529,9 @@ void stateMoveToTarget() {
 
   // Check if zombie activated LED (hit detection)
   if (activeTarget >= 0) {
-    if (sensors[activeTarget].justActivated) {
-      // Zombie has been hit!
+    // Consider a hit when we see a rising edge OR a forward-to-backward change with high reading
+    bool directionFlip = (sensors[activeTarget].direction == BACKWARD && sensors[activeTarget].velocity < -2.0 && sensors[activeTarget].rawValue > ACTIVATION_THRESHOLD_LOW);
+    if (sensors[activeTarget].justActivated || directionFlip) {
       recordHit();
 
       Serial.print(F("*** HIT! Target "));
@@ -539,6 +553,16 @@ void stateMoveToTarget() {
   if (abs(error) < DEADBAND) {
     // Position reached, check if we've waited long enough
     if (millis() - positionReachedTime > WAIT_TIME) {
+      // Try nudges before giving up
+      if (activeTarget >= 0 && nudgeIndex < NUDGE_COUNT) {
+        currentTargetPosition = targetPositions[activeTarget] + NUDGE_OFFSETS[nudgeIndex];
+        nudgeIndex++;
+        Serial.print(F("No activation, nudging to "));
+        Serial.println(currentTargetPosition);
+        positionReachedTime = millis();
+        return;
+      }
+
       // Position held but no activation - zombie missed or passed
       Serial.println(F("Position reached, no activation. Choosing new target."));
 
@@ -625,6 +649,9 @@ void updateSensors() {
 
     // Calculate derivative (rate of change)
     float derivative = sensors[i].filteredValue - sensors[i].lastFilteredValue;
+    float dt = (millis() - sensors[i].lastUpdate) / 1000.0;
+    if (dt <= 0) dt = CONTROL_PERIOD / 1000.0;
+    sensors[i].velocity = derivative / dt;
 
     // Determine direction based on derivative
     if (derivative > 2.0) {
@@ -710,10 +737,26 @@ void checkForBetterTarget() {
 
 void checkRoundTransition() {
   unsigned long elapsed = millis() - roundStartTime;
+  static unsigned long allStoppedSince = 0;
+
+  auto allSensorsStopped = [&]() {
+    for (int i = 0; i < 4; i++) {
+      if (fabs(sensors[i].velocity) > VEL_STOP_THRESH) return false;
+    }
+    return true;
+  };
+
+  bool sensorsStopped = allSensorsStopped();
+  if (sensorsStopped) {
+    if (allStoppedSince == 0) allStoppedSince = millis();
+  } else {
+    allStoppedSince = 0;
+  }
+  bool stoppedFor5s = (allStoppedSince > 0) && (millis() - allStoppedSince >= 5000);
 
   switch (currentRound) {
     case ROUND_1:
-      if (elapsed >= ROUND_1_DURATION) {
+      if (elapsed >= ROUND_1_DURATION && stoppedFor5s) {
         // Round 1 complete
         Serial.println(F("\n========================================"));
         Serial.println(F("=== ROUND 1 COMPLETE ==="));
@@ -727,7 +770,7 @@ void checkRoundTransition() {
       break;
 
     case ROUND_2:
-      if (elapsed >= ROUND_2_DURATION) {
+      if (elapsed >= ROUND_2_DURATION && stoppedFor5s) {
         // Round 2 complete
         Serial.println(F("\n========================================"));
         Serial.println(F("=== ROUND 2 COMPLETE ==="));
