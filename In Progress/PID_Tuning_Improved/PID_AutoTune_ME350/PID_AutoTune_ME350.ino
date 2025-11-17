@@ -668,6 +668,24 @@ void autoTuneZieglerNichols() {
     setMotorVoltage(voltage);
     delay(10);
   }
+
+  // Final close-in using current PID gains with small voltage cap
+  error = lastError = integral = derivative = 0;
+  unsigned long pidStart = millis();
+  unsigned long stableStart = millis();
+  const int CENTER_TOL = 3;
+  while (millis() - pidStart < 3000) {
+    float pidVoltage = updatePID(centerPosition);
+    float applied = constrain(pidVoltage, -4.0, 4.0);
+    setMotorVoltage(applied);
+
+    if (abs(error) <= CENTER_TOL) {
+      if (millis() - stableStart > 300) break;  // held near center
+    } else {
+      stableStart = millis();
+    }
+    delay(10);
+  }
   setMotorVoltage(0);
   delay(500);
 
@@ -1145,7 +1163,7 @@ void manualMoveTo(long targetPosition) {
   unsigned long settledTime = 0;
   bool hasSettled = false;
 
-  while (millis() - startTime < 10000) {  // 10 second window
+  while (millis() - startTime < 5000) {  // 5 second window
     float voltage = updatePID(targetPosition);
     float applied = constrain(voltage, -TEST_MAX_VOLTAGE, TEST_MAX_VOLTAGE);
     setMotorVoltage(applied);
