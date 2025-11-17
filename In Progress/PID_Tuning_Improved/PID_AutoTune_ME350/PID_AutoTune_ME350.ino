@@ -620,8 +620,9 @@ void autoTuneZieglerNichols() {
   // Relay parameters
   const float TEST_VOLTAGE = 5.0;  // Relay amplitude
   const long HYSTERESIS = TOTAL_RANGE / 6;  // Oscillation band
-  const int REQUIRED_PEAKS = 16;
-  const unsigned long TIMEOUT = 60000;  // 60 seconds
+  const int TARGET_PEAKS = 20;       // desired peaks for better averaging
+  const int MIN_PEAKS = 16;          // minimum acceptable
+  const unsigned long TIMEOUT = 120000;  // 120 seconds
 
   Serial.println(F("\nStarting relay oscillation test..."));
   Serial.print(F("Test voltage: "));
@@ -630,8 +631,8 @@ void autoTuneZieglerNichols() {
   Serial.println(HYSTERESIS);
 
   // Peak detection
-  long peaks[REQUIRED_PEAKS];
-  unsigned long peakTimes[REQUIRED_PEAKS];
+  long peaks[TARGET_PEAKS];
+  unsigned long peakTimes[TARGET_PEAKS];
   int peakCount = 0;
   bool lastAboveCenter = false;
   long lastCrossPosition = centerPosition;
@@ -641,7 +642,7 @@ void autoTuneZieglerNichols() {
   unsigned long testStart = millis();
   bool relayState = true;  // Start moving up
 
-  while (peakCount < REQUIRED_PEAKS && millis() - testStart < TIMEOUT) {
+  while (peakCount < TARGET_PEAKS && millis() - testStart < TIMEOUT) {
     long currentPos = motorEncoder.read();
     long deviation = currentPos - centerPosition;
 
@@ -669,7 +670,7 @@ void autoTuneZieglerNichols() {
       unsigned long crossTime = millis();
 
       // Record peak (skip first 4 for settling)
-      if (peakCount >= 4 && peakCount < REQUIRED_PEAKS + 4) {
+      if (peakCount >= 4 && peakCount < TARGET_PEAKS + 4) {
         peaks[peakCount - 4] = abs(lastCrossPosition - centerPosition);
         peakTimes[peakCount - 4] = crossTime - lastCrossTime;
       }
@@ -691,29 +692,30 @@ void autoTuneZieglerNichols() {
 
   setMotorVoltage(0);
 
-  if (peakCount < REQUIRED_PEAKS + 4) {
+  if (peakCount < MIN_PEAKS + 4) {
     Serial.println(F("ERROR: Insufficient peaks collected for reliable tuning."));
     Serial.print(F("Collected "));
     Serial.print(peakCount);
     Serial.print(F(" peaks, needed "));
-    Serial.println(REQUIRED_PEAKS + 4);
+    Serial.println(MIN_PEAKS + 4);
     lastTuneResults.valid = false;
     return;
   }
 
   // Calculate average amplitude
   long sumAmplitude = 0;
-  for (int i = 0; i < REQUIRED_PEAKS; i++) {
+  int peaksUsed = min(peakCount - 4, TARGET_PEAKS);
+  for (int i = 0; i < peaksUsed; i++) {
     sumAmplitude += peaks[i];
   }
-  float avgAmplitude = sumAmplitude / (float)REQUIRED_PEAKS;
+  float avgAmplitude = sumAmplitude / (float)peaksUsed;
 
   // Calculate average period
   unsigned long sumPeriod = 0;
-  for (int i = 0; i < REQUIRED_PEAKS - 1; i++) {
+  for (int i = 0; i < peaksUsed - 1; i++) {
     sumPeriod += peakTimes[i];
   }
-  float avgPeriod = (sumPeriod / (float)(REQUIRED_PEAKS - 1)) / 1000.0;  // Convert to seconds
+  float avgPeriod = (sumPeriod / (float)(peaksUsed - 1)) / 1000.0;  // Convert to seconds
 
   // Calculate Ku (ultimate gain)
   // Ku = 4 * V / (π * amplitude)
@@ -723,13 +725,13 @@ void autoTuneZieglerNichols() {
   lastTuneResults.Ku = Ku;
   lastTuneResults.Tu = avgPeriod * 2;  // Full period is 2 half-periods
   lastTuneResults.amplitude = avgAmplitude;
-  lastTuneResults.peakCount = REQUIRED_PEAKS;
+  lastTuneResults.peakCount = peaksUsed;
   lastTuneResults.valid = true;
 
   // Display results
   Serial.println(F("\n=== AUTO-TUNE RESULTS ==="));
   Serial.print(F("Peaks collected: "));
-  Serial.println(REQUIRED_PEAKS);
+  Serial.println(peaksUsed);
   Serial.print(F("Average amplitude: "));
   Serial.print(avgAmplitude);
   Serial.println(F(" encoder counts"));
@@ -748,10 +750,11 @@ void autoTuneZieglerNichols() {
   Serial.println(F("1. Conservative (30% of ZN) - RECOMMENDED for stability"));
   Serial.println(F("2. Classic Ziegler-Nichols (Full ZN) - Balanced"));
   Serial.println(F("3. Aggressive (80% of ZN) - Fast response"));
-  Serial.println(F("4. PD-Only (No integral) - Prevents windup"));
-  Serial.println(F("5. Cancel - Don't apply gains"));
+  Serial.println(F("4. Tyreus-Luyben (robust, less oscillatory)"));
+  Serial.println(F("5. PD-Only (No integral) - Prevents windup"));
+  Serial.println(F("6. Cancel - Don't apply gains"));
 
-  Serial.println(F("\nEnter selection (1-5):"));
+  Serial.println(F("\nEnter selection (1-6):"));
 
   while (!Serial.available()) { }
   char selection = Serial.read();
@@ -780,7 +783,17 @@ void autoTuneZieglerNichols() {
       Serial.println(F("Applying AGGRESSIVE gains (80% of ZN)..."));
       break;
 
-    case '4':  // PD-Only
+    case '4': {  // Tyreus-Luyben
+      // Using ultimate gain/period form
+      // Kp = 0.45*Ku, Ti = Tu/2.2, Td = Tu/6.3
+      newKp = 0.45 * Ku;
+      newKi = newKp * 2.2 / lastTuneResults.Tu;
+      newKd = newKp * (lastTuneResults.Tu / 6.3);
+      Serial.println(F("Applying TYREUS-LUYBEN gains..."));
+      break;
+    }
+
+    case '5':  // PD-Only
       newKp = 0.6 * Ku;
       newKi = 0.0;
       newKd = 0.125 * Ku * lastTuneResults.Tu;

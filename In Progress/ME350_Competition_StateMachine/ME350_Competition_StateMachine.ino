@@ -55,12 +55,13 @@
 // ============================================================================
 
 enum State {
+  IDLE = 0,
   CALIBRATE = 1,
   CHOOSE_ACTIVE_TARGET = 2,
   MOVE_TO_TARGET = 3
 };
 
-State currentState = CALIBRATE;
+State currentState = IDLE;
 
 // ============================================================================
 // ROUND MANAGEMENT
@@ -175,6 +176,7 @@ struct SensorData {
 };
 
 SensorData sensors[4];
+bool competitionEnabled = false;  // Must be started via command
 
 // ============================================================================
 // CALIBRATION STATE VARIABLES
@@ -204,6 +206,12 @@ unsigned long lastSensorUpdate = 0;
 unsigned long lastStatusPrint = 0;
 
 const unsigned long STATUS_PRINT_INTERVAL = 2000;  // Print status every 2s
+
+// Homing softness
+const float CALIBRATE_EXTRA_VOLTAGE = 0.6;          // added to overcome friction
+const float CALIBRATE_MIN_VOLTAGE = 2.5;            // minimum drive during homing
+const unsigned long CALIBRATE_HOLD_TIME = 300;      // ms hold on limit before zeroing
+const int CALIBRATE_STABLE_TICKS = 3;               // stable readings before zeroing
 
 // ============================================================================
 // SETUP
@@ -247,7 +255,7 @@ void setup() {
   Serial.println(F("  ME350 COMPETITION STATE MACHINE"));
   Serial.println(F("  Plants vs Zombies"));
   Serial.println(F("========================================"));
-  Serial.println(F("Starting in CALIBRATE state..."));
+  Serial.println(F("Starting in IDLE. Use serial commands to calibrate/start."));
   Serial.println(F("========================================\n"));
 }
 
@@ -257,6 +265,18 @@ void setup() {
 
 void loop() {
   unsigned long currentTime = millis();
+
+  // Handle serial commands
+  if (Serial.available()) {
+    char c = Serial.read();
+    handleCommand(c);
+  }
+
+  // Only update sensors/state machine when enabled or calibrating
+  if (currentState == IDLE && !competitionEnabled) {
+    // keep idle
+    return;
+  }
 
   // Update sensors at 100 Hz
   if (currentTime - lastSensorUpdate >= CONTROL_PERIOD) {
@@ -286,6 +306,10 @@ void loop() {
 // ============================================================================
 
 void runStateMachine() {
+  if (currentState == IDLE && !competitionEnabled) {
+    return;
+  }
+
   switch (currentState) {
     case CALIBRATE:
       stateCalibrate();
@@ -323,7 +347,23 @@ void stateCalibrate() {
     long movement = abs(currentPos - lastCalibrationPos);
 
     if (movement < 2) {
-      // Motor has stopped at limit
+      // Motor has stopped at limit; hold gently to remove bounce
+      unsigned long holdStart = millis();
+      long lastPos = currentPos;
+      int stableTicks = 0;
+      float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+      while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
+        setMotorVoltage(holdVoltage);
+        delay(10);
+        long pos = motorEncoder.read();
+        if (abs(pos - lastPos) <= 1) {
+          stableTicks++;
+        } else {
+          stableTicks = 0;
+          lastPos = pos;
+        }
+      }
+
       motorEncoder.write(0);  // Zero the encoder
       setMotorVoltage(0);     // Stop motor
 
@@ -338,14 +378,16 @@ void stateCalibrate() {
       currentTargetPosition = WAIT_POSITION;
       activeTarget = -1;
 
-      currentState = CHOOSE_ACTIVE_TARGET;
+      // If competition not enabled, return to IDLE; otherwise continue
+      currentState = competitionEnabled ? CHOOSE_ACTIVE_TARGET : IDLE;
     }
 
     lastCalibrationPos = currentPos;
   }
   else {
-    // Continue moving to left limit
-    setMotorVoltage(5.0);  // Constant voltage LEFT
+    // Continue moving to left limit with softer voltage
+    float driveVoltage = max(FRICTION_RIGHT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+    setMotorVoltage(driveVoltage);  // Constant voltage LEFT
 
     // Start calibration timer on first move
     if (calibrationStartTime == 0) {
@@ -819,6 +861,9 @@ void printStatus() {
   Serial.print(F(" | State: "));
 
   switch (currentState) {
+    case IDLE:
+      Serial.print(F("IDLE"));
+      break;
     case CALIBRATE:
       Serial.print(F("CALIBRATE"));
       break;
@@ -867,4 +912,107 @@ void printFinalScore() {
   Serial.print(F("TOTAL:   "));
   Serial.println(totalScore);
   Serial.println(F("========================================\n"));
+}
+
+// ============================================================================
+// COMMAND HANDLING & EEPROM
+// ============================================================================
+
+#include <EEPROM.h>
+
+const int EEPROM_FLAG = 0;
+const int EEPROM_TARGET_BASE = 4;  // 4*4 bytes for long
+
+void loadTargets() {
+  byte flag = EEPROM.read(EEPROM_FLAG);
+  if (flag != 0xAA) return;
+  for (int i = 0; i < 4; i++) {
+    long val;
+    EEPROM.get(EEPROM_TARGET_BASE + i * sizeof(long), val);
+    targetPositions[i] = val;
+  }
+  WAIT_POSITION = targetPositions[2];
+}
+
+void saveTargets() {
+  EEPROM.write(EEPROM_FLAG, 0xAA);
+  for (int i = 0; i < 4; i++) {
+    EEPROM.put(EEPROM_TARGET_BASE + i * sizeof(long), targetPositions[i]);
+  }
+  Serial.println(F("Lane positions saved to EEPROM."));
+}
+
+void printConfig() {
+  Serial.println(F("\n=== CONFIG ==="));
+  Serial.print(F("Lane 1: ")); Serial.println(targetPositions[0]);
+  Serial.print(F("Lane 2: ")); Serial.println(targetPositions[1]);
+  Serial.print(F("Lane 3: ")); Serial.println(targetPositions[2]);
+  Serial.print(F("Lane 4: ")); Serial.println(targetPositions[3]);
+  Serial.print(F("Wait pos: ")); Serial.println(WAIT_POSITION);
+  Serial.print(F("Competition enabled: "));
+  Serial.println(competitionEnabled ? F("YES") : F("NO"));
+}
+
+void handleCommand(char c) {
+  c = toupper(c);
+  switch (c) {
+    case 'H':
+      Serial.println(F("\nCommands:"));
+      Serial.println(F("  C - Calibrate to left limit"));
+      Serial.println(F("  1-4 - Set lane position to current encoder reading"));
+      Serial.println(F("  P - Print config"));
+      Serial.println(F("  S - Stop/IDLE"));
+      Serial.println(F("  G - Start competition (Round 1)"));
+      Serial.println(F("  L - Load lanes from EEPROM"));
+      Serial.println(F("  W - Save lanes to EEPROM"));
+      break;
+
+    case 'C':
+      currentState = CALIBRATE;
+      break;
+
+    case '1': case '2': case '3': case '4': {
+      int lane = c - '1';
+      long val = motorEncoder.read();
+      targetPositions[lane] = val;
+      WAIT_POSITION = targetPositions[2];
+      Serial.print(F("Lane ")); Serial.print(lane + 1);
+      Serial.print(F(" set to ")); Serial.println(val);
+      break;
+    }
+
+    case 'P':
+      printConfig();
+      break;
+
+    case 'S':
+      competitionEnabled = false;
+      currentState = IDLE;
+      setMotorVoltage(0);
+      Serial.println(F("Stopped. State=IDLE."));
+      break;
+
+    case 'G':
+      // Start competition
+      competitionEnabled = true;
+      currentRound = ROUND_1;
+      round1Score = round2Score = round3Score = totalScore = 0;
+      roundStartTime = millis();
+      currentState = isCalibrated ? CHOOSE_ACTIVE_TARGET : CALIBRATE;
+      Serial.println(F("Competition started (Round 1)."));
+      break;
+
+    case 'L':
+      loadTargets();
+      Serial.println(F("Loaded lane positions from EEPROM."));
+      printConfig();
+      break;
+
+    case 'W':
+      saveTargets();
+      break;
+
+    default:
+      break;
+  }
 }
