@@ -649,8 +649,26 @@ void autoTuneZieglerNichols() {
     setMotorVoltage(voltage);
     delay(10);
   }
+  // Tighten center approach with smaller voltage if still off
+  if (abs(motorEncoder.read() - centerPosition) > 10) {
+    moveStart = millis();
+    while (abs(motorEncoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
+      long currentPos = motorEncoder.read();
+      long err = centerPosition - currentPos;
+      float voltage = constrain(err * 0.008, -4.0, 4.0);
+      setMotorVoltage(voltage);
+      delay(10);
+    }
+  }
   setMotorVoltage(0);
   delay(500);
+
+  long finalCenterPos = motorEncoder.read();
+  Serial.print(F("Center approach ended at: "));
+  Serial.println(finalCenterPos);
+  if (abs(finalCenterPos - centerPosition) > 15) {
+    Serial.println(F("Warning: Not centered; results may be less accurate."));
+  }
 
   // Relay parameters
   const float TEST_VOLTAGE = 5.0;  // Relay amplitude
@@ -1104,6 +1122,9 @@ void manualLaneMove() {
 
 void manualMoveTo(long targetPosition) {
   Serial.println(F("\nTime(s),Position,Error,Integral,AppliedVoltage"));
+
+  // Clear any pending serial input that could abort immediately
+  while (Serial.available()) { Serial.read(); }
 
   // Reset PID state
   error = 0;
