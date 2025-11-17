@@ -78,6 +78,7 @@ bool frictionCharacterized = false;
 
 const float HOMING_EXTRA_VOLTAGE = 0.6;     // Added on top of friction during homing
 const unsigned long HOMING_HOLD_TIME = 400; // ms to hold on switch before zeroing
+const int HOMING_STABLE_TICKS = 3;          // Require this many consecutive stable readings
 
 // ============================================================================
 // CALIBRATION DATA
@@ -360,12 +361,21 @@ void calibrateRange() {
 
   // Wait for motor to stop
   delay(200);
-  // Hold against left limit to seat before zeroing
+  // Hold against left limit to seat before zeroing; require stability
   unsigned long holdStart = millis();
   float holdVoltage = max(FRICTION_RIGHT, 2.5);
-  while (millis() - holdStart < HOMING_HOLD_TIME) {
+  long lastPos = motorEncoder.read();
+  int stableTicks = 0;
+  while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
     setMotorVoltage(holdVoltage);
     delay(10);
+    long pos = motorEncoder.read();
+    if (abs(pos - lastPos) <= 1) {
+      stableTicks++;
+    } else {
+      stableTicks = 0;
+      lastPos = pos;
+    }
   }
   setMotorVoltage(0);
   delay(100);
@@ -395,12 +405,21 @@ void calibrateRange() {
 
   // Wait for motor to stop
   delay(200);
-  // Hold on right limit briefly for consistency
+  // Hold on right limit briefly with stability check
   holdStart = millis();
   float holdVoltageRight = -max(FRICTION_LEFT, 2.5);
-  while (millis() - holdStart < HOMING_HOLD_TIME) {
+  lastPos = motorEncoder.read();
+  stableTicks = 0;
+  while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
     setMotorVoltage(holdVoltageRight);
     delay(10);
+    long pos = motorEncoder.read();
+    if (abs(pos - lastPos) <= 1) {
+      stableTicks++;
+    } else {
+      stableTicks = 0;
+      lastPos = pos;
+    }
   }
   setMotorVoltage(0);
   delay(100);
@@ -973,12 +992,21 @@ void homeToLeft() {
     delay(10);
   }
 
-  // Hold on the switch before zeroing
+  // Hold on the switch before zeroing; ensure it settles
   unsigned long holdStart = millis();
   float holdVoltage = max(FRICTION_RIGHT, 2.5);
-  while (millis() - holdStart < HOMING_HOLD_TIME) {
+  long lastPos = motorEncoder.read();
+  int stableTicks = 0;
+  while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
     setMotorVoltage(holdVoltage);
     delay(10);
+    long pos = motorEncoder.read();
+    if (abs(pos - lastPos) <= 1) {
+      stableTicks++;
+    } else {
+      stableTicks = 0;
+      lastPos = pos;
+    }
   }
   setMotorVoltage(0);
   delay(200);
