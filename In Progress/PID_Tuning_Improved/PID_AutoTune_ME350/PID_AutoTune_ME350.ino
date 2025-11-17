@@ -68,6 +68,7 @@ float derivative = 0;
 const long DEADBAND = 5;  // Encoder counts
 const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz)
 const float TEST_MAX_VOLTAGE = 6.0;  // Max drive during manual tests to reduce slam
+const unsigned long LOG_INTERVAL_MS = 30; // Logging cadence for manual tests/moves
 
 // ============================================================================
 // FRICTION COMPENSATION
@@ -1041,14 +1042,14 @@ void manualPositionTest() {
   // Clear any pending serial input so we don't abort immediately
   while (Serial.available()) { Serial.read(); }
 
-  while (millis() - startTime < 10000) {  // 10 second test
+  while (millis() - startTime < 5000) {  // 5 second test
     // Update PID
     float voltage = updatePID(targetPosition);
     float applied = constrain(voltage, -TEST_MAX_VOLTAGE, TEST_MAX_VOLTAGE);
     setMotorVoltage(applied);
 
     // Print status every 100ms
-    if (millis() - lastPrint >= 100) {
+    if (millis() - lastPrint >= LOG_INTERVAL_MS) {
       float elapsedSec = (millis() - startTime) / 1000.0;
       long currentPos = motorEncoder.read();
 
@@ -1168,7 +1169,7 @@ void manualMoveTo(long targetPosition) {
     float applied = constrain(voltage, -TEST_MAX_VOLTAGE, TEST_MAX_VOLTAGE);
     setMotorVoltage(applied);
 
-    if (millis() - lastPrint >= 100) {
+    if (millis() - lastPrint >= LOG_INTERVAL_MS) {
       float elapsedSec = (millis() - startTime) / 1000.0;
       long currentPos = motorEncoder.read();
 
