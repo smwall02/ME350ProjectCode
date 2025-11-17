@@ -140,8 +140,8 @@ float controlDtSeconds = CONTROL_PERIOD / 1000.0;  // Actual loop dt for PID
 // ============================================================================
 
 // NOTE: Replace these with values from friction characterization!
-float FRICTION_LEFT = 2.2;   // Voltage to overcome friction moving LEFT
-float FRICTION_RIGHT = 0.25; // Voltage to overcome friction moving RIGHT
+float FRICTION_LEFT = 2.2;   // Voltage to overcome friction moving RIGHT (stored as positive, applied as negative)
+float FRICTION_RIGHT = 0.25; // Voltage to overcome friction moving LEFT (stored and applied as positive)
 
 // Adaptive friction boost (increases if target not reached)
 float adaptiveFrictionLeft = FRICTION_LEFT;
@@ -310,7 +310,7 @@ void loop() {
 
   // Run state machine at 100 Hz
   if (currentTime - lastControlUpdate >= CONTROL_PERIOD) {
-    controlDtSeconds = max((currentTime - lastControlUpdate) / 1000.0, CONTROL_PERIOD / 1000.0);
+    controlDtSeconds = (currentTime - lastControlUpdate) / 1000.0;  // Use actual dt for accurate PID derivative
     runStateMachine();
     lastControlUpdate = currentTime;
   }
@@ -529,8 +529,8 @@ void stateMoveToTarget() {
 
   // Check if zombie activated LED (hit detection)
   if (activeTarget >= 0) {
-    // Consider a hit when we see a rising edge OR a forward-to-backward change with high reading
-    bool directionFlip = (sensors[activeTarget].direction == BACKWARD && sensors[activeTarget].velocity < -2.0 && sensors[activeTarget].rawValue > ACTIVATION_THRESHOLD_LOW);
+    // Consider a hit when we see a rising edge OR a backward direction (zombie leaving after being close)
+    bool directionFlip = (sensors[activeTarget].direction == BACKWARD && sensors[activeTarget].rawValue > ACTIVATION_THRESHOLD_LOW);
     if (sensors[activeTarget].justActivated || directionFlip) {
       recordHit();
 
@@ -756,8 +756,12 @@ void checkRoundTransition() {
 
   switch (currentRound) {
     case ROUND_1:
-      if (elapsed >= ROUND_1_DURATION && stoppedFor5s) {
+      // Transition if: (time up AND sensors quiet for 5s) OR (time up + 10s grace period)
+      if ((elapsed >= ROUND_1_DURATION && stoppedFor5s) || (elapsed >= ROUND_1_DURATION + 10000)) {
         // Round 1 complete
+        if (elapsed >= ROUND_1_DURATION + 10000) {
+          Serial.println(F("Round 1 timeout - forcing transition"));
+        }
         Serial.println(F("\n========================================"));
         Serial.println(F("=== ROUND 1 COMPLETE ==="));
         Serial.print(F("Score: "));
@@ -766,12 +770,17 @@ void checkRoundTransition() {
 
         currentRound = ROUND_2;
         roundStartTime = millis();
+        allStoppedSince = 0;  // Reset for next round
       }
       break;
 
     case ROUND_2:
-      if (elapsed >= ROUND_2_DURATION && stoppedFor5s) {
+      // Transition if: (time up AND sensors quiet for 5s) OR (time up + 10s grace period)
+      if ((elapsed >= ROUND_2_DURATION && stoppedFor5s) || (elapsed >= ROUND_2_DURATION + 10000)) {
         // Round 2 complete
+        if (elapsed >= ROUND_2_DURATION + 10000) {
+          Serial.println(F("Round 2 timeout - forcing transition"));
+        }
         Serial.println(F("\n========================================"));
         Serial.println(F("=== ROUND 2 COMPLETE ==="));
         Serial.print(F("Score: "));
@@ -780,6 +789,7 @@ void checkRoundTransition() {
 
         currentRound = ROUND_3;
         roundStartTime = millis();
+        allStoppedSince = 0;  // Reset for next round
 
         Serial.println(F("=== ROUND 3 STARTING ==="));
         Serial.println(F("LED ONLY - Limit switch ends round!"));

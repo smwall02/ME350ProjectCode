@@ -74,8 +74,8 @@ const unsigned long LOG_INTERVAL_MS = 30; // Logging cadence for manual tests/mo
 // FRICTION COMPENSATION
 // ============================================================================
 
-float FRICTION_LEFT = 2.2;   // Voltage to overcome friction moving LEFT
-float FRICTION_RIGHT = 2.9;  // Voltage to overcome friction moving RIGHT
+float FRICTION_LEFT = 2.2;   // Voltage to overcome friction moving RIGHT (stored as positive, applied as negative)
+float FRICTION_RIGHT = 2.9;  // Voltage to overcome friction moving LEFT (stored and applied as positive)
 bool frictionCharacterized = false;
 
 const float HOMING_EXTRA_VOLTAGE = 0.6;     // Added on top of friction during homing
@@ -799,6 +799,8 @@ void autoTuneZieglerNichols() {
 
   // Calculate Ku (ultimate gain)
   // Ku = 4 * V / (π * amplitude)
+  // Units: Ku has dimensions of [V/count], which is correct for our PID implementation
+  // where error is in encoder counts and output is in volts
   float Ku = (4.0 * TEST_VOLTAGE) / (PI * avgAmplitude);
 
   // Store results
@@ -844,11 +846,11 @@ void autoTuneZieglerNichols() {
   float ki5 = 0.0;
   float kd5 = 0.125 * Ku * lastTuneResults.Tu;
 
-  Serial.println(F("1. Conservative (30% ZN)     -> Kp=")); Serial.print(kp1, 4); Serial.print(F(" Ki=")); Serial.print(ki1, 4); Serial.print(F(" Kd=")); Serial.println(kd1, 4);
-  Serial.println(F("2. Classic ZN (100%)         -> Kp=")); Serial.print(kp2, 4); Serial.print(F(" Ki=")); Serial.print(ki2, 4); Serial.print(F(" Kd=")); Serial.println(kd2, 4);
-  Serial.println(F("3. Aggressive (80% ZN)       -> Kp=")); Serial.print(kp3, 4); Serial.print(F(" Ki=")); Serial.print(ki3, 4); Serial.print(F(" Kd=")); Serial.println(kd3, 4);
-  Serial.println(F("4. Tyreus-Luyben (robust)    -> Kp=")); Serial.print(kp4, 4); Serial.print(F(" Ki=")); Serial.print(ki4, 4); Serial.print(F(" Kd=")); Serial.println(kd4, 4);
-  Serial.println(F("5. PD-Only (no integral)     -> Kp=")); Serial.print(kp5, 4); Serial.print(F(" Ki=")); Serial.print(ki5, 4); Serial.print(F(" Kd=")); Serial.println(kd5, 4);
+  Serial.print(F("1. Conservative (30% ZN)     -> Kp=")); Serial.print(kp1, 4); Serial.print(F(" Ki=")); Serial.print(ki1, 4); Serial.print(F(" Kd=")); Serial.println(kd1, 4);
+  Serial.print(F("2. Classic ZN (100%)         -> Kp=")); Serial.print(kp2, 4); Serial.print(F(" Ki=")); Serial.print(ki2, 4); Serial.print(F(" Kd=")); Serial.println(kd2, 4);
+  Serial.print(F("3. Aggressive (80% ZN)       -> Kp=")); Serial.print(kp3, 4); Serial.print(F(" Ki=")); Serial.print(ki3, 4); Serial.print(F(" Kd=")); Serial.println(kd3, 4);
+  Serial.print(F("4. Tyreus-Luyben (robust)    -> Kp=")); Serial.print(kp4, 4); Serial.print(F(" Ki=")); Serial.print(ki4, 4); Serial.print(F(" Kd=")); Serial.println(kd4, 4);
+  Serial.print(F("5. PD-Only (no integral)     -> Kp=")); Serial.print(kp5, 4); Serial.print(F(" Ki=")); Serial.print(ki5, 4); Serial.print(F(" Kd=")); Serial.println(kd5, 4);
   Serial.println(F("6. Cancel - Don't apply gains"));
 
   Serial.println(F("\nEnter selection (1-6):"));
