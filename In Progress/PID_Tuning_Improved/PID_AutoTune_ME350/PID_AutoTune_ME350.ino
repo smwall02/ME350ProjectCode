@@ -971,36 +971,14 @@ void manualPositionTest() {
   Serial.print(F("Kd = "));
   Serial.println(KD, 6);
 
-  Serial.print(F("\nEnter target position ("));
-  Serial.print(RIGHT_LIMIT_POSITION);
-  Serial.print(F(" to "));
-  Serial.print(LEFT_LIMIT_POSITION);
-  Serial.println(F("):"));
-
-  while (!Serial.available()) { }
-  long targetPosition = Serial.parseInt();
-
-  // Clear serial buffer
-  while (Serial.available()) {
-    Serial.read();
-  }
-
-  // Validate target
-  if (targetPosition < RIGHT_LIMIT_POSITION || targetPosition > LEFT_LIMIT_POSITION) {
-    Serial.println(F("ERROR: Target position out of range."));
-    return;
-  }
-
   // Always home first to avoid drift
   homeToLeft();
   delay(300);
 
-  // If user entered 0, default to lane 3
-  if (targetPosition == 0) {
-    targetPosition = LANE_POSITIONS[2];
-  }
+  // Always target Lane 3 for this test
+  long targetPosition = LANE_POSITIONS[2];
 
-  Serial.print(F("Moving to position: "));
+  Serial.print(F("Moving to Lane 3 position: "));
   Serial.println(targetPosition);
   Serial.println(F("Press any key to stop test early."));
   Serial.println(F("\nTime(s),Position,Error,Integral,AppliedVoltage"));
