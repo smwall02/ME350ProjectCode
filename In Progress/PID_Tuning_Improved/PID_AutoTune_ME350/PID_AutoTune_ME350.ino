@@ -67,6 +67,7 @@ float derivative = 0;
 
 const long DEADBAND = 5;  // Encoder counts
 const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz)
+const float TEST_MAX_VOLTAGE = 6.0;  // Max drive during manual tests to reduce slam
 
 // ============================================================================
 // FRICTION COMPENSATION
@@ -88,6 +89,9 @@ long LEFT_LIMIT_POSITION = 0;
 long RIGHT_LIMIT_POSITION = -1800;
 long TOTAL_RANGE = 0;
 
+// Lane positions (can be set via serial)
+long LANE_POSITIONS[4] = {0, -350, -700, -1050};
+
 bool isCalibrated = false;
 
 // ============================================================================
@@ -102,6 +106,7 @@ const int EEPROM_FRICTION_LEFT = 13;
 const int EEPROM_FRICTION_RIGHT = 17;
 const int EEPROM_LEFT_LIMIT = 21;
 const int EEPROM_RIGHT_LIMIT = 25;
+const int EEPROM_LANES_BASE = 29;  // 4 lanes * 4 bytes each
 
 // ============================================================================
 // AUTO-TUNE RESULTS
@@ -197,6 +202,28 @@ void processCommand(char cmd) {
 
     case 'C':
       clearCalibration();
+      break;
+
+    case '1': case '2': case '3': case '4': {
+      int lane = cmd - '1';
+      LANE_POSITIONS[lane] = motorEncoder.read();
+      Serial.print(F("Lane "));
+      Serial.print(lane + 1);
+      Serial.print(F(" set to "));
+      Serial.println(LANE_POSITIONS[lane]);
+      saveCalibration();
+      break;
+    }
+
+    case 'L':
+      loadCalibration();
+      Serial.println(F("Loaded calibration and lane positions from EEPROM."));
+      printStatus();
+      break;
+
+    case 'W':
+      saveCalibration();
+      Serial.println(F("Saved calibration and lane positions to EEPROM."));
       break;
 
     case '?':
@@ -344,7 +371,7 @@ void calibrateRange() {
 
   // Move to left limit
   Serial.println(F("Moving to left limit..."));
-  float leftDrive = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE, 3.0);
+  float leftDrive = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotorVoltage(leftDrive);
 
   unsigned long startTime = millis();
@@ -388,7 +415,7 @@ void calibrateRange() {
   // Move to right limit
   Serial.println(F("Moving to right limit..."));
   delay(500);
-  float rightDrive = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE, 3.0);
+  float rightDrive = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotorVoltage(rightDrive);
 
   startTime = millis();
@@ -502,7 +529,7 @@ void characterizeFriction() {
 
   // Move to right limit
   Serial.println(F("Moving to right limit..."));
-  float driveRight = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE, 3.0);
+  float driveRight = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotorVoltage(driveRight);
   unsigned long driveStart = millis();
   while (digitalRead(LIMIT_RIGHT) == LOW) {
@@ -747,11 +774,28 @@ void autoTuneZieglerNichols() {
   // Offer tuning options
   Serial.println(F("\n=== TUNING OPTIONS ==="));
   Serial.println(F("Select a tuning method:"));
-  Serial.println(F("1. Conservative (30% of ZN) - RECOMMENDED for stability"));
-  Serial.println(F("2. Classic Ziegler-Nichols (Full ZN) - Balanced"));
-  Serial.println(F("3. Aggressive (80% of ZN) - Fast response"));
-  Serial.println(F("4. Tyreus-Luyben (robust, less oscillatory)"));
-  Serial.println(F("5. PD-Only (No integral) - Prevents windup"));
+  // Pre-compute suggested gains for display
+  float kp1 = 0.3 * 0.6 * Ku;
+  float ki1 = 0.3 * 1.2 * Ku / lastTuneResults.Tu;
+  float kd1 = 0.3 * 0.075 * Ku * lastTuneResults.Tu;
+  float kp2 = 0.6 * Ku;
+  float ki2 = 1.2 * Ku / lastTuneResults.Tu;
+  float kd2 = 0.075 * Ku * lastTuneResults.Tu;
+  float kp3 = 0.8 * 0.6 * Ku;
+  float ki3 = 0.8 * 1.2 * Ku / lastTuneResults.Tu;
+  float kd3 = 0.8 * 0.075 * Ku * lastTuneResults.Tu;
+  float kp4 = 0.45 * Ku;
+  float ki4 = kp4 * 2.2 / lastTuneResults.Tu;
+  float kd4 = kp4 * (lastTuneResults.Tu / 6.3);
+  float kp5 = 0.6 * Ku;
+  float ki5 = 0.0;
+  float kd5 = 0.125 * Ku * lastTuneResults.Tu;
+
+  Serial.println(F("1. Conservative (30% ZN)     -> Kp=")); Serial.print(kp1, 4); Serial.print(F(" Ki=")); Serial.print(ki1, 4); Serial.print(F(" Kd=")); Serial.println(kd1, 4);
+  Serial.println(F("2. Classic ZN (100%)         -> Kp=")); Serial.print(kp2, 4); Serial.print(F(" Ki=")); Serial.print(ki2, 4); Serial.print(F(" Kd=")); Serial.println(kd2, 4);
+  Serial.println(F("3. Aggressive (80% ZN)       -> Kp=")); Serial.print(kp3, 4); Serial.print(F(" Ki=")); Serial.print(ki3, 4); Serial.print(F(" Kd=")); Serial.println(kd3, 4);
+  Serial.println(F("4. Tyreus-Luyben (robust)    -> Kp=")); Serial.print(kp4, 4); Serial.print(F(" Ki=")); Serial.print(ki4, 4); Serial.print(F(" Kd=")); Serial.println(kd4, 4);
+  Serial.println(F("5. PD-Only (no integral)     -> Kp=")); Serial.print(kp5, 4); Serial.print(F(" Ki=")); Serial.print(ki5, 4); Serial.print(F(" Kd=")); Serial.println(kd5, 4);
   Serial.println(F("6. Cancel - Don't apply gains"));
 
   Serial.println(F("\nEnter selection (1-6):"));
@@ -934,7 +978,7 @@ void manualPositionTest() {
   Serial.print(F("Moving to position: "));
   Serial.println(targetPosition);
   Serial.println(F("Press any key to stop test early."));
-  Serial.println(F("\nTime(s),Position,Error,Integral,Voltage"));
+  Serial.println(F("\nTime(s),Position,Error,Integral,AppliedVoltage"));
 
   // Reset PID state
   error = 0;
@@ -950,7 +994,8 @@ void manualPositionTest() {
   while (millis() - startTime < 10000) {  // 10 second test
     // Update PID
     float voltage = updatePID(targetPosition);
-    setMotorVoltage(voltage);
+    float applied = constrain(voltage, -TEST_MAX_VOLTAGE, TEST_MAX_VOLTAGE);
+    setMotorVoltage(applied);
 
     // Print status every 100ms
     if (millis() - lastPrint >= 100) {
@@ -965,7 +1010,7 @@ void manualPositionTest() {
       Serial.print(",");
       Serial.print(integral, 2);
       Serial.print(",");
-      Serial.println(voltage, 3);
+      Serial.println(applied, 3);
 
       lastPrint = millis();
     }
@@ -1010,7 +1055,7 @@ void manualPositionTest() {
 void homeToLeft() {
   Serial.println(F("Homing to left limit..."));
 
-  float driveVoltage = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE, 3.0);
+  float driveVoltage = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotorVoltage(driveVoltage);
 
   unsigned long startTime = millis();
@@ -1078,6 +1123,12 @@ void printStatus() {
   Serial.print(FRICTION_RIGHT, 3);
   Serial.println(F(" V"));
 
+  Serial.println(F("\n=== LANES ==="));
+  Serial.print(F("Lane 1: ")); Serial.println(LANE_POSITIONS[0]);
+  Serial.print(F("Lane 2: ")); Serial.println(LANE_POSITIONS[1]);
+  Serial.print(F("Lane 3: ")); Serial.println(LANE_POSITIONS[2]);
+  Serial.print(F("Lane 4: ")); Serial.println(LANE_POSITIONS[3]);
+
   if (lastTuneResults.valid) {
     Serial.println(F("\n=== LAST AUTO-TUNE RESULTS ==="));
     Serial.print(F("Ku = "));
@@ -1102,6 +1153,9 @@ void printHelp() {
   Serial.println(F("H - Home (return to left limit and zero encoder)"));
   Serial.println(F("P - Print Status (show all current settings)"));
   Serial.println(F("C - Clear Calibration (erase EEPROM data)"));
+  Serial.println(F("1-4 - Set lane position to current encoder value"));
+  Serial.println(F("L - Load calibration/lanes from EEPROM"));
+  Serial.println(F("W - Write calibration/lanes to EEPROM"));
   Serial.println(F("? - Help (show this menu)"));
 
   Serial.println(F("\n=== RECOMMENDED WORKFLOW ==="));
@@ -1143,6 +1197,9 @@ void saveCalibration() {
   EEPROM.put(EEPROM_FRICTION_RIGHT, FRICTION_RIGHT);
   EEPROM.put(EEPROM_LEFT_LIMIT, LEFT_LIMIT_POSITION);
   EEPROM.put(EEPROM_RIGHT_LIMIT, RIGHT_LIMIT_POSITION);
+  for (int i = 0; i < 4; i++) {
+    EEPROM.put(EEPROM_LANES_BASE + i * sizeof(long), LANE_POSITIONS[i]);
+  }
 
   Serial.println(F("Calibration saved to EEPROM."));
 }
@@ -1158,6 +1215,11 @@ void loadCalibration() {
     EEPROM.get(EEPROM_FRICTION_RIGHT, FRICTION_RIGHT);
     EEPROM.get(EEPROM_LEFT_LIMIT, LEFT_LIMIT_POSITION);
     EEPROM.get(EEPROM_RIGHT_LIMIT, RIGHT_LIMIT_POSITION);
+    for (int i = 0; i < 4; i++) {
+      long v;
+      EEPROM.get(EEPROM_LANES_BASE + i * sizeof(long), v);
+      LANE_POSITIONS[i] = v;
+    }
 
     TOTAL_RANGE = abs(RIGHT_LIMIT_POSITION - LEFT_LIMIT_POSITION);
     isCalibrated = (TOTAL_RANGE > 100);
