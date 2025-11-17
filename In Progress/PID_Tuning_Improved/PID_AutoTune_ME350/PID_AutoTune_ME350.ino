@@ -167,6 +167,9 @@ void loop() {
 // ============================================================================
 
 void processCommand(char cmd) {
+  // Ignore whitespace/newlines to reduce "Unknown command" spam
+  if (cmd == '\r' || cmd == '\n' || cmd == ' ' || cmd == '\t') return;
+
   switch (toupper(cmd)) {
     case 'R':
       calibrateRange();
@@ -189,6 +192,11 @@ void processCommand(char cmd) {
     case 'T':
       if (!ensureRangeAndFrictionReady()) return;
       manualPositionTest();
+      break;
+
+    case 'M':
+      if (!ensureRangeAndFrictionReady()) return;
+      manualLaneMove();
       break;
 
     case 'H':
@@ -916,8 +924,8 @@ void stepResponse() {
 
   setMotorVoltage(5.0);
 
-  // Record for 3 seconds or until right limit
-  while (millis() - startTime < 3000 && digitalRead(LIMIT_RIGHT) == HIGH) {
+  // Record for 3 seconds or until right limit is pressed (active HIGH)
+  while (millis() - startTime < 3000 && digitalRead(LIMIT_RIGHT) == LOW) {
     unsigned long elapsed = millis() - startTime;
     long position = motorEncoder.read();
 
@@ -981,6 +989,15 @@ void manualPositionTest() {
   if (targetPosition < RIGHT_LIMIT_POSITION || targetPosition > LEFT_LIMIT_POSITION) {
     Serial.println(F("ERROR: Target position out of range."));
     return;
+  }
+
+  // Always home first to avoid drift
+  homeToLeft();
+  delay(300);
+
+  // If user entered 0, default to lane 3
+  if (targetPosition == 0) {
+    targetPosition = LANE_POSITIONS[2];
   }
 
   Serial.print(F("Moving to position: "));
@@ -1052,6 +1069,111 @@ void manualPositionTest() {
     Serial.println(F(" seconds"));
   }
   else {
+    Serial.println(F("Warning: Did not settle within test period."));
+  }
+}
+
+// ============================================================================
+// MANUAL LANE MOVE
+// ============================================================================
+
+void manualLaneMove() {
+  Serial.println(F("\n=== MANUAL LANE MOVE ==="));
+
+  if (!isCalibrated) {
+    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    return;
+  }
+
+  Serial.println(F("Enter lane number (1-4), or 0 to cancel:"));
+  while (!Serial.available()) { }
+  int lane = Serial.parseInt();
+  while (Serial.available()) Serial.read();  // clear buffer
+
+  if (lane < 1 || lane > 4) {
+    Serial.println(F("Cancelled."));
+    return;
+  }
+
+  long target = LANE_POSITIONS[lane - 1];
+  Serial.print(F("Homing then moving to lane "));
+  Serial.print(lane);
+  Serial.print(F(" at position "));
+  Serial.println(target);
+
+  homeToLeft();
+  delay(300);
+
+  manualMoveTo(target);
+}
+
+// ============================================================================
+// SHARED MANUAL MOVE HELPER
+// ============================================================================
+
+void manualMoveTo(long targetPosition) {
+  Serial.println(F("\nTime(s),Position,Error,Integral,AppliedVoltage"));
+
+  // Reset PID state
+  error = 0;
+  lastError = 0;
+  integral = 0;
+  derivative = 0;
+
+  unsigned long startTime = millis();
+  unsigned long lastPrint = 0;
+  unsigned long settledTime = 0;
+  bool hasSettled = false;
+
+  while (millis() - startTime < 10000) {  // 10 second window
+    float voltage = updatePID(targetPosition);
+    float applied = constrain(voltage, -TEST_MAX_VOLTAGE, TEST_MAX_VOLTAGE);
+    setMotorVoltage(applied);
+
+    if (millis() - lastPrint >= 100) {
+      float elapsedSec = (millis() - startTime) / 1000.0;
+      long currentPos = motorEncoder.read();
+
+      Serial.print(elapsedSec, 2);
+      Serial.print(",");
+      Serial.print(currentPos);
+      Serial.print(",");
+      Serial.print(error);
+      Serial.print(",");
+      Serial.print(integral, 2);
+      Serial.print(",");
+      Serial.println(applied, 3);
+
+      lastPrint = millis();
+    }
+
+    if (abs(error) < DEADBAND && !hasSettled) {
+      settledTime = millis();
+      hasSettled = true;
+    }
+
+    if (Serial.available()) {
+      Serial.read();  // consume key
+      break;
+    }
+
+    delay(CONTROL_PERIOD);
+  }
+
+  setMotorVoltage(0);
+
+  Serial.println(F("\n=== MOVE COMPLETE ==="));
+  Serial.print(F("Final position: "));
+  Serial.println(motorEncoder.read());
+  Serial.print(F("Final error: "));
+  Serial.println(error);
+
+  if (hasSettled) {
+    float settleTime = (settledTime - startTime) / 1000.0;
+    Serial.print(F("Settling time: "));
+    Serial.print(settleTime, 2);
+    Serial.println(F(" seconds"));
+  } else {
     Serial.println(F("Warning: Did not settle within test period."));
   }
 }
@@ -1158,6 +1280,7 @@ void printHelp() {
   Serial.println(F("Z - Ziegler-Nichols Auto-Tune (relay oscillation method)"));
   Serial.println(F("S - Step Response Analysis (voltage step test)"));
   Serial.println(F("T - Manual Position Test (test current PID gains)"));
+  Serial.println(F("M - Manual lane move (enter lane # to move)"));
   Serial.println(F("H - Home (return to left limit and zero encoder)"));
   Serial.println(F("P - Print Status (show all current settings)"));
   Serial.println(F("C - Clear Calibration (erase EEPROM data)"));
