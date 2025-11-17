@@ -582,8 +582,19 @@ void autoTuneZieglerNichols() {
   Serial.println(F("Ensure system is clear and ready to move."));
   Serial.println(F("Press 'Y' to continue or any other key to cancel..."));
 
-  while (!Serial.available()) { }
-  char response = Serial.read();
+  // Flush any stray input (e.g., newline from previous command)
+  while (Serial.available()) { Serial.read(); }
+  // Wait for a non-newline response
+  char response = 0;
+  while (response == 0) {
+    while (!Serial.available()) { }
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') {
+      continue;
+    }
+    response = c;
+  }
+
   if (toupper(response) != 'Y') {
     Serial.println(F("Auto-tune cancelled."));
     return;
