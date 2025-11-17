@@ -234,6 +234,8 @@ const float VEL_STOP_THRESH = 2.0;  // counts/sec considered stopped
 
 // Proximity normalization
 const unsigned long PROX_CALIBRATION_WINDOW = 5000;  // ms to learn min/max per sensor after start
+unsigned long lastHitTime[4] = {0, 0, 0, 0};
+const unsigned long HIT_COOLDOWN = 1500;  // ms before retargeting same lane
 
 // ============================================================================
 // SETUP
@@ -470,11 +472,18 @@ void stateChooseActiveTarget() {
   }
 
   if (chosenTarget >= 0) {
+    // Skip if recently hit and still in cooldown
+    if (millis() - lastHitTime[chosenTarget] < HIT_COOLDOWN) {
+      chosenTarget = -1;
+    }
+  }
+
+  if (chosenTarget >= 0) {
     // Found a target
     currentTargetPosition = targetPositions[chosenTarget];
     activeTarget = chosenTarget;
 
-    Serial.print(F("Target selected (normalized farthest): "));
+    Serial.print(F("Target selected (lowest prox): "));
     Serial.print(chosenTarget + 1);
     Serial.print(F(" at position "));
     Serial.println(currentTargetPosition);
@@ -695,10 +704,8 @@ void checkForBetterTarget() {
       continue;  // Skip current target
     }
 
-    // Check if this sensor detects a forward-moving zombie
-    if (sensors[i].active &&
-        sensors[i].direction == FORWARD) {
-
+    // Check if this sensor detects a zombie
+    if (sensors[i].rawValue > ACTIVATION_THRESHOLD_LOW) {
       long newTargetDistance = abs(currentPos - targetPositions[i]);
 
       // Switch if new target is significantly closer (>20% closer)
@@ -735,6 +742,10 @@ void recordHit() {
   /*
    * Record a zombie hit based on current round rules
    */
+
+  if (activeTarget >= 0) {
+    lastHitTime[activeTarget] = millis();
+  }
 
   switch (currentRound) {
     case ROUND_1:
