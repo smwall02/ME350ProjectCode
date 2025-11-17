@@ -67,7 +67,7 @@ float derivative = 0;
 
 const long DEADBAND = 5;  // Encoder counts
 const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz)
-const float TEST_MAX_VOLTAGE = 6.0;  // Max drive during manual tests to reduce slam
+const float TEST_MAX_VOLTAGE = 5.0;  // Base max drive during manual tests to reduce slam
 const unsigned long LOG_INTERVAL_MS = 30; // Logging cadence for manual tests/moves
 
 // ============================================================================
@@ -1045,7 +1045,7 @@ void manualPositionTest() {
   while (millis() - startTime < 5000) {  // 5 second test
     // Update PID
     float voltage = updatePID(targetPosition);
-    float applied = constrain(voltage, -TEST_MAX_VOLTAGE, TEST_MAX_VOLTAGE);
+    float applied = cappedVoltageForError(voltage, error);
     setMotorVoltage(applied);
 
     // Print status every 100ms
@@ -1166,7 +1166,7 @@ void manualMoveTo(long targetPosition) {
 
   while (millis() - startTime < 5000) {  // 5 second window
     float voltage = updatePID(targetPosition);
-    float applied = constrain(voltage, -TEST_MAX_VOLTAGE, TEST_MAX_VOLTAGE);
+    float applied = cappedVoltageForError(voltage, error);
     setMotorVoltage(applied);
 
     if (millis() - lastPrint >= LOG_INTERVAL_MS) {
@@ -1418,4 +1418,13 @@ void clearCalibration() {
 
   Serial.println(F("Calibration cleared. Defaults restored."));
   Serial.println(F("Run 'R' to recalibrate."));
+}
+float cappedVoltageForError(float voltage, long error) {
+  long absErr = abs(error);
+  float cap = TEST_MAX_VOLTAGE;
+  if (absErr > 800) cap = min(cap, 4.5f);
+  else if (absErr > 400) cap = min(cap, 4.0f);
+  else if (absErr > 200) cap = min(cap, 3.5f);
+  else cap = min(cap, 3.0f);
+  return constrain(voltage, -cap, cap);
 }

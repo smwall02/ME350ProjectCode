@@ -23,6 +23,7 @@
  */
 
 #include <Encoder.h>
+#include <EEPROM.h>
 
 // ============================================================================
 // PIN CONFIGURATION
@@ -178,6 +179,17 @@ struct SensorData {
 SensorData sensors[4];
 bool competitionEnabled = false;  // Must be started via command
 
+// EEPROM layout shared with PID auto-tune sketch
+const int EEPROM_FLAG = 0;
+const int EEPROM_KP = 1;
+const int EEPROM_KI = 5;
+const int EEPROM_KD = 9;
+const int EEPROM_FRICTION_LEFT = 13;
+const int EEPROM_FRICTION_RIGHT = 17;
+const int EEPROM_LEFT_LIMIT = 21;
+const int EEPROM_RIGHT_LIMIT = 25;
+const int EEPROM_LANES_BASE = 29;  // 4 lanes * 4 bytes each
+
 // ============================================================================
 // CALIBRATION STATE VARIABLES
 // ============================================================================
@@ -245,6 +257,9 @@ void setup() {
 
   // Stop motor initially
   setMotorVoltage(0);
+
+  // Load PID, friction, limits, and lane positions from EEPROM (if present)
+  loadCalibrationFromEEPROM();
 
   // Initialize timing
   lastControlUpdate = millis();
@@ -912,6 +927,46 @@ void printFinalScore() {
   Serial.print(F("TOTAL:   "));
   Serial.println(totalScore);
   Serial.println(F("========================================\n"));
+}
+
+// ============================================================================
+// EEPROM LOADING
+// ============================================================================
+
+void loadCalibrationFromEEPROM() {
+  byte flag = EEPROM.read(EEPROM_FLAG);
+  if (flag != 0xAA) {
+    Serial.println(F("EEPROM flag not set; using defaults."));
+    return;
+  }
+
+  EEPROM.get(EEPROM_KP, KP);
+  EEPROM.get(EEPROM_KI, KI);
+  EEPROM.get(EEPROM_KD, KD);
+  EEPROM.get(EEPROM_FRICTION_LEFT, FRICTION_LEFT);
+  EEPROM.get(EEPROM_FRICTION_RIGHT, FRICTION_RIGHT);
+  EEPROM.get(EEPROM_LEFT_LIMIT, TARGET_1_POSITION);   // not directly used, but keep compatible
+  EEPROM.get(EEPROM_RIGHT_LIMIT, TARGET_4_POSITION);  // not directly used, but keep compatible
+
+  for (int i = 0; i < 4; i++) {
+    long v;
+    EEPROM.get(EEPROM_LANES_BASE + i * sizeof(long), v);
+    targetPositions[i] = v;
+  }
+  WAIT_POSITION = targetPositions[2];
+
+  Serial.println(F("Loaded PID/friction/lanes from EEPROM:"));
+  Serial.print(F("  Kp=")); Serial.print(KP, 6);
+  Serial.print(F(" Ki=")); Serial.print(KI, 6);
+  Serial.print(F(" Kd=")); Serial.println(KD, 6);
+  Serial.print(F("  Fric L=")); Serial.print(FRICTION_LEFT, 3);
+  Serial.print(F(" R=")); Serial.println(FRICTION_RIGHT, 3);
+  Serial.print(F("  Lanes: "));
+  for (int i = 0; i < 4; i++) {
+    Serial.print(targetPositions[i]);
+    if (i < 3) Serial.print(F(", "));
+  }
+  Serial.println();
 }
 
 // ============================================================================
