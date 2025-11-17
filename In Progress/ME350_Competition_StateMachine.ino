@@ -1,0 +1,807 @@
+/*
+ * ME350 Competition State Machine Code
+ * Plants vs Zombies - Target Interception System
+ *
+ * Features:
+ * - Three-state machine (CALIBRATE, CHOOSE_ACTIVE_TARGET, MOVE_TO_TARGET)
+ * - Three-round competition support with different rules per round
+ * - Adaptive target selection (prioritizes closest forward-moving zombie)
+ * - Low-pass filtered sensor readings with direction detection
+ * - PID position control with friction compensation
+ * - Comprehensive scoring and status display
+ *
+ * Hardware: Standard ME350 configuration
+ * - Encoder: Pins 2, 3
+ * - Motor: Pins 11 (PWM), 12, 13 (direction)
+ * - Limit Switches: Pins 8 (left), 9 (right)
+ * - Proximity Sensors: A0, A1, A2, A3
+ *
+ * Competition Rules:
+ * Round 1: 40s, normal speed, LED or limit counts
+ * Round 2: 40s, faster, LED or limit counts
+ * Round 3: Until fail, LED only, increasing speed
+ */
+
+#include <Encoder.h>
+
+// ============================================================================
+// PIN CONFIGURATION
+// ============================================================================
+
+// Encoder
+#define ENCODER_A 2
+#define ENCODER_B 3
+
+// Motor Control (H-Bridge)
+#define MOTOR_ENA 11  // PWM
+#define MOTOR_IN2 12  // Direction 1
+#define MOTOR_IN3 13  // Direction 2
+
+// Limit Switches (active LOW with INPUT_PULLUP)
+#define LIMIT_LEFT 8   // Zero position
+#define LIMIT_RIGHT 9  // Maximum range
+
+// Proximity Sensors
+#define PROX_SENSOR_1 A0
+#define PROX_SENSOR_2 A1
+#define PROX_SENSOR_3 A2
+#define PROX_SENSOR_4 A3
+
+// ============================================================================
+// STATE MACHINE DEFINITIONS
+// ============================================================================
+
+enum State {
+  CALIBRATE = 1,
+  CHOOSE_ACTIVE_TARGET = 2,
+  MOVE_TO_TARGET = 3
+};
+
+State currentState = CALIBRATE;
+
+// ============================================================================
+// ROUND MANAGEMENT
+// ============================================================================
+
+enum Round {
+  ROUND_1 = 1,
+  ROUND_2 = 2,
+  ROUND_3 = 3,
+  COMPLETE = 4
+};
+
+Round currentRound = ROUND_1;
+unsigned long roundStartTime = 0;
+
+const unsigned long ROUND_1_DURATION = 40000;  // 40 seconds
+const unsigned long ROUND_2_DURATION = 40000;  // 40 seconds
+// Round 3 has no time limit - runs until zombie hits front limit
+
+int round1Score = 0;
+int round2Score = 0;
+int round3Score = 0;
+int totalScore = 0;
+
+// ============================================================================
+// GLOBAL OBJECTS
+// ============================================================================
+
+Encoder motorEncoder(ENCODER_A, ENCODER_B);
+
+// ============================================================================
+// TARGET POSITIONS
+// ============================================================================
+
+// Encoder positions for each target (from calibration)
+// NOTE: Adjust these values after running calibration!
+long TARGET_1_POSITION = -74;
+long TARGET_2_POSITION = -307;
+long TARGET_3_POSITION = -547;
+long TARGET_4_POSITION = -1080;
+
+long targetPositions[4] = {
+  TARGET_1_POSITION,
+  TARGET_2_POSITION,
+  TARGET_3_POSITION,
+  TARGET_4_POSITION
+};
+
+long WAIT_POSITION = TARGET_3_POSITION;  // Default waiting position
+
+long currentTargetPosition = WAIT_POSITION;
+int activeTarget = -1;  // Index of current target (-1 = none)
+
+// ============================================================================
+// PID CONTROLLER PARAMETERS
+// ============================================================================
+
+// NOTE: Replace these with values from PID auto-tune!
+float KP = 0.020;  // Proportional gain
+float KI = 0.005;  // Integral gain
+float KD = 0.004;  // Derivative gain
+
+// PID state variables
+float error = 0;
+float lastError = 0;
+float integral = 0;
+float derivative = 0;
+
+const long DEADBAND = 5;  // Encoder counts - don't correct for small errors
+const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz update rate)
+
+// ============================================================================
+// FRICTION COMPENSATION
+// ============================================================================
+
+// NOTE: Replace these with values from friction characterization!
+float FRICTION_LEFT = 2.2;   // Voltage to overcome friction moving LEFT
+float FRICTION_RIGHT = 0.25; // Voltage to overcome friction moving RIGHT
+
+// Adaptive friction boost (increases if target not reached)
+float adaptiveFrictionLeft = FRICTION_LEFT;
+float adaptiveFrictionRight = FRICTION_RIGHT;
+const float FRICTION_BOOST_AMOUNT = 0.2;
+
+// ============================================================================
+// SENSOR CONFIGURATION
+// ============================================================================
+
+// Direction detection constants
+const int FORWARD = 1;    // Zombie moving toward sensor (approaching)
+const int BACKWARD = -1;  // Zombie moving away from sensor
+const int STOPPED = 0;    // Zombie not moving
+
+// Low-pass filter coefficient for sensor smoothing
+const float ALPHA = 0.925;  // Higher = more filtering (0-1)
+
+// Sensor activation threshold
+const int ACTIVATION_THRESHOLD = 400;  // Raw sensor value (0-1023)
+
+// Sensor data structure
+struct SensorData {
+  int rawValue;           // Current raw analog reading
+  float filteredValue;    // Low-pass filtered value
+  int direction;          // FORWARD, BACKWARD, or STOPPED
+  float lastFilteredValue; // Previous filtered value for derivative
+  unsigned long lastUpdate; // Timestamp of last update
+};
+
+SensorData sensors[4];
+
+// ============================================================================
+// CALIBRATION STATE VARIABLES
+// ============================================================================
+
+long lastCalibrationPos = 0;
+unsigned long calibrationStartTime = 0;
+bool isCalibrated = false;
+
+// ============================================================================
+// MOVE TO TARGET STATE VARIABLES
+// ============================================================================
+
+unsigned long positionReachedTime = 0;
+const unsigned long WAIT_TIME = 1000;  // Wait 1s at position before giving up
+
+unsigned long lastTargetSwitchTime = 0;
+const unsigned long TARGET_SWITCH_COOLDOWN = 200;  // 200ms min between switches
+
+// ============================================================================
+// TIMING
+// ============================================================================
+
+unsigned long lastControlUpdate = 0;
+unsigned long lastSensorUpdate = 0;
+unsigned long lastStatusPrint = 0;
+
+const unsigned long STATUS_PRINT_INTERVAL = 2000;  // Print status every 2s
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configure motor pins
+  pinMode(MOTOR_ENA, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  pinMode(MOTOR_IN3, OUTPUT);
+
+  // Configure limit switches
+  pinMode(LIMIT_LEFT, INPUT_PULLUP);
+  pinMode(LIMIT_RIGHT, INPUT_PULLUP);
+
+  // Initialize sensors
+  for (int i = 0; i < 4; i++) {
+    sensors[i].rawValue = 0;
+    sensors[i].filteredValue = 0;
+    sensors[i].lastFilteredValue = 0;
+    sensors[i].direction = STOPPED;
+    sensors[i].lastUpdate = 0;
+  }
+
+  // Stop motor initially
+  setMotorVoltage(0);
+
+  // Initialize timing
+  lastControlUpdate = millis();
+  lastSensorUpdate = millis();
+  roundStartTime = millis();
+
+  Serial.println(F("========================================"));
+  Serial.println(F("  ME350 COMPETITION STATE MACHINE"));
+  Serial.println(F("  Plants vs Zombies"));
+  Serial.println(F("========================================"));
+  Serial.println(F("Starting in CALIBRATE state..."));
+  Serial.println(F("========================================\n"));
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // Update sensors at 100 Hz
+  if (currentTime - lastSensorUpdate >= CONTROL_PERIOD) {
+    updateSensors();
+    lastSensorUpdate = currentTime;
+  }
+
+  // Run state machine at 100 Hz
+  if (currentTime - lastControlUpdate >= CONTROL_PERIOD) {
+    runStateMachine();
+    lastControlUpdate = currentTime;
+  }
+
+  // Check round transitions
+  checkRoundTransition();
+
+  // Print status periodically
+  if (currentTime - lastStatusPrint >= STATUS_PRINT_INTERVAL) {
+    printStatus();
+    lastStatusPrint = currentTime;
+  }
+}
+
+// ============================================================================
+// STATE MACHINE
+// ============================================================================
+
+void runStateMachine() {
+  switch (currentState) {
+    case CALIBRATE:
+      stateCalibrate();
+      break;
+
+    case CHOOSE_ACTIVE_TARGET:
+      stateChooseActiveTarget();
+      break;
+
+    case MOVE_TO_TARGET:
+      stateMoveToTarget();
+      break;
+  }
+}
+
+// ============================================================================
+// STATE: CALIBRATE
+// ============================================================================
+
+void stateCalibrate() {
+  /*
+   * Purpose: Find left limit switch and zero encoder position
+   *
+   * Actions:
+   * 1. Apply constant positive voltage to move LEFT
+   * 2. Wait for left limit switch activation
+   * 3. Check for zero velocity (motor has stopped)
+   * 4. Zero encoder position
+   * 5. Transition to CHOOSE_ACTIVE_TARGET
+   */
+
+  if (digitalRead(LIMIT_LEFT) == LOW) {  // Limit switch pressed (active LOW)
+    // Check if motor has stopped (velocity near zero)
+    long currentPos = motorEncoder.read();
+    long movement = abs(currentPos - lastCalibrationPos);
+
+    if (movement < 2) {
+      // Motor has stopped at limit
+      motorEncoder.write(0);  // Zero the encoder
+      setMotorVoltage(0);     // Stop motor
+
+      isCalibrated = true;
+
+      Serial.println(F("=== CALIBRATION COMPLETE ==="));
+      Serial.println(F("Encoder zeroed at left limit."));
+      Serial.println(F("Transitioning to CHOOSE_ACTIVE_TARGET state.\n"));
+
+      // Move to wait position
+      currentTargetPosition = WAIT_POSITION;
+      activeTarget = -1;
+
+      currentState = CHOOSE_ACTIVE_TARGET;
+    }
+
+    lastCalibrationPos = currentPos;
+  }
+  else {
+    // Continue moving to left limit
+    setMotorVoltage(5.0);  // Constant voltage LEFT
+  }
+}
+
+// ============================================================================
+// STATE: CHOOSE_ACTIVE_TARGET
+// ============================================================================
+
+void stateChooseActiveTarget() {
+  /*
+   * Purpose: Determine which zombie to target based on proximity and direction
+   *
+   * Logic:
+   * 1. Read all 4 proximity sensors
+   * 2. Determine direction for each zombie (FORWARD/BACKWARD/STOPPED)
+   * 3. Calculate distance from current position to each target
+   * 4. Priority: Select closest FORWARD-moving zombie
+   * 5. If no forward-moving zombies, go to wait position
+   * 6. Set target position and transition to MOVE_TO_TARGET
+   */
+
+  int closestTarget = -1;
+  long minDistance = 999999;
+
+  // Find closest FORWARD-moving zombie
+  for (int i = 0; i < 4; i++) {
+    // Check if sensor detects a zombie
+    if (sensors[i].rawValue > ACTIVATION_THRESHOLD) {
+      // Check if zombie is moving FORWARD (toward the sensor)
+      if (sensors[i].direction == FORWARD) {
+        // Calculate distance from current position to this target
+        long currentPos = motorEncoder.read();
+        long distance = abs(currentPos - targetPositions[i]);
+
+        if (distance < minDistance) {
+          minDistance = distance;
+          closestTarget = i;
+        }
+      }
+    }
+  }
+
+  if (closestTarget >= 0) {
+    // Found a target
+    currentTargetPosition = targetPositions[closestTarget];
+    activeTarget = closestTarget;
+
+    Serial.print(F("Target selected: "));
+    Serial.print(closestTarget + 1);
+    Serial.print(F(" at position "));
+    Serial.println(currentTargetPosition);
+  }
+  else {
+    // No forward-moving zombies, go to wait position
+    currentTargetPosition = WAIT_POSITION;
+    activeTarget = -1;
+
+    // Don't spam serial, only print once
+    static bool waitMessagePrinted = false;
+    if (!waitMessagePrinted) {
+      Serial.println(F("No active targets. Moving to wait position."));
+      waitMessagePrinted = true;
+    }
+  }
+
+  // Reset PID state for new target
+  error = 0;
+  lastError = 0;
+  integral = 0;
+  derivative = 0;
+
+  // Transition to MOVE_TO_TARGET
+  currentState = MOVE_TO_TARGET;
+  positionReachedTime = millis();
+}
+
+// ============================================================================
+// STATE: MOVE_TO_TARGET
+// ============================================================================
+
+void stateMoveToTarget() {
+  /*
+   * Purpose: Execute PID control to reach target position
+   *
+   * Actions:
+   * 1. Run PID control loop
+   * 2. Monitor proximity sensor for zombie activation
+   * 3. If zombie detected (LED lights):
+   *    - Increment score
+   *    - Return to CHOOSE_ACTIVE_TARGET
+   * 4. Allow dynamic target switching if closer forward-moving zombie appears
+   * 5. If position reached and held for WAIT_TIME with no activation:
+   *    - Return to CHOOSE_ACTIVE_TARGET
+   */
+
+  // Run PID controller
+  float voltage = updatePID(currentTargetPosition);
+  setMotorVoltage(voltage);
+
+  // Check if zombie activated LED (hit detection)
+  if (activeTarget >= 0) {
+    if (sensors[activeTarget].rawValue > ACTIVATION_THRESHOLD) {
+      // Zombie has been hit!
+      recordHit();
+
+      Serial.print(F("*** HIT! Target "));
+      Serial.print(activeTarget + 1);
+      Serial.println(F(" ***"));
+
+      // Return to target selection
+      currentState = CHOOSE_ACTIVE_TARGET;
+      return;
+    }
+  }
+
+  // Check for closer forward-moving zombie (dynamic switching)
+  if (millis() - lastTargetSwitchTime > TARGET_SWITCH_COOLDOWN) {
+    checkForBetterTarget();
+  }
+
+  // Check if position is stable
+  if (abs(error) < DEADBAND) {
+    // Position reached, check if we've waited long enough
+    if (millis() - positionReachedTime > WAIT_TIME) {
+      // Position held but no activation - zombie missed or passed
+      Serial.println(F("Position reached, no activation. Choosing new target."));
+
+      // Boost friction to overcome stiction on next move
+      adaptiveFrictionLeft += FRICTION_BOOST_AMOUNT;
+      adaptiveFrictionRight += FRICTION_BOOST_AMOUNT;
+
+      currentState = CHOOSE_ACTIVE_TARGET;
+    }
+  }
+  else {
+    // Still moving, reset timer
+    positionReachedTime = millis();
+
+    // Reset adaptive friction when actively moving
+    adaptiveFrictionLeft = FRICTION_LEFT;
+    adaptiveFrictionRight = FRICTION_RIGHT;
+  }
+}
+
+// ============================================================================
+// PID CONTROLLER
+// ============================================================================
+
+float updatePID(long targetPosition) {
+  long currentPosition = motorEncoder.read();
+
+  // Calculate error
+  error = targetPosition - currentPosition;
+
+  // Apply deadband
+  if (abs(error) < DEADBAND) {
+    error = 0;
+    integral = 0;  // Reset integral when at target
+  }
+  else {
+    // Calculate integral (with anti-windup)
+    integral += error * (CONTROL_PERIOD / 1000.0);
+    integral = constrain(integral, -1000, 1000);
+  }
+
+  // Calculate derivative
+  derivative = (error - lastError) / (CONTROL_PERIOD / 1000.0);
+
+  // Calculate PID output
+  float pidOutput = KP * error + KI * integral + KD * derivative;
+
+  // Add friction compensation
+  float frictionComp = 0;
+
+  if (error < -DEADBAND) {
+    // Need to move RIGHT (negative direction)
+    frictionComp = -adaptiveFrictionLeft;
+  }
+  else if (error > DEADBAND) {
+    // Need to move LEFT (positive direction)
+    frictionComp = adaptiveFrictionRight;
+  }
+
+  // Calculate total voltage
+  float voltage = pidOutput + frictionComp;
+
+  // Store for next iteration
+  lastError = error;
+
+  return voltage;
+}
+
+// ============================================================================
+// SENSOR UPDATES
+// ============================================================================
+
+void updateSensors() {
+  for (int i = 0; i < 4; i++) {
+    // Read raw analog value
+    int raw = analogRead(A0 + i);
+
+    // Apply low-pass filter
+    // filtered = alpha * filtered_old + (1 - alpha) * raw
+    sensors[i].filteredValue = ALPHA * sensors[i].filteredValue +
+                               (1.0 - ALPHA) * raw;
+
+    // Calculate derivative (rate of change)
+    float derivative = sensors[i].filteredValue - sensors[i].lastFilteredValue;
+
+    // Determine direction based on derivative
+    if (derivative > 2.0) {
+      sensors[i].direction = FORWARD;   // Value increasing = zombie approaching
+    }
+    else if (derivative < -2.0) {
+      sensors[i].direction = BACKWARD;  // Value decreasing = zombie leaving
+    }
+    else {
+      sensors[i].direction = STOPPED;   // Stable = zombie stopped or not present
+    }
+
+    // Store values for next iteration
+    sensors[i].rawValue = raw;
+    sensors[i].lastFilteredValue = sensors[i].filteredValue;
+    sensors[i].lastUpdate = millis();
+  }
+}
+
+// ============================================================================
+// TARGET SWITCHING
+// ============================================================================
+
+void checkForBetterTarget() {
+  /*
+   * Check if there's a closer forward-moving zombie than current target
+   * This allows dynamic target switching during movement
+   */
+
+  if (activeTarget < 0) {
+    return;  // No active target, nothing to switch from
+  }
+
+  long currentPos = motorEncoder.read();
+  long currentTargetDistance = abs(currentPos - currentTargetPosition);
+
+  for (int i = 0; i < 4; i++) {
+    if (i == activeTarget) {
+      continue;  // Skip current target
+    }
+
+    // Check if this sensor detects a forward-moving zombie
+    if (sensors[i].rawValue > ACTIVATION_THRESHOLD &&
+        sensors[i].direction == FORWARD) {
+
+      long newTargetDistance = abs(currentPos - targetPositions[i]);
+
+      // Switch if new target is significantly closer (>20% closer)
+      if (newTargetDistance < currentTargetDistance * 0.8) {
+        Serial.print(F("Switching target: "));
+        Serial.print(activeTarget + 1);
+        Serial.print(F(" -> "));
+        Serial.println(i + 1);
+
+        // Switch to new target
+        currentTargetPosition = targetPositions[i];
+        activeTarget = i;
+
+        // Reset PID state
+        integral = 0;
+
+        lastTargetSwitchTime = millis();
+
+        break;  // Only switch once per check
+      }
+    }
+  }
+}
+
+// ============================================================================
+// ROUND MANAGEMENT
+// ============================================================================
+
+void checkRoundTransition() {
+  unsigned long elapsed = millis() - roundStartTime;
+
+  switch (currentRound) {
+    case ROUND_1:
+      if (elapsed >= ROUND_1_DURATION) {
+        // Round 1 complete
+        Serial.println(F("\n========================================"));
+        Serial.println(F("=== ROUND 1 COMPLETE ==="));
+        Serial.print(F("Score: "));
+        Serial.println(round1Score);
+        Serial.println(F("========================================\n"));
+
+        currentRound = ROUND_2;
+        roundStartTime = millis();
+      }
+      break;
+
+    case ROUND_2:
+      if (elapsed >= ROUND_2_DURATION) {
+        // Round 2 complete
+        Serial.println(F("\n========================================"));
+        Serial.println(F("=== ROUND 2 COMPLETE ==="));
+        Serial.print(F("Score: "));
+        Serial.println(round2Score);
+        Serial.println(F("========================================\n"));
+
+        currentRound = ROUND_3;
+        roundStartTime = millis();
+
+        Serial.println(F("=== ROUND 3 STARTING ==="));
+        Serial.println(F("LED ONLY - Limit switch ends round!"));
+        Serial.println(F("========================================\n"));
+      }
+      break;
+
+    case ROUND_3:
+      // Round 3 ends when zombie hits front limit switch
+      if (digitalRead(LIMIT_RIGHT) == LOW) {
+        // Zombie hit front limit - GAME OVER
+        Serial.println(F("\n========================================"));
+        Serial.println(F("=== ROUND 3 FAILED ==="));
+        Serial.println(F("Zombie reached front limit!"));
+        Serial.print(F("Score: "));
+        Serial.println(round3Score);
+        Serial.println(F("========================================\n"));
+
+        currentRound = COMPLETE;
+        setMotorVoltage(0);  // Stop motor
+
+        printFinalScore();
+      }
+      break;
+
+    case COMPLETE:
+      // Game over, do nothing
+      setMotorVoltage(0);
+      break;
+  }
+}
+
+void recordHit() {
+  /*
+   * Record a zombie hit based on current round rules
+   */
+
+  switch (currentRound) {
+    case ROUND_1:
+      round1Score++;
+      totalScore++;
+      break;
+
+    case ROUND_2:
+      round2Score++;
+      totalScore++;
+      break;
+
+    case ROUND_3:
+      // In Round 3, ONLY LED activation counts
+      // (limit switch would end the round, not add to score)
+      round3Score++;
+      totalScore++;
+      break;
+
+    case COMPLETE:
+      // Game over, no scoring
+      break;
+  }
+}
+
+// ============================================================================
+// MOTOR CONTROL
+// ============================================================================
+
+void setMotorVoltage(float voltage) {
+  // Constrain voltage to safe range
+  voltage = constrain(voltage, -10.0, 10.0);
+
+  // Convert voltage to PWM (0-255)
+  int pwmValue = abs(voltage) * 25.5;  // 10V -> 255
+
+  // Safety: Check limit switches and prevent movement into limits
+  if (digitalRead(LIMIT_LEFT) == LOW && voltage > 0) {
+    voltage = 0;
+    pwmValue = 0;
+  }
+  if (digitalRead(LIMIT_RIGHT) == LOW && voltage < 0) {
+    // In Round 3, hitting right limit ends the game
+    if (currentRound == ROUND_3) {
+      // Let checkRoundTransition handle this
+    }
+    voltage = 0;
+    pwmValue = 0;
+  }
+
+  // Apply voltage to H-bridge
+  if (voltage > 0) {
+    // Move LEFT (toward position 0)
+    digitalWrite(MOTOR_IN2, HIGH);
+    digitalWrite(MOTOR_IN3, LOW);
+    analogWrite(MOTOR_ENA, pwmValue);
+  }
+  else if (voltage < 0) {
+    // Move RIGHT (toward negative positions)
+    digitalWrite(MOTOR_IN2, LOW);
+    digitalWrite(MOTOR_IN3, HIGH);
+    analogWrite(MOTOR_ENA, pwmValue);
+  }
+  else {
+    // STOP
+    digitalWrite(MOTOR_IN2, LOW);
+    digitalWrite(MOTOR_IN3, LOW);
+    analogWrite(MOTOR_ENA, 0);
+  }
+}
+
+// ============================================================================
+// STATUS DISPLAY
+// ============================================================================
+
+void printStatus() {
+  Serial.print(F("Round "));
+  Serial.print(currentRound);
+  Serial.print(F(" | State: "));
+
+  switch (currentState) {
+    case CALIBRATE:
+      Serial.print(F("CALIBRATE"));
+      break;
+    case CHOOSE_ACTIVE_TARGET:
+      Serial.print(F("CHOOSE_TARGET"));
+      break;
+    case MOVE_TO_TARGET:
+      Serial.print(F("MOVE_TO_TARGET"));
+      break;
+  }
+
+  Serial.print(F(" | Pos: "));
+  Serial.print(motorEncoder.read());
+
+  if (activeTarget >= 0) {
+    Serial.print(F(" | Target: "));
+    Serial.print(activeTarget + 1);
+    Serial.print(F(" ("));
+    Serial.print(currentTargetPosition);
+    Serial.print(F(")"));
+  }
+
+  Serial.print(F(" | Score: "));
+  Serial.print(totalScore);
+
+  Serial.print(F(" | Sensors: "));
+  for (int i = 0; i < 4; i++) {
+    Serial.print(sensors[i].rawValue);
+    if (i < 3) Serial.print(F(","));
+  }
+
+  Serial.println();
+}
+
+void printFinalScore() {
+  Serial.println(F("\n========================================"));
+  Serial.println(F("=== FINAL SCORE ==="));
+  Serial.println(F("========================================"));
+  Serial.print(F("Round 1: "));
+  Serial.println(round1Score);
+  Serial.print(F("Round 2: "));
+  Serial.println(round2Score);
+  Serial.print(F("Round 3: "));
+  Serial.println(round3Score);
+  Serial.println(F("----------------------------------------"));
+  Serial.print(F("TOTAL:   "));
+  Serial.println(totalScore);
+  Serial.println(F("========================================\n"));
+}
