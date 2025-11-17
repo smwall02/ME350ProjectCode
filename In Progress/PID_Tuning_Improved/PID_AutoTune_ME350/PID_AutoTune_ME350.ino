@@ -756,8 +756,15 @@ void autoTuneZieglerNichols() {
 
   Serial.println(F("\nEnter selection (1-6):"));
 
-  while (!Serial.available()) { }
-  char selection = Serial.read();
+  // Flush any leftover input first
+  while (Serial.available()) { Serial.read(); }
+  char selection = 0;
+  while (selection == 0) {
+    while (!Serial.available()) { }
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') continue;
+    selection = c;
+  }
 
   float newKp, newKi, newKd;
 
