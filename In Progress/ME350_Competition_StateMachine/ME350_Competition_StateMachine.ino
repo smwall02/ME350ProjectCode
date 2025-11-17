@@ -161,9 +161,9 @@ const int STOPPED = 0;    // Zombie not moving
 const float ALPHA = 0.925;  // Higher = more filtering (0-1)
 
 // Sensor activation threshold (tighter to reduce noise)
-const int ACTIVATION_THRESHOLD = 400;  // Raw sensor value (0-1023)
-const int ACTIVATION_THRESHOLD_HIGH = 430;  // Hysteresis high
-const int ACTIVATION_THRESHOLD_LOW = 370;   // Hysteresis low
+const int ACTIVATION_THRESHOLD = 350;  // Raw sensor value (0-1023)
+const int ACTIVATION_THRESHOLD_HIGH = 380;  // Hysteresis high
+const int ACTIVATION_THRESHOLD_LOW = 320;   // Hysteresis low
 
 // Sensor data structure
 struct SensorData {
@@ -235,7 +235,7 @@ const float VEL_STOP_THRESH = 2.0;  // counts/sec considered stopped
 // Proximity normalization
 const unsigned long PROX_CALIBRATION_WINDOW = 5000;  // ms to learn min/max per sensor after start
 unsigned long lastHitTime[4] = {0, 0, 0, 0};
-const unsigned long HIT_COOLDOWN = 4000;  // ms before retargeting same lane
+const unsigned long HIT_COOLDOWN = 1500;  // ms before retargeting same lane
 bool lockMode = false;
 int lockLane = -1;
 bool awaitingReturnAfterHit = false;
@@ -466,31 +466,23 @@ void stateChooseActiveTarget() {
   }
 
   int chosenTarget = -1;
-  float lowestFiltered = 1e9;
+  int bestRaw = 0;
   float bestVelMag = -1;
 
-  // Pick the active sensor with the lowest filtered value (farthest/down-rail).
-  // Direction check removed; velocity used as tiebreaker. Skip lanes recently hit (cooldown).
+  // Pick the active sensor with the highest raw reading (strongest signal).
   for (int i = 0; i < 4; i++) {
-    if (sensors[i].rawValue > ACTIVATION_THRESHOLD_HIGH) {  // active enough
+    int raw = sensors[i].rawValue;
+    if (raw > ACTIVATION_THRESHOLD_LOW) {
       if (millis() - lastHitTime[i] < HIT_COOLDOWN) continue;
       float vmag = fabs(sensors[i].velocity);
-      if (sensors[i].filteredValue < lowestFiltered - 1.0) {
-        lowestFiltered = sensors[i].filteredValue;
+      if (raw > bestRaw) {
+        bestRaw = raw;
         bestVelMag = vmag;
         chosenTarget = i;
-      } else if (fabs(sensors[i].filteredValue - lowestFiltered) <= 1.0 && vmag > bestVelMag + 0.01) {
-        lowestFiltered = sensors[i].filteredValue;
+      } else if (raw == bestRaw && vmag > bestVelMag) {
         bestVelMag = vmag;
         chosenTarget = i;
       }
-    }
-  }
-
-  if (chosenTarget >= 0) {
-    // Skip if recently hit and still in cooldown
-    if (millis() - lastHitTime[chosenTarget] < HIT_COOLDOWN) {
-      chosenTarget = -1;
     }
   }
 
@@ -499,7 +491,7 @@ void stateChooseActiveTarget() {
     currentTargetPosition = targetPositions[chosenTarget];
     activeTarget = chosenTarget;
 
-    Serial.print(F("Target selected (lowest prox): "));
+    Serial.print(F("Target selected (highest raw): "));
     Serial.print(chosenTarget + 1);
     Serial.print(F(" at position "));
     Serial.println(currentTargetPosition);
@@ -577,21 +569,10 @@ void stateMoveToTarget() {
 
   // Wait for target to move back toward prox before selecting a new one
   if (awaitingReturnAfterHit) {
-    if (activeTarget >= 0 && sensors[activeTarget].velocity < -2.0) {
-      awaitingReturnAfterHit = false;
-      currentState = CHOOSE_ACTIVE_TARGET;
-      Serial.println(F("Target moving back, reselecting..."));
-    } else if (millis() - lastHitTime[activeTarget] > 2000) {
-      // Timeout: give up waiting after 2s
-      awaitingReturnAfterHit = false;
-      currentState = CHOOSE_ACTIVE_TARGET;
-      Serial.println(F("Timeout waiting for return, reselecting..."));
-    } else {
-      // Hold position while waiting
-      setMotorVoltage(0);
-      Serial.println(F("Holding at lane awaiting return..."));
-      return;
-    }
+    // Immediately reselect after hit; no waiting
+    awaitingReturnAfterHit = false;
+    currentState = CHOOSE_ACTIVE_TARGET;
+    Serial.println(F("Reselecting after hit..."));
   }
 
   // If no active target (e.g., waiting), hold position quietly
