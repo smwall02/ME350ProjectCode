@@ -160,10 +160,10 @@ const int STOPPED = 0;    // Zombie not moving
 // Low-pass filter coefficient for sensor smoothing
 const float ALPHA = 0.925;  // Higher = more filtering (0-1)
 
-// Sensor activation threshold (tighter to reduce noise)
-const int ACTIVATION_THRESHOLD = 350;  // Raw sensor value (0-1023)
-const int ACTIVATION_THRESHOLD_HIGH = 380;  // Hysteresis high
-const int ACTIVATION_THRESHOLD_LOW = 320;   // Hysteresis low
+// Sensor activation threshold (balanced)
+const int ACTIVATION_THRESHOLD = 300;  // Raw sensor value (0-1023)
+const int ACTIVATION_THRESHOLD_HIGH = 330;  // Hysteresis high
+const int ACTIVATION_THRESHOLD_LOW = 270;   // Hysteresis low
 
 // Sensor data structure
 struct SensorData {
@@ -235,7 +235,7 @@ const float VEL_STOP_THRESH = 2.0;  // counts/sec considered stopped
 // Proximity normalization
 const unsigned long PROX_CALIBRATION_WINDOW = 5000;  // ms to learn min/max per sensor after start
 unsigned long lastHitTime[4] = {0, 0, 0, 0};
-const unsigned long HIT_COOLDOWN = 1500;  // ms before retargeting same lane
+const unsigned long HIT_COOLDOWN = 800;  // ms before retargeting same lane
 bool lockMode = false;
 int lockLane = -1;
 bool awaitingReturnAfterHit = false;
@@ -507,16 +507,10 @@ void stateChooseActiveTarget() {
     waitMessagePrinted = false;
   }
   else {
-    // No forward-moving zombies, go to wait position
+    // No active zombies, go to wait position
     currentTargetPosition = WAIT_POSITION;
     activeTarget = -1;
-
-    // Don't spam serial, only print once
-    static bool waitMessagePrinted = false;
-    if (!waitMessagePrinted) {
-      Serial.println(F("No active targets. Moving to wait position."));
-      waitMessagePrinted = true;
-    }
+    Serial.println(F("No active targets. Moving to wait position."));
   }
 
   // Reset PID state for new target
