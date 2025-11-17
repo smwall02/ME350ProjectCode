@@ -74,6 +74,10 @@ const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz)
 
 float FRICTION_LEFT = 2.2;   // Voltage to overcome friction moving LEFT
 float FRICTION_RIGHT = 2.9;  // Voltage to overcome friction moving RIGHT
+bool frictionCharacterized = false;
+
+const float HOMING_EXTRA_VOLTAGE = 0.6;     // Added on top of friction during homing
+const unsigned long HOMING_HOLD_TIME = 400; // ms to hold on switch before zeroing
 
 // ============================================================================
 // CALIBRATION DATA
@@ -167,18 +171,22 @@ void processCommand(char cmd) {
       break;
 
     case 'Z':
+      if (!ensureRangeAndFrictionReady()) return;
       autoTuneZieglerNichols();
       break;
 
     case 'S':
+      if (!ensureRangeAndFrictionReady()) return;
       stepResponse();
       break;
 
     case 'T':
+      if (!ensureRangeAndFrictionReady()) return;
       manualPositionTest();
       break;
 
     case 'H':
+      if (!ensureRangeAndFrictionReady()) return;
       homeToLeft();
       break;
 
@@ -268,6 +276,20 @@ void setMotorVoltage(float voltage) {
 // PID CONTROLLER
 // ============================================================================
 
+bool ensureRangeAndFrictionReady() {
+  if (!isCalibrated) {
+    Serial.println(F("Range not calibrated. Running range calibration..."));
+    calibrateRange();
+  }
+
+  if (!frictionCharacterized) {
+    Serial.println(F("Friction not characterized. Running friction characterization..."));
+    characterizeFriction();
+  }
+
+  return isCalibrated && frictionCharacterized;
+}
+
 float updatePID(long targetPosition) {
   long currentPosition = motorEncoder.read();
 
@@ -321,12 +343,13 @@ void calibrateRange() {
 
   // Move to left limit
   Serial.println(F("Moving to left limit..."));
-  setMotorVoltage(5.0);
+  float leftDrive = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE, 3.0);
+  setMotorVoltage(leftDrive);
 
   unsigned long startTime = millis();
   long lastPosition = motorEncoder.read();
 
-  while (digitalRead(LIMIT_LEFT) == LOW) {
+  while (digitalRead(LIMIT_LEFT) == LOW) {  // LOW = not pressed
     if (millis() - startTime > 10000) {
       Serial.println(F("ERROR: Timeout waiting for left limit"));
       setMotorVoltage(0);
@@ -337,6 +360,13 @@ void calibrateRange() {
 
   // Wait for motor to stop
   delay(200);
+  // Hold against left limit to seat before zeroing
+  unsigned long holdStart = millis();
+  float holdVoltage = max(FRICTION_RIGHT, 2.5);
+  while (millis() - holdStart < HOMING_HOLD_TIME) {
+    setMotorVoltage(holdVoltage);
+    delay(10);
+  }
   setMotorVoltage(0);
   delay(100);
 
@@ -348,7 +378,8 @@ void calibrateRange() {
   // Move to right limit
   Serial.println(F("Moving to right limit..."));
   delay(500);
-  setMotorVoltage(-5.0);
+  float rightDrive = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE, 3.0);
+  setMotorVoltage(rightDrive);
 
   startTime = millis();
   lastPosition = 0;
@@ -364,6 +395,13 @@ void calibrateRange() {
 
   // Wait for motor to stop
   delay(200);
+  // Hold on right limit briefly for consistency
+  holdStart = millis();
+  float holdVoltageRight = -max(FRICTION_LEFT, 2.5);
+  while (millis() - holdStart < HOMING_HOLD_TIME) {
+    setMotorVoltage(holdVoltageRight);
+    delay(10);
+  }
   setMotorVoltage(0);
   delay(100);
 
@@ -445,8 +483,22 @@ void characterizeFriction() {
 
   // Move to right limit
   Serial.println(F("Moving to right limit..."));
-  setMotorVoltage(-6.0);
+  float driveRight = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE, 3.0);
+  setMotorVoltage(driveRight);
+  unsigned long driveStart = millis();
   while (digitalRead(LIMIT_RIGHT) == LOW) {
+    if (millis() - driveStart > 12000) {
+      Serial.println(F("ERROR: Timeout moving to right limit during friction characterization"));
+      setMotorVoltage(0);
+      return;
+    }
+    delay(10);
+  }
+  // Hold briefly on right limit
+  unsigned long holdStart = millis();
+  float holdRight = -max(FRICTION_LEFT, 2.5);
+  while (millis() - holdStart < HOMING_HOLD_TIME) {
+    setMotorVoltage(holdRight);
     delay(10);
   }
   setMotorVoltage(0);
@@ -480,6 +532,7 @@ void characterizeFriction() {
     }
   }
 
+  frictionCharacterized = true;
   saveCalibration();
 
   Serial.println(F("\n=== Friction Characterization Complete ==="));
@@ -907,10 +960,11 @@ void manualPositionTest() {
 void homeToLeft() {
   Serial.println(F("Homing to left limit..."));
 
-  setMotorVoltage(6.0);
+  float driveVoltage = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE, 3.0);
+  setMotorVoltage(driveVoltage);
 
   unsigned long startTime = millis();
-  while (digitalRead(LIMIT_LEFT) == HIGH) {
+  while (digitalRead(LIMIT_LEFT) == LOW) {  // LOW = not pressed
     if (millis() - startTime > 10000) {
       Serial.println(F("ERROR: Timeout during homing"));
       setMotorVoltage(0);
@@ -919,6 +973,13 @@ void homeToLeft() {
     delay(10);
   }
 
+  // Hold on the switch before zeroing
+  unsigned long holdStart = millis();
+  float holdVoltage = max(FRICTION_RIGHT, 2.5);
+  while (millis() - holdStart < HOMING_HOLD_TIME) {
+    setMotorVoltage(holdVoltage);
+    delay(10);
+  }
   setMotorVoltage(0);
   delay(200);
 
@@ -1041,6 +1102,9 @@ void loadCalibration() {
 
     TOTAL_RANGE = abs(RIGHT_LIMIT_POSITION - LEFT_LIMIT_POSITION);
     isCalibrated = (TOTAL_RANGE > 100);
+    frictionCharacterized = (FRICTION_LEFT > 0.1 && FRICTION_RIGHT > 0.1);
+  } else {
+    frictionCharacterized = false;
   }
 }
 
@@ -1059,6 +1123,7 @@ void clearCalibration() {
   RIGHT_LIMIT_POSITION = -1800;
   TOTAL_RANGE = 0;
   isCalibrated = false;
+  frictionCharacterized = false;
 
   Serial.println(F("Calibration cleared. Defaults restored."));
   Serial.println(F("Run 'R' to recalibrate."));
