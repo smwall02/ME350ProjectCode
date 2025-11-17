@@ -128,6 +128,7 @@ float derivative = 0;
 
 const long DEADBAND = 5;  // Encoder counts - don't correct for small errors
 const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz update rate)
+float controlDtSeconds = CONTROL_PERIOD / 1000.0;  // Actual loop dt for PID
 
 // ============================================================================
 // FRICTION COMPENSATION
@@ -156,6 +157,8 @@ const float ALPHA = 0.925;  // Higher = more filtering (0-1)
 
 // Sensor activation threshold
 const int ACTIVATION_THRESHOLD = 400;  // Raw sensor value (0-1023)
+const int ACTIVATION_THRESHOLD_HIGH = 430;  // Hysteresis high
+const int ACTIVATION_THRESHOLD_LOW = 370;   // Hysteresis low
 
 // Sensor data structure
 struct SensorData {
@@ -164,6 +167,8 @@ struct SensorData {
   int direction;          // FORWARD, BACKWARD, or STOPPED
   float lastFilteredValue; // Previous filtered value for derivative
   unsigned long lastUpdate; // Timestamp of last update
+  bool active;            // Above hysteresis threshold
+  bool justActivated;     // Rising edge detection
 };
 
 SensorData sensors[4];
@@ -175,6 +180,7 @@ SensorData sensors[4];
 long lastCalibrationPos = 0;
 unsigned long calibrationStartTime = 0;
 bool isCalibrated = false;
+const unsigned long CALIBRATION_TIMEOUT = 15000;  // 15s safety timeout
 
 // ============================================================================
 // MOVE TO TARGET STATE VARIABLES
@@ -219,6 +225,8 @@ void setup() {
     sensors[i].lastFilteredValue = 0;
     sensors[i].direction = STOPPED;
     sensors[i].lastUpdate = 0;
+    sensors[i].active = false;
+    sensors[i].justActivated = false;
   }
 
   // Stop motor initially
@@ -252,6 +260,7 @@ void loop() {
 
   // Run state machine at 100 Hz
   if (currentTime - lastControlUpdate >= CONTROL_PERIOD) {
+    controlDtSeconds = max((currentTime - lastControlUpdate) / 1000.0, CONTROL_PERIOD / 1000.0);
     runStateMachine();
     lastControlUpdate = currentTime;
   }
@@ -313,6 +322,7 @@ void stateCalibrate() {
       setMotorVoltage(0);     // Stop motor
 
       isCalibrated = true;
+      calibrationStartTime = 0;
 
       Serial.println(F("=== CALIBRATION COMPLETE ==="));
       Serial.println(F("Encoder zeroed at left limit."));
@@ -330,6 +340,19 @@ void stateCalibrate() {
   else {
     // Continue moving to left limit
     setMotorVoltage(5.0);  // Constant voltage LEFT
+
+    // Start calibration timer on first move
+    if (calibrationStartTime == 0) {
+      calibrationStartTime = millis();
+    }
+
+    // Safety: stop if limit switch never triggers
+    if (calibrationStartTime > 0 && millis() - calibrationStartTime > CALIBRATION_TIMEOUT) {
+      setMotorVoltage(0);
+      Serial.println(F("Calibration timeout! Check left limit switch wiring."));
+      currentState = CALIBRATE;  // Stay in CALIBRATE but motor stopped
+      calibrationStartTime = millis();  // Reset timer so we retry without hammering the stop
+    }
   }
 }
 
@@ -356,7 +379,7 @@ void stateChooseActiveTarget() {
   // Find closest FORWARD-moving zombie
   for (int i = 0; i < 4; i++) {
     // Check if sensor detects a zombie
-    if (sensors[i].rawValue > ACTIVATION_THRESHOLD) {
+    if (sensors[i].active) {
       // Check if zombie is moving FORWARD (toward the sensor)
       if (sensors[i].direction == FORWARD) {
         // Calculate distance from current position to this target
@@ -430,7 +453,7 @@ void stateMoveToTarget() {
 
   // Check if zombie activated LED (hit detection)
   if (activeTarget >= 0) {
-    if (sensors[activeTarget].rawValue > ACTIVATION_THRESHOLD) {
+    if (sensors[activeTarget].justActivated) {
       // Zombie has been hit!
       recordHit();
 
@@ -490,12 +513,12 @@ float updatePID(long targetPosition) {
   }
   else {
     // Calculate integral (with anti-windup)
-    integral += error * (CONTROL_PERIOD / 1000.0);
+    integral += error * controlDtSeconds;
     integral = constrain(integral, -1000, 1000);
   }
 
   // Calculate derivative
-  derivative = (error - lastError) / (CONTROL_PERIOD / 1000.0);
+  derivative = (error - lastError) / controlDtSeconds;
 
   // Calculate PID output
   float pidOutput = KP * error + KI * integral + KD * derivative;
@@ -527,6 +550,8 @@ float updatePID(long targetPosition) {
 
 void updateSensors() {
   for (int i = 0; i < 4; i++) {
+    bool previousActive = sensors[i].active;
+
     // Read raw analog value
     int raw = analogRead(A0 + i);
 
@@ -553,6 +578,16 @@ void updateSensors() {
     sensors[i].rawValue = raw;
     sensors[i].lastFilteredValue = sensors[i].filteredValue;
     sensors[i].lastUpdate = millis();
+
+    // Hysteresis-based activation using filtered value
+    if (sensors[i].filteredValue >= ACTIVATION_THRESHOLD_HIGH) {
+      sensors[i].active = true;
+    }
+    else if (sensors[i].filteredValue <= ACTIVATION_THRESHOLD_LOW) {
+      sensors[i].active = false;
+    }
+
+    sensors[i].justActivated = sensors[i].active && !previousActive;
   }
 }
 
@@ -579,7 +614,7 @@ void checkForBetterTarget() {
     }
 
     // Check if this sensor detects a forward-moving zombie
-    if (sensors[i].rawValue > ACTIVATION_THRESHOLD &&
+    if (sensors[i].active &&
         sensors[i].direction == FORWARD) {
 
       long newTargetDistance = abs(currentPos - targetPositions[i]);

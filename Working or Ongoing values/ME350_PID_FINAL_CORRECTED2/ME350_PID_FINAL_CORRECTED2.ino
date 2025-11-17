@@ -194,22 +194,22 @@ void stopMotor() {
 // LIMIT SWITCHES
 // ============================================
 void checkLimitSwitches() {
-  if (digitalRead(LIMIT_LEFT) == HIGH) {
+  if (digitalRead(LIMIT_LEFT) == LOW) {
     stopMotor();
     encoder.write(0);
   }
   
-  if (digitalRead(LIMIT_RIGHT) == HIGH) {
+  if (digitalRead(LIMIT_RIGHT) == LOW) {
     stopMotor();
   }
 }
 
 bool leftPressed() {
-  return digitalRead(LIMIT_LEFT) == HIGH;
+  return digitalRead(LIMIT_LEFT) == LOW;
 }
 
 bool rightPressed() {
-  return digitalRead(LIMIT_RIGHT) == HIGH;
+  return digitalRead(LIMIT_RIGHT) == LOW;
 }
 
 // ============================================

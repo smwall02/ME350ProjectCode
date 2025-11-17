@@ -32,6 +32,9 @@
 #define MOTOR_IN2 12  // Direction 1
 #define MOTOR_IN3 13  // Direction 2
 
+// Flip (enable) switch
+#define ON_OFF_SWITCH_PIN 5  // HIGH = enabled, LOW = override/stop
+
 // Limit Switches
 #define LIMIT_LEFT 8   // Zero position
 #define LIMIT_RIGHT 9  // Maximum range
@@ -125,6 +128,9 @@ void setup() {
   pinMode(LIMIT_LEFT, INPUT_PULLUP);
   pinMode(LIMIT_RIGHT, INPUT_PULLUP);
 
+   // Configure flip switch with pull-up so HIGH = on by default
+  pinMode(ON_OFF_SWITCH_PIN, INPUT_PULLUP);
+
   // Stop motor initially
   setMotorVoltage(0);
 
@@ -199,7 +205,29 @@ void processCommand(char cmd) {
 // MOTOR CONTROL
 // ============================================================================
 
+bool isSwitchEnabled() {
+  return digitalRead(ON_OFF_SWITCH_PIN) == HIGH;
+}
+
 void setMotorVoltage(float voltage) {
+  // Master override
+  static bool lastSwitchState = true;
+  bool enabled = isSwitchEnabled();
+  if (!enabled) {
+    if (lastSwitchState != enabled) {
+      Serial.println(F("Flip switch OFF - motor disabled"));
+    }
+    lastSwitchState = enabled;
+    digitalWrite(MOTOR_IN2, LOW);
+    digitalWrite(MOTOR_IN3, LOW);
+    analogWrite(MOTOR_ENA, 0);
+    return;
+  }
+  if (lastSwitchState != enabled) {
+    Serial.println(F("Flip switch ON - motor enabled"));
+  }
+  lastSwitchState = enabled;
+
   // Constrain voltage to safe range
   voltage = constrain(voltage, -10.0, 10.0);
 
