@@ -161,9 +161,9 @@ const int STOPPED = 0;    // Zombie not moving
 const float ALPHA = 0.925;  // Higher = more filtering (0-1)
 
 // Sensor activation threshold (balanced)
-const int ACTIVATION_THRESHOLD = 300;  // Raw sensor value (0-1023)
-const int ACTIVATION_THRESHOLD_HIGH = 330;  // Hysteresis high
-const int ACTIVATION_THRESHOLD_LOW = 270;   // Hysteresis low
+const int ACTIVATION_THRESHOLD = 320;  // Raw sensor value (0-1023)
+const int ACTIVATION_THRESHOLD_HIGH = 340;  // Hysteresis high
+const int ACTIVATION_THRESHOLD_LOW = 280;   // Hysteresis low
 
 // Sensor data structure
 struct SensorData {
@@ -234,8 +234,9 @@ const float VEL_STOP_THRESH = 2.0;  // counts/sec considered stopped
 
 // Proximity normalization
 const unsigned long PROX_CALIBRATION_WINDOW = 5000;  // ms to learn min/max per sensor after start
-unsigned long lastHitTime[4] = {0, 0, 0, 0};
-const unsigned long HIT_COOLDOWN = 800;  // ms before retargeting same lane
+unsigned long lastHitTime[4] = {0, 0, 0, 0};  // kept for debug
+const unsigned long TARGET_MIN_HOLD = 300;    // ms to hold a target before reselect if no hit/command
+unsigned long lastSelectTime = 0;
 bool lockMode = false;
 int lockLane = -1;
 bool awaitingReturnAfterHit = false;
@@ -460,8 +461,14 @@ void stateChooseActiveTarget() {
     error = lastError = integral = derivative = 0;
     currentState = MOVE_TO_TARGET;
     positionReachedTime = millis();
+    lastSelectTime = millis();
     Serial.print(F("Lane lock: moving to lane "));
     Serial.println(lockLane + 1);
+    return;
+  }
+
+  // Honor minimum hold time on current target to reduce chatter
+  if (activeTarget >= 0 && (millis() - lastSelectTime < TARGET_MIN_HOLD)) {
     return;
   }
 
@@ -473,7 +480,6 @@ void stateChooseActiveTarget() {
   for (int i = 0; i < 4; i++) {
     int raw = sensors[i].rawValue;
     if (raw > ACTIVATION_THRESHOLD_LOW) {
-      if (millis() - lastHitTime[i] < HIT_COOLDOWN) continue;
       float vmag = fabs(sensors[i].velocity);
       if (raw > bestRaw) {
         bestRaw = raw;
@@ -501,6 +507,7 @@ void stateChooseActiveTarget() {
     Serial.print(sensors[chosenTarget].filteredValue);
     Serial.print(F(" vel="));
     Serial.println(sensors[chosenTarget].velocity);
+    lastSelectTime = millis();
 
     // allow wait message again next time there's no target
     static bool waitMessagePrinted = false;
@@ -556,17 +563,11 @@ void stateMoveToTarget() {
       Serial.print(activeTarget + 1);
       Serial.println(F(" ***"));
 
-      awaitingReturnAfterHit = true;
-      Serial.println(F("Awaiting target return before reselecting..."));
+      awaitingReturnAfterHit = false;
+      currentState = CHOOSE_ACTIVE_TARGET;
+      lastSelectTime = millis();
+      return;
     }
-  }
-
-  // Wait for target to move back toward prox before selecting a new one
-  if (awaitingReturnAfterHit) {
-    // Immediately reselect after hit; no waiting
-    awaitingReturnAfterHit = false;
-    currentState = CHOOSE_ACTIVE_TARGET;
-    Serial.println(F("Reselecting after hit..."));
   }
 
   // If no active target (e.g., waiting), hold position quietly
