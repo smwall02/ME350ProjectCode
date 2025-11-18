@@ -583,7 +583,7 @@ void runStateMachine() {
     
     case CALIBRATE:
       desiredPosition = LOWER_BOUND;
-      
+
       if (!dynamicCalibrationActive && rangeFindingComplete && sensorCalibrated) {
         Serial.println(F("State: CALIBRATE → CHOOSE_ACTIVE_TARGET (tracking enabled)\n"));
         currentState = CHOOSE_ACTIVE_TARGET;
@@ -592,6 +592,11 @@ void runStateMachine() {
       else if (!dynamicCalibrationActive && !rangeFindingComplete) {
         Serial.println(F("State: CALIBRATE → FIND_RANGE\n"));
         currentState = FIND_RANGE;
+      }
+      else if (!dynamicCalibrationActive && rangeFindingComplete && !sensorCalibrated) {
+        // Range finding was skipped (AUTO mode), start sensor calibration directly
+        startDynamicCalibration();
+        desiredPosition = LOWER_BOUND;
       }
       break;
     
