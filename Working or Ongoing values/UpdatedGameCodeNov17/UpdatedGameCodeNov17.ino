@@ -960,23 +960,8 @@ void checkLimitSwitches() {
     errorIntegral = 0;
     Serial.println(F("⚠️  Recalibrated at left limit"));
   }
-  
-  if (digitalRead(LIMIT_RIGHT) == HIGH) {
-    stopMotor();
-    Serial.println(F("⚠️  RIGHT LIMIT HIT - EMERGENCY STOP!"));
-    
-    if (autoMode && currentState != FIND_RANGE) {
-      Serial.println(F("⚠️  Unexpected right limit hit, returning to safe zone"));
-      delay(500);
-      
-      setMotor(2.0);
-      delay(500);
-      stopMotor();
-      
-      desiredPosition = LOWER_BOUND;
-      currentState = CHOOSE_ACTIVE_TARGET;
-    }
-  }
+
+  // Right limit is valid range boundary, not an e-stop
 }
 
 bool leftPressed() {
