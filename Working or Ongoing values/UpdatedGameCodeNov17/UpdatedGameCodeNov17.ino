@@ -593,11 +593,6 @@ void runStateMachine() {
         Serial.println(F("State: CALIBRATE → FIND_RANGE\n"));
         currentState = FIND_RANGE;
       }
-      else if (!dynamicCalibrationActive && rangeFindingComplete && !sensorCalibrated) {
-        // Range finding was skipped (AUTO mode), start sensor calibration directly
-        startDynamicCalibration();
-        desiredPosition = LOWER_BOUND;
-      }
       break;
     
     case FIND_RANGE:
@@ -1932,12 +1927,12 @@ void processCommand() {
     case 'G':
       if (!autoMode) {
         Serial.println(F("\n🎮 STARTING AUTONOMOUS MODE"));
-        Serial.println(F("Sequence: Home → Sensor Cal → Track\n"));
+        Serial.println(F("Sequence: Home → Find Range → Sensor Cal → Track\n"));
 
         if (homeToLeftLimit()) {
           autoMode = true;
           systemEnabled = true;
-          rangeFindingComplete = true;  // Skip range finding in AUTO mode
+          rangeFindingComplete = false;  // Run full range finding to establish encoder coordinates
           sensorCalibrated = false;
 
           currentState = CALIBRATE;
@@ -1945,7 +1940,7 @@ void processCommand() {
           lastPrintTime = 0;
 
           Serial.println(F("✓ HOMING COMPLETE"));
-          Serial.println(F("Next: Calibrating sensors...\n"));
+          Serial.println(F("Next: Finding encoder range...\n"));
         } else {
           Serial.println(F("✗ Homing failed\n"));
         }
