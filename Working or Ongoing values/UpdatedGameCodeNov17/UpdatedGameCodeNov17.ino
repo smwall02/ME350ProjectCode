@@ -1205,9 +1205,9 @@ void enterTuningMode() {
   stopMotor();
 
   Serial.println(F("Z-AutoTune T-Test U-Update V-View Q-Quit"));
-  Serial.print(F("Kp=")); Serial.print(KP, 4);
-  Serial.print(F(" Ki=")); Serial.print(KI, 4);
-  Serial.print(F(" Kd=")); Serial.println(KD, 4);
+  Serial.print(F("Kp=")); Serial.print(KP, 6);
+  Serial.print(F(" Ki=")); Serial.print(KI, 6);
+  Serial.print(F(" Kd=")); Serial.println(KD, 6);
 
   while (true) {
     if (Serial.available()) {
@@ -1622,9 +1622,9 @@ void tuneZieglerNichols() {
       return;
   }
 
-  Serial.print(F("Set: ")); Serial.print(KP, 5);
-  Serial.print(F(",")); Serial.print(KI, 5);
-  Serial.print(F(",")); Serial.println(KD, 5);
+  Serial.print(F("Set: ")); Serial.print(KP, 6);
+  Serial.print(F(",")); Serial.print(KI, 6);
+  Serial.print(F(",")); Serial.println(KD, 6);
 
   savePIDToEEPROM();
   Serial.println(F("Saved"));
@@ -1705,9 +1705,9 @@ void testPIDGains() {
 
 void updatePIDManually() {
   Serial.println(F("\n=== UPDATE ==="));
-  Serial.print(F("Kp=")); Serial.print(KP, 4);
-  Serial.print(F(" Ki=")); Serial.print(KI, 4);
-  Serial.print(F(" Kd=")); Serial.println(KD, 4);
+  Serial.print(F("Kp=")); Serial.print(KP, 6);
+  Serial.print(F(" Ki=")); Serial.print(KI, 6);
+  Serial.print(F(" Kd=")); Serial.println(KD, 6);
 
   Serial.println(F("New Kp (or Enter):"));
   while (Serial.available()) Serial.read();
@@ -1734,9 +1734,9 @@ void updatePIDManually() {
   }
   while (Serial.available()) Serial.read();
 
-  Serial.print(F("Set: ")); Serial.print(KP, 4);
-  Serial.print(F(",")); Serial.print(KI, 4);
-  Serial.print(F(",")); Serial.println(KD, 4);
+  Serial.print(F("Set: ")); Serial.print(KP, 6);
+  Serial.print(F(",")); Serial.print(KI, 6);
+  Serial.print(F(",")); Serial.println(KD, 6);
 
   savePIDToEEPROM();
   Serial.println(F("Saved"));
@@ -1744,9 +1744,9 @@ void updatePIDManually() {
 
 void viewPIDSettings() {
   Serial.println(F("\n=== SETTINGS ==="));
-  Serial.print(F("Kp=")); Serial.print(KP, 4);
-  Serial.print(F(" Ki=")); Serial.print(KI, 4);
-  Serial.print(F(" Kd=")); Serial.println(KD, 4);
+  Serial.print(F("Kp=")); Serial.print(KP, 6);
+  Serial.print(F(" Ki=")); Serial.print(KI, 6);
+  Serial.print(F(" Kd=")); Serial.println(KD, 6);
   Serial.print(F("FrL=")); Serial.print(FRICTION_LEFT, 2);
   Serial.print(F(" FrR=")); Serial.println(FRICTION_RIGHT, 2);
 
@@ -2195,11 +2195,11 @@ void printStatus() {
   
   Serial.println(F("\n━━ PID GAINS ━━"));
   Serial.print(F("Kp = "));
-  Serial.println(KP, 4);
+  Serial.println(KP, 6);
   Serial.print(F("Ki = "));
-  Serial.println(KI, 4);
+  Serial.println(KI, 6);
   Serial.print(F("Kd = "));
-  Serial.println(KD, 4);
+  Serial.println(KD, 6);
   
   if (adaptiveFrictionVoltage > 0) {
     Serial.print(F("Learned Friction = "));
