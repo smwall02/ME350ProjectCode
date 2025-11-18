@@ -153,7 +153,7 @@ bool adaptiveLearned = false;
 // ============================================
 float KP = 0.020;
 float KI = 0.005;
-float KD = 0.010;  // Increased from 0.004 to add damping and prevent overshoot
+float KD = 0.004;  // Reduced back to original for faster response (friction comp disabled)
 
 float KP_active = KP;
 float KI_active = KI;
@@ -890,40 +890,22 @@ void runMotionControl() {
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
 
-  // Improved friction compensation based on direction
+  // FRICTION COMPENSATION DISABLED - was causing overshoot
   float frictionComp = 0;
-  if (abs(error) > TARGET_BAND) {
-    // Determine direction: negative error means move to MORE NEGATIVE (away from home)
-    // positive error means move to LESS NEGATIVE (toward home)
-    bool movingTowardMoreNegative = (error < 0);
-    float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
-
-    // Scale friction based on error magnitude
-    float frictionScale = 1.0;
-    float absError = abs(error);
-
-    if (absError < 3) {
-      frictionScale = 0.05;  // Reduced to prevent overshoot near target
-    } else if (absError < 10) {
-      frictionScale = 0.15;  // Reduced to prevent overshoot
-    } else if (absError < 30) {
-      frictionScale = 0.4;   // Reduced from original 0.6
-    } else if (absError < 100) {
-      frictionScale = 0.7;   // Reduced from original 0.85
-    }
-
-    // Reduce friction compensation when moving to prevent overshoot
-    if (abs(motorVelocity) > 5) {
-      frictionScale *= 0.5;  // Cut friction in half when moving
-    }
-
-    // Apply friction compensation in correct direction
-    if (error < 0) {
-      frictionComp = -baseFriction * frictionScale;
-    } else {
-      frictionComp = baseFriction * frictionScale;
-    }
-  }
+  // Disabled until proper tuning can be done
+  // if (abs(error) > TARGET_BAND) {
+  //   bool movingTowardMoreNegative = (error < 0);
+  //   float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
+  //   float frictionScale = 1.0;
+  //   float absError = abs(error);
+  //   if (absError < 3) frictionScale = 0.05;
+  //   else if (absError < 10) frictionScale = 0.15;
+  //   else if (absError < 30) frictionScale = 0.4;
+  //   else if (absError < 100) frictionScale = 0.7;
+  //   if (abs(motorVelocity) > 5) frictionScale *= 0.5;
+  //   if (error < 0) frictionComp = -baseFriction * frictionScale;
+  //   else frictionComp = baseFriction * frictionScale;
+  // }
 
   // Velocity feedforward - DISABLED to prevent overshoot
   float velocityFF = 0;
@@ -940,15 +922,17 @@ void runMotionControl() {
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 3.0;  // Further reduced to prevent overshoot
+    voltageLimit = 7.0;  // Increased for faster movement
   } else if (absErr > 500) {
-    voltageLimit = 2.7;  // Further reduced to prevent overshoot
+    voltageLimit = 6.5;  // Increased for faster movement
   } else if (absErr > 300) {
-    voltageLimit = 2.5;  // Further reduced to prevent overshoot
+    voltageLimit = 6.0;  // Increased for faster movement
   } else if (absErr > 100) {
-    voltageLimit = 2.3;  // Further reduced to prevent overshoot
+    voltageLimit = 5.5;  // Increased for faster movement
+  } else if (absErr > 50) {
+    voltageLimit = 5.0;  // Increased for faster movement
   } else {
-    voltageLimit = 2.0;  // Further reduced for careful final approach
+    voltageLimit = 4.0;  // Increased for final approach
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -968,7 +952,7 @@ void runMotionControl() {
 
         // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
         if (stuckCounter >= 2) {
-          float minVoltage = 2.0;  // Reduced to prevent overshoot
+          float minVoltage = 3.5;  // Increased for faster unsticking
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (error < 0) ? -minVoltage : minVoltage;
           }
