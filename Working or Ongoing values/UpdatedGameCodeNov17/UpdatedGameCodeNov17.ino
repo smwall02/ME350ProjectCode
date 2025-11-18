@@ -1583,69 +1583,54 @@ void testPIDGains() {
   homeToLeftLimit();
   delay(500);
 
+  // Use actual lane movement method
   long targetPos = TARGET_3_POSITION;
-  Serial.println(F("Time,Pos,Err,V"));
+  desiredPosition = targetPos;
+  errorIntegral = 0;
+  lastError = 0;
+  moveStartTime = millis();
+  targetReached = false;
+  systemEnabled = true;
 
-  // Local PID state variables for testing
-  long testError = 0;
-  long testLastError = 0;
-  float testIntegral = 0.0;
+  Serial.println(F("Time,Pos,Err"));
 
   unsigned long startTime = millis();
   unsigned long lastLog = 0;
 
-  while (millis() - startTime < 5000) {
+  // Run for 8 seconds or until target reached
+  while (millis() - startTime < 8000) {
     long currentPos = encoder.read();
-    testError = targetPos - currentPos;
+    long err = targetPos - currentPos;
 
-    // PID calculation
-    float pTerm = KP * testError;
-    testIntegral += KI * testError;
-    float dTerm = KD * (testError - testLastError);
-    float voltage = pTerm + testIntegral + dTerm;
+    // Use real control system
+    runMotionControl();
 
-    // Determine direction and add friction compensation
-    float frictionComp = 0.0;
-    if (testError < -50) {  // Moving left (toward more negative)
-      frictionComp = FRICTION_LEFT;
-    } else if (testError > 50) {  // Moving right (toward less negative)
-      frictionComp = FRICTION_RIGHT;
-    }
-
-    // Add friction with sign of error
-    if (testError < 0) {
-      voltage -= frictionComp;
-    } else if (testError > 0) {
-      voltage += frictionComp;
-    }
-
-    // Anti-windup on zero crossing
-    if ((testError != 0) && (testError * testLastError < 0)) {
-      testIntegral *= 0.5;
-    }
-
-    float applied = cappedVoltageForError(voltage, abs(testError));
-    setMotor(applied);
-
+    // Log at 30ms intervals
     if (millis() - lastLog >= 30) {
       float t = (millis() - startTime) / 1000.0;
       Serial.print(t, 2);
       Serial.print(",");
       Serial.print(currentPos);
       Serial.print(",");
-      Serial.print(testError);
-      Serial.print(",");
-      Serial.println(applied, 3);
+      Serial.println(err);
       lastLog = millis();
     }
 
-    testLastError = testError;
-    delay(10);
+    // Exit early if target reached and stable
+    if (targetReached && millis() - startTime > 2000) {
+      Serial.println(F("Target reached"));
+      break;
+    }
+
+    delay(CONTROL_PERIOD);
   }
 
   stopMotor();
-  Serial.print(F("Done. Err="));
-  Serial.println(testError);
+  systemEnabled = false;
+
+  long finalErr = targetPos - encoder.read();
+  Serial.print(F("Final err="));
+  Serial.println(finalErr);
 }
 
 void updatePIDManually() {
