@@ -903,20 +903,18 @@ void runMotionControl() {
     float absError = abs(error);
 
     if (absError < 3) {
-      frictionScale = 0.3;  // Increased from 0.1 to help reach target
+      frictionScale = 0.05;  // Reduced to prevent overshoot near target
     } else if (absError < 10) {
-      frictionScale = 0.5;  // Increased from 0.3
+      frictionScale = 0.15;  // Reduced to prevent overshoot
     } else if (absError < 30) {
-      frictionScale = 0.75; // Increased from 0.6
+      frictionScale = 0.4;   // Reduced from original 0.6
     } else if (absError < 100) {
-      frictionScale = 0.95; // Increased from 0.85
+      frictionScale = 0.7;   // Reduced from original 0.85
     }
 
-    // FIXED: Increase friction comp if motor is NOT moving (stuck)
-    if (abs(motorVelocity) < 5) {
-      frictionScale *= 1.5;  // BOOST friction when stuck to overcome static friction
-    } else {
-      frictionScale *= 0.8;  // Reduce slightly when moving (kinetic friction is lower)
+    // Reduce friction compensation when moving to prevent overshoot
+    if (abs(motorVelocity) > 5) {
+      frictionScale *= 0.5;  // Cut friction in half when moving
     }
 
     // Apply friction compensation in correct direction
@@ -941,15 +939,15 @@ void runMotionControl() {
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 6.5;  // Increased from 4.5 for faster long-distance moves
+    voltageLimit = 4.0;  // Reduced to prevent overshoot
   } else if (absErr > 500) {
-    voltageLimit = 6.0;  // Increased from 4.0
+    voltageLimit = 3.5;  // Reduced to prevent overshoot
   } else if (absErr > 300) {
-    voltageLimit = 5.5;  // Increased from 3.7
+    voltageLimit = 3.2;  // Reduced to prevent overshoot
   } else if (absErr > 100) {
-    voltageLimit = 5.0;  // New tier for medium distances
+    voltageLimit = 3.0;  // Reduced to prevent overshoot
   } else {
-    voltageLimit = 4.5;  // Increased from 3.5 for final approach
+    voltageLimit = 2.8;  // Reduced for careful final approach
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -969,7 +967,7 @@ void runMotionControl() {
 
         // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
         if (stuckCounter >= 2) {
-          float minVoltage = 3.0;  // Increased from 2.2 to overcome static friction
+          float minVoltage = 2.0;  // Reduced to prevent overshoot
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (error < 0) ? -minVoltage : minVoltage;
           }
