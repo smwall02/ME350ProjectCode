@@ -151,9 +151,9 @@ bool adaptiveLearned = false;
 // ============================================
 // PID CONTROL PARAMETERS
 // ============================================
-float KP = 0.020;
-float KI = 0.005;
-float KD = 0.004;  // Reduced back to original for faster response (friction comp disabled)
+float KP = 0.015;  // Reduced from 0.020 to be less aggressive
+float KI = 0.003;  // Reduced from 0.005 to prevent integral windup
+float KD = 0.020;  // Increased from 0.004 for much stronger damping to prevent overshoot
 
 float KP_active = KP;
 float KI_active = KI;
@@ -919,20 +919,21 @@ void runMotionControl() {
   float totalVoltage = pidVoltage + frictionComp + velocityFF;
 
   // Voltage capping based on error magnitude (prevents overshoot)
+  // DRASTICALLY reduced - was overshooting by a whole lane
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 7.0;  // Increased for faster movement
+    voltageLimit = 3.0;  // Very conservative for long moves
   } else if (absErr > 500) {
-    voltageLimit = 6.5;  // Increased for faster movement
+    voltageLimit = 2.7;  // Conservative
   } else if (absErr > 300) {
-    voltageLimit = 6.0;  // Increased for faster movement
+    voltageLimit = 2.5;  // Conservative
   } else if (absErr > 100) {
-    voltageLimit = 5.5;  // Increased for faster movement
+    voltageLimit = 2.2;  // Conservative
   } else if (absErr > 50) {
-    voltageLimit = 5.0;  // Increased for faster movement
+    voltageLimit = 2.0;  // Very gentle approach
   } else {
-    voltageLimit = 4.0;  // Increased for final approach
+    voltageLimit = 1.8;  // Very gentle final approach
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -952,7 +953,7 @@ void runMotionControl() {
 
         // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
         if (stuckCounter >= 2) {
-          float minVoltage = 3.5;  // Increased for faster unsticking
+          float minVoltage = 2.5;  // Conservative to prevent overshoot
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (error < 0) ? -minVoltage : minVoltage;
           }
