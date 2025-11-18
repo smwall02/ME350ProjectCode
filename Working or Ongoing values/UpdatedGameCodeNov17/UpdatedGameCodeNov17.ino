@@ -1250,6 +1250,14 @@ void tuneZieglerNichols() {
 
   unsigned long moveStart = millis();
   while (abs(encoder.read() - centerPosition) > 2 && millis() - moveStart < 5000) {
+    // Safety: check limit switches
+    if (leftPressed() || rightPressed()) {
+      Serial.println(F("ERR: Hit limit during center"));
+      stopMotor();
+      lastTuneResults.valid = false;
+      return;
+    }
+
     long currentPos = encoder.read();
     centerError = centerPosition - currentPos;
 
@@ -1259,14 +1267,13 @@ void tuneZieglerNichols() {
     float dTerm = KD * (centerError - centerLastError);
     float voltage = pTerm + centerIntegral + dTerm;
 
-    // Add friction compensation
-    float frictionComp = 0.0;
+    // Directional friction compensation
     if (centerError < -50) {
-      frictionComp = FRICTION_LEFT;
-      voltage -= frictionComp;
+      // Moving right (negative direction)
+      voltage -= FRICTION_LEFT;
     } else if (centerError > 50) {
-      frictionComp = FRICTION_RIGHT;
-      voltage += frictionComp;
+      // Moving left (positive direction)
+      voltage += FRICTION_RIGHT;
     }
 
     // Anti-windup on zero crossing
@@ -1274,8 +1281,8 @@ void tuneZieglerNichols() {
       centerIntegral *= 0.5;
     }
 
-    // Apply voltage with capping
-    float cappedVoltage = constrain(voltage, -4.0, 4.0);
+    // Apply voltage with conservative capping
+    float cappedVoltage = constrain(voltage, -3.0, 3.0);
     setMotor(cappedVoltage);
 
     centerLastError = centerError;
