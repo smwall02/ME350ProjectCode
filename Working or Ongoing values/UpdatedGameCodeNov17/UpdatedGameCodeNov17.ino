@@ -1174,8 +1174,70 @@ void tuneZieglerNichols() {
     return;
   }
 
-  long centerPosition = TARGET_3_POSITION;
-  Serial.print(F("Moving to ")); Serial.println(centerPosition);
+  // Step 1: Robust home to left limit with stable detection
+  Serial.println(F("Homing to left..."));
+  if (!homeToLeftLimit()) {
+    Serial.println(F("ERR: Home failed"));
+    lastTuneResults.valid = false;
+    return;
+  }
+
+  long tuneLeftBound = encoder.read();
+  Serial.print(F("Left=")); Serial.println(tuneLeftBound);
+  delay(300);
+
+  // Step 2: Move to right limit with stable holding
+  Serial.println(F("Finding right limit..."));
+  setMotor(4.0);  // Move right
+
+  unsigned long rightStart = millis();
+  while (!rightPressed() && (millis() - rightStart) < 15000) {
+    delay(10);
+  }
+
+  if (!rightPressed()) {
+    stopMotor();
+    Serial.println(F("ERR: Right timeout"));
+    lastTuneResults.valid = false;
+    return;
+  }
+
+  // Hold at right limit with stable detection (like left homing)
+  Serial.println(F("Stabilizing at right..."));
+  long lastRightPos = encoder.read();
+  unsigned long holdStart = millis();
+  int stableCount = 0;
+
+  while (stableCount < 3 && (millis() - holdStart) < 1000) {
+    setMotor(0.8);  // Gentle hold against right limit
+    delay(100);
+
+    long pos = encoder.read();
+    if (abs(pos - lastRightPos) < 3) {
+      stableCount++;
+    } else {
+      stableCount = 0;
+      lastRightPos = pos;
+    }
+  }
+
+  stopMotor();
+  delay(100);
+
+  long tuneRightBound = encoder.read();
+  Serial.print(F("Right=")); Serial.println(tuneRightBound);
+
+  if (abs(tuneRightBound - tuneLeftBound) < 500) {
+    Serial.println(F("ERR: Range too small"));
+    lastTuneResults.valid = false;
+    return;
+  }
+
+  delay(300);
+
+  // Step 3: Move to center position
+  long centerPosition = (tuneLeftBound + tuneRightBound) / 2;
+  Serial.print(F("Moving to center: ")); Serial.println(centerPosition);
 
   unsigned long moveStart = millis();
   while (abs(encoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
@@ -1186,11 +1248,14 @@ void tuneZieglerNichols() {
   stopMotor();
   delay(500);
 
+  // Use locally measured bounds for tuning
   const float TEST_VOLTAGE = 5.0;
-  const long HYSTERESIS = abs(UPPER_BOUND - LOWER_BOUND) / 6;
+  const long HYSTERESIS = abs(tuneRightBound - tuneLeftBound) / 6;
   const int TARGET_PEAKS = 20;
   const unsigned long TIMEOUT = 120000;
+  const long tuneRange = abs(tuneRightBound - tuneLeftBound);
 
+  Serial.print(F("Range=")); Serial.println(tuneRange);
   Serial.println(F("Testing..."));
 
   // Enhanced peak/trough detection
@@ -1339,7 +1404,7 @@ void tuneZieglerNichols() {
   float Tu = avgPeriod * 2;
 
   // Validate results are physically reasonable
-  if (avgAmplitude < 10 || avgAmplitude > abs(UPPER_BOUND - LOWER_BOUND)) {
+  if (avgAmplitude < 10 || avgAmplitude > tuneRange) {
     Serial.println(F("ERR: Bad amplitude"));
     lastTuneResults.valid = false;
     return;
