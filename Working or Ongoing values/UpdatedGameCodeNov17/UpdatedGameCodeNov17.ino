@@ -1939,20 +1939,20 @@ void processCommand() {
     case 'G':
       if (!autoMode) {
         Serial.println(F("\n🎮 STARTING AUTONOMOUS MODE"));
-        Serial.println(F("Sequence: Home → Find Range → Sensor Cal → Track\n"));
-        
+        Serial.println(F("Sequence: Home → Sensor Cal → Track\n"));
+
         if (homeToLeftLimit()) {
           autoMode = true;
           systemEnabled = true;
-          rangeFindingComplete = false;
+          rangeFindingComplete = true;  // Skip range finding in AUTO mode
           sensorCalibrated = false;
-          
+
           currentState = CALIBRATE;
           errorIntegral = 0;
           lastPrintTime = 0;
-          
+
           Serial.println(F("✓ HOMING COMPLETE"));
-          Serial.println(F("Next: Finding encoder range...\n"));
+          Serial.println(F("Next: Calibrating sensors...\n"));
         } else {
           Serial.println(F("✗ Homing failed\n"));
         }
