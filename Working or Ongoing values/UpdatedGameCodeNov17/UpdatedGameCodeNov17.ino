@@ -1311,20 +1311,27 @@ void tuneZieglerNichols() {
 
     // Track peaks and troughs
     if (searchingForPeak && currentPos < lastPos) {
-      // Found a peak
+      // Found a peak (lastPos was the highest point)
       if (peakCount >= 4 && peakCount < TARGET_PEAKS + 4) {
-        peaks[peakCount - 4] = lastExtreme;
+        peaks[peakCount - 4] = lastPos;
       }
-      lastExtreme = currentPos;
+      lastExtreme = lastPos;
       searchingForPeak = false;
     } else if (!searchingForPeak && currentPos > lastPos) {
-      // Found a trough
+      // Found a trough (lastPos was the lowest point)
       if (peakCount >= 4 && peakCount < TARGET_PEAKS + 4) {
-        troughs[peakCount - 4] = lastExtreme;
+        troughs[peakCount - 4] = lastPos;
       }
-      lastExtreme = currentPos;
+      lastExtreme = lastPos;
       searchingForPeak = true;
     }
+
+    if (currentPos > lastExtreme && searchingForPeak) {
+      lastExtreme = currentPos;
+    } else if (currentPos < lastExtreme && !searchingForPeak) {
+      lastExtreme = currentPos;
+    }
+
     lastPos = currentPos;
 
     // Detect center crossings for period measurement
@@ -1418,9 +1425,17 @@ void tuneZieglerNichols() {
   float Ku = (4.0 * TEST_VOLTAGE) / (PI * avgAmplitude);
   float Tu = avgPeriod * 2;
 
+  // Debug output
+  Serial.print(F("AvgAmp=")); Serial.println(avgAmplitude);
+
   // Validate results are physically reasonable
-  if (avgAmplitude < 10 || avgAmplitude > tuneRange) {
-    Serial.println(F("ERR: Bad amplitude"));
+  // Amplitude should be distance from center to peak (max = tuneRange/2)
+  if (avgAmplitude < 10 || avgAmplitude > tuneRange / 2) {
+    Serial.print(F("ERR: Bad amplitude ("));
+    Serial.print(avgAmplitude);
+    Serial.print(F(" vs max "));
+    Serial.print(tuneRange / 2);
+    Serial.println(F(")"));
     lastTuneResults.valid = false;
     return;
   }
