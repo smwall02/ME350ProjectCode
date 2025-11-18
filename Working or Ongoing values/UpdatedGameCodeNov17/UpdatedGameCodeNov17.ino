@@ -903,18 +903,20 @@ void runMotionControl() {
     float absError = abs(error);
 
     if (absError < 3) {
-      frictionScale = 0.1;
+      frictionScale = 0.3;  // Increased from 0.1 to help reach target
     } else if (absError < 10) {
-      frictionScale = 0.3;
+      frictionScale = 0.5;  // Increased from 0.3
     } else if (absError < 30) {
-      frictionScale = 0.6;
+      frictionScale = 0.75; // Increased from 0.6
     } else if (absError < 100) {
-      frictionScale = 0.85;
+      frictionScale = 0.95; // Increased from 0.85
     }
 
-    // Reduce friction comp if motor is already moving
+    // FIXED: Increase friction comp if motor is NOT moving (stuck)
     if (abs(motorVelocity) < 5) {
-      frictionScale *= 0.5;
+      frictionScale *= 1.5;  // BOOST friction when stuck to overcome static friction
+    } else {
+      frictionScale *= 0.8;  // Reduce slightly when moving (kinetic friction is lower)
     }
 
     // Apply friction compensation in correct direction
@@ -939,13 +941,15 @@ void runMotionControl() {
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 4.5;
+    voltageLimit = 6.5;  // Increased from 4.5 for faster long-distance moves
   } else if (absErr > 500) {
-    voltageLimit = 4.0;
+    voltageLimit = 6.0;  // Increased from 4.0
   } else if (absErr > 300) {
-    voltageLimit = 3.7;
+    voltageLimit = 5.5;  // Increased from 3.7
+  } else if (absErr > 100) {
+    voltageLimit = 5.0;  // New tier for medium distances
   } else {
-    voltageLimit = 3.5;
+    voltageLimit = 4.5;  // Increased from 3.5 for final approach
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -965,7 +969,7 @@ void runMotionControl() {
 
         // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
         if (stuckCounter >= 2) {
-          float minVoltage = 2.2;  // Minimum to overcome static friction
+          float minVoltage = 3.0;  // Increased from 2.2 to overcome static friction
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (error < 0) ? -minVoltage : minVoltage;
           }
