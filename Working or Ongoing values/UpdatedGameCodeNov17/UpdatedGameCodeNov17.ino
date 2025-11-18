@@ -747,8 +747,12 @@ void runStateMachine() {
           }
           // Otherwise stay put at wait position
         } else if (millis() - arrivalTime > targetActivateTime) {
-          Serial.println(F("✓ Target activated (timeout), choosing next"));
-          currentState = CHOOSE_ACTIVE_TARGET;
+          // Check if targeted zombie is moving backward before leaving
+          if (activeTargetIndex >= 0 && ProxSensors[activeTargetIndex].direction == BACKWARD) {
+            Serial.println(F("✓ Target retreating, choosing next"));
+            currentState = CHOOSE_ACTIVE_TARGET;
+          }
+          // Otherwise stay at target position until zombie starts retreating
         }
       } else {
         arrivalTime = millis();
