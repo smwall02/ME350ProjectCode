@@ -1158,6 +1158,15 @@ void enterTuningMode() {
 
 void tuneZieglerNichols() {
   Serial.println(F("\n=== AUTO-TUNE ==="));
+
+  // Require friction learning first
+  if (!adaptiveLearned) {
+    Serial.println(F("ERR: Must learn friction first"));
+    Serial.println(F("Move to a lane (1-4) to trigger learning"));
+    Serial.println(F("Then retry auto-tune"));
+    return;
+  }
+
   Serial.println(F("Relay test at Lane 3. Press Y..."));
 
   while (Serial.available()) Serial.read();
@@ -1488,31 +1497,43 @@ void tuneZieglerNichols() {
   Serial.print(F("Amp=")); Serial.print(avgAmplitude);
   Serial.print(F(" StdDev=")); Serial.println(amplitudeStdDev);
 
-  Serial.println(F("1-Conserv 2-Classic 3-Aggr 4-Cancel"));
+  Serial.println(F("1-Robust 2-Conserv 3-Classic 4-Aggr 5-Cancel"));
 
-  float kp1 = 0.3 * 0.6 * Ku;
-  float ki1 = 0.3 * 1.2 * Ku / Tu;
-  float kd1 = 0.3 * 0.075 * Ku * Tu;
+  // Robust (Tyreus-Luyben method - best for overshoot rejection)
+  float kp1 = 0.45 * Ku;
+  float ki1 = 0.54 * Ku / (2.2 * Tu);
+  float kd1 = 0.0;  // No derivative for robustness
 
-  Serial.print(F("1: ")); Serial.print(kp1, 3);
-  Serial.print(F(",")); Serial.print(ki1, 3);
-  Serial.print(F(",")); Serial.println(kd1, 3);
+  Serial.print(F("1: ")); Serial.print(kp1, 5);
+  Serial.print(F(",")); Serial.print(ki1, 5);
+  Serial.print(F(",")); Serial.println(kd1, 5);
 
-  float kp2 = 0.6 * Ku;
-  float ki2 = 1.2 * Ku / Tu;
-  float kd2 = 0.075 * Ku * Tu;
+  // Conservative (30% of ZN)
+  float kp2 = 0.3 * 0.6 * Ku;
+  float ki2 = 0.3 * 1.2 * Ku / Tu;
+  float kd2 = 0.3 * 0.075 * Ku * Tu;
 
-  Serial.print(F("2: ")); Serial.print(kp2, 3);
-  Serial.print(F(",")); Serial.print(ki2, 3);
-  Serial.print(F(",")); Serial.println(kd2, 3);
+  Serial.print(F("2: ")); Serial.print(kp2, 5);
+  Serial.print(F(",")); Serial.print(ki2, 5);
+  Serial.print(F(",")); Serial.println(kd2, 5);
 
-  float kp3 = 0.8 * 0.6 * Ku;
-  float ki3 = 0.8 * 1.2 * Ku / Tu;
-  float kd3 = 0.8 * 0.075 * Ku * Tu;
+  // Classic ZN
+  float kp3 = 0.6 * Ku;
+  float ki3 = 1.2 * Ku / Tu;
+  float kd3 = 0.075 * Ku * Tu;
 
-  Serial.print(F("3: ")); Serial.print(kp3, 3);
-  Serial.print(F(",")); Serial.print(ki3, 3);
-  Serial.print(F(",")); Serial.println(kd3, 3);
+  Serial.print(F("3: ")); Serial.print(kp3, 5);
+  Serial.print(F(",")); Serial.print(ki3, 5);
+  Serial.print(F(",")); Serial.println(kd3, 5);
+
+  // Aggressive (80% of ZN)
+  float kp4 = 0.8 * 0.6 * Ku;
+  float ki4 = 0.8 * 1.2 * Ku / Tu;
+  float kd4 = 0.8 * 0.075 * Ku * Tu;
+
+  Serial.print(F("4: ")); Serial.print(kp4, 5);
+  Serial.print(F(",")); Serial.print(ki4, 5);
+  Serial.print(F(",")); Serial.println(kd4, 5);
 
   while (Serial.available()) Serial.read();
   char selection = 0;
@@ -1527,14 +1548,15 @@ void tuneZieglerNichols() {
     case '1': KP = kp1; KI = ki1; KD = kd1; break;
     case '2': KP = kp2; KI = ki2; KD = kd2; break;
     case '3': KP = kp3; KI = ki3; KD = kd3; break;
+    case '4': KP = kp4; KI = ki4; KD = kd4; break;
     default:
       Serial.println(F("Cancel"));
       return;
   }
 
-  Serial.print(F("Set: ")); Serial.print(KP, 4);
-  Serial.print(F(",")); Serial.print(KI, 4);
-  Serial.print(F(",")); Serial.println(KD, 4);
+  Serial.print(F("Set: ")); Serial.print(KP, 5);
+  Serial.print(F(",")); Serial.print(KI, 5);
+  Serial.print(F(",")); Serial.println(KD, 5);
 
   savePIDToEEPROM();
   Serial.println(F("Saved"));
