@@ -639,17 +639,33 @@ void runMotionControl() {
   float error = desiredPosition - currentPosition;
   
   if (currentState == MOVE_TO_TARGET && autoMode) {
-    if (currentPosition < UPPER_BOUND + 30) {
+    // CRITICAL FIX: Enhanced encoder drift detection
+    if (currentPosition > 50) {
+      Serial.print(F("⚠️  ENCODER DRIFT DETECTED - Position too positive: "));
+      Serial.println(currentPosition);
+      Serial.println(F("Stopping autonomous mode. Press 'G' to re-home and re-calibrate."));
+      autoMode = false;
+      systemEnabled = false;
       stopMotor();
+      return;
+    }
+
+    // Check if position is way beyond expected range
+    if (currentPosition < UPPER_BOUND - 200) {
+      Serial.print(F("⚠️  ENCODER DRIFT DETECTED - Position too negative: "));
+      Serial.println(currentPosition);
+      Serial.println(F("Stopping autonomous mode. Press 'G' to re-home and re-calibrate."));
+      autoMode = false;
+      systemEnabled = false;
+      stopMotor();
+      return;
+    }
+
+    // Safety check - approaching right limit
+    if (currentPosition < UPPER_BOUND + 30) {
       Serial.println(F("⚠️  Too close to right limit!"));
       desiredPosition = WAIT_POSITION;
       currentState = CHOOSE_ACTIVE_TARGET;
-      return;
-    }
-    
-    if (currentPosition > 50) {
-      Serial.println(F("⚠️  Position drift detected - need recalibration"));
-      stopMotor();
       return;
     }
   }
@@ -820,27 +836,37 @@ void stopMotor() {
 // LIMIT SWITCH SAFETY
 // ============================================
 void checkLimitSwitches() {
-  if (digitalRead(LIMIT_LEFT) == HIGH && 
-      currentState != CALIBRATE && 
+  // CRITICAL FIX: Only re-zero encoder if we're VERY close to position 0
+  // This prevents false re-zeroing if the limit switch bounces or has noise
+  if (digitalRead(LIMIT_LEFT) == HIGH &&
+      currentState != CALIBRATE &&
       currentState != FIND_RANGE &&
       !dynamicCalibrationActive &&
-      abs(motorVelocity) < 10) {
-    
+      abs(motorVelocity) < 10 &&
+      encoder.read() > -20 && encoder.read() < 50) {  // ← NEW: Only if near expected position
+
     delay(50);
-    encoder.write(0);
-    delay(30);
-    
-    if (encoder.read() != 0) {
+
+    // Double-check the limit is still pressed after debounce delay
+    if (digitalRead(LIMIT_LEFT) == HIGH) {
+      long oldPos = encoder.read();
       encoder.write(0);
       delay(30);
+
+      if (encoder.read() != 0) {
+        encoder.write(0);
+        delay(30);
+      }
+
+      if (encoder.read() != 0) {
+        encoder.write(0);
+      }
+
+      errorIntegral = 0;
+      Serial.print(F("⚠️  Recalibrated at left limit (was "));
+      Serial.print(oldPos);
+      Serial.println(F(")"));
     }
-    
-    if (encoder.read() != 0) {
-      encoder.write(0);
-    }
-    
-    errorIntegral = 0;
-    Serial.println(F("⚠️  Recalibrated at left limit"));
   }
   
   if (digitalRead(LIMIT_RIGHT) == HIGH) {
@@ -1061,22 +1087,31 @@ void processCommand() {
       if (!autoMode) {
         Serial.println(F("\n🎮 STARTING AUTONOMOUS MODE"));
         Serial.println(F("Sequence: Home → Find Range → Sensor Cal → Track\n"));
-        
+        Serial.print(F("Current encoder position before homing: "));
+        Serial.println(encoder.read());
+
         if (homeToLeftLimit()) {
           autoMode = true;
           systemEnabled = true;
-          rangeFindingComplete = false;
+          rangeFindingComplete = false;  // CRITICAL: Always find range to re-establish encoder reference
           sensorCalibrated = false;
-          
+
+          // Reset any stale position data
+          LOWER_BOUND = 0;
+          UPPER_BOUND = -1400;  // Will be updated during range finding
+
           currentState = CALIBRATE;
           errorIntegral = 0;
           lastPrintTime = 0;
-          
-          Serial.println(F("✓ HOMING COMPLETE"));
-          Serial.println(F("Next: Finding encoder range...\n"));
+
+          Serial.print(F("✓ HOMING COMPLETE - Encoder zeroed at: "));
+          Serial.println(encoder.read());
+          Serial.println(F("Next: Finding encoder range to establish position reference...\n"));
         } else {
           Serial.println(F("✗ Homing failed\n"));
         }
+      } else {
+        Serial.println(F("⚠️  Already in autonomous mode. Press 'S' to stop first.\n"));
       }
       break;
     
