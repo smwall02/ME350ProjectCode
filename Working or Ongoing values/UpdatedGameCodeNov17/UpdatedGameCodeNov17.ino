@@ -1198,14 +1198,14 @@ void tuneZieglerNichols() {
   Serial.print(F("Moving to center (Lane 3): "));
   Serial.println(centerPosition);
 
-  // Use PID to get close
-  error = lastError = errorIntegral = 0;
+  // Use simple proportional control to get close
   unsigned long moveStart = millis();
 
-  while (abs(motorEncoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
-    float voltage = updatePID(centerPosition);
-    float applied = constrain(voltage, -4.0, 4.0);
-    setMotor(applied);
+  while (abs(encoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
+    long currentPos = encoder.read();
+    long err = centerPosition - currentPos;
+    float voltage = constrain(err * 0.01, -4.0, 4.0);
+    setMotor(voltage);
     delay(10);
   }
   stopMotor();
@@ -1227,14 +1227,14 @@ void tuneZieglerNichols() {
   long peaks[TARGET_PEAKS];
   unsigned long peakTimes[TARGET_PEAKS];
   int peakCount = 0;
-  bool lastAboveCenter = (motorEncoder.read() > centerPosition);
+  bool lastAboveCenter = (encoder.read() > centerPosition);
   unsigned long lastCrossTime = millis();
 
   unsigned long testStart = millis();
   bool relayState = true;
 
   while (peakCount < TARGET_PEAKS + 4 && millis() - testStart < TIMEOUT) {
-    long currentPos = motorEncoder.read();
+    long currentPos = encoder.read();
     long deviation = currentPos - centerPosition;
 
     // Relay logic with hysteresis
@@ -1425,38 +1425,67 @@ void testPIDGains() {
   Serial.println(targetPos);
   Serial.println(F("\nTime(s),Position,Error,Voltage"));
 
-  error = lastError = errorIntegral = 0;
+  // Local PID state variables for testing
+  long testError = 0;
+  long testLastError = 0;
+  float testIntegral = 0.0;
+
   unsigned long startTime = millis();
   unsigned long lastLog = 0;
 
   while (millis() - startTime < 5000) {
-    float voltage = updatePID(targetPos);
-    // Anti-windup
-    if ((error != 0) && (error * lastError < 0)) {
-      errorIntegral *= 0.5;
+    long currentPos = encoder.read();
+    testError = targetPos - currentPos;
+
+    // PID calculation
+    float pTerm = KP * testError;
+    testIntegral += KI * testError;
+    float dTerm = KD * (testError - testLastError);
+    float voltage = pTerm + testIntegral + dTerm;
+
+    // Determine direction and add friction compensation
+    float frictionComp = 0.0;
+    if (testError < -50) {  // Moving left (toward more negative)
+      frictionComp = FRICTION_LEFT;
+    } else if (testError > 50) {  // Moving right (toward less negative)
+      frictionComp = FRICTION_RIGHT;
     }
-    float applied = cappedVoltageForError(voltage, error);
+
+    // Add friction with sign of error
+    if (testError < 0) {
+      voltage -= frictionComp;
+    } else if (testError > 0) {
+      voltage += frictionComp;
+    }
+
+    // Anti-windup on zero crossing
+    if ((testError != 0) && (testError * testLastError < 0)) {
+      testIntegral *= 0.5;
+    }
+
+    float applied = cappedVoltageForError(voltage, abs(testError));
     setMotor(applied);
 
     if (millis() - lastLog >= 30) {
       float t = (millis() - startTime) / 1000.0;
       Serial.print(t, 2);
       Serial.print(",");
-      Serial.print(motorEncoder.read());
+      Serial.print(currentPos);
       Serial.print(",");
-      Serial.print(error);
+      Serial.print(testError);
       Serial.print(",");
       Serial.println(applied, 3);
       lastLog = millis();
     }
 
+    testLastError = testError;
     delay(10);
   }
 
   stopMotor();
   Serial.println(F("\n=== TEST COMPLETE ==="));
   Serial.print(F("Final error: "));
-  Serial.println(error);
+  Serial.println(testError);
 }
 
 void updatePIDManually() {
