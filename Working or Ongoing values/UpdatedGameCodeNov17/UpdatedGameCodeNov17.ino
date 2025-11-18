@@ -198,7 +198,7 @@ const float RANGE_FINDING_VOLTAGE = -3.5;
 
 // Improved homing softness parameters
 const float CALIBRATE_EXTRA_VOLTAGE = 0.6;      // Added to overcome friction during homing
-const float CALIBRATE_MIN_VOLTAGE = 2.5;        // Minimum drive voltage during homing
+const float CALIBRATE_MIN_VOLTAGE = 3.5;        // Minimum drive voltage during homing
 const unsigned long CALIBRATE_HOLD_TIME = 300;  // ms to hold on limit before zeroing
 const int CALIBRATE_STABLE_TICKS = 3;           // Stable readings required before zeroing
 const float VEL_STOP_THRESH = 2.0;              // counts/sec considered stopped
