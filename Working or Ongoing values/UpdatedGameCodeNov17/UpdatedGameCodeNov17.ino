@@ -180,6 +180,11 @@ long lastStuckCheckPos = 0;
 unsigned long lastStuckCheckTime = 0;
 int stuckCounter = 0;
 
+// Retry logic for positioning accuracy
+int positionRetryCount = 0;
+const int MAX_POSITION_RETRIES = 1;
+const int RETRY_ERROR_THRESHOLD = 5;
+
 const int MIN_VEL_COMP_COUNT = 2;
 const long MIN_VEL_COMP_TIME = 10000;
 
@@ -654,6 +659,7 @@ void runStateMachine() {
       arrivalTime = millis();
       targetReached = false;
       stuckCounter = 0;
+      positionRetryCount = 0;
       currentState = MOVE_TO_TARGET;
       break;
     
@@ -763,7 +769,7 @@ void runMotionControl() {
     stopMotor();
     errorIntegral = 0;
     adaptiveLearning = false;
-    
+
     if (!targetReached) {
       targetReached = true;
       unsigned long settleTime = millis() - moveStartTime;
@@ -772,10 +778,26 @@ void runMotionControl() {
       Serial.print(F(" in "));
       Serial.print(settleTime / 1000.0, 2);
       Serial.println(F("s"));
+
+      // Check if error is too large and retry if needed
+      if (abs(error) > RETRY_ERROR_THRESHOLD && positionRetryCount < MAX_POSITION_RETRIES) {
+        positionRetryCount++;
+        Serial.print(F("⚠️  Error = "));
+        Serial.print(abs(error));
+        Serial.println(F(", retrying..."));
+
+        // Reset for retry
+        targetReached = false;
+        errorIntegral = 0;
+        lastError = 0;
+        moveStartTime = millis();
+        stuckCounter = 0;
+        delay(50);  // Brief pause before retry
+      }
     }
     return;
   }
-  
+
   targetReached = false;
   
   if (abs(error) > 500 && !adaptiveLearning && !adaptiveLearned) {
@@ -1303,6 +1325,7 @@ void tuneZieglerNichols() {
   moveStartTime = millis();
   targetReached = false;
   stuckCounter = 0;
+  positionRetryCount = 0;
   systemEnabled = true;
 
   Serial.print(F("Target center: "));
@@ -1612,6 +1635,7 @@ void testPIDGains() {
   moveStartTime = millis();
   targetReached = false;
   stuckCounter = 0;
+  positionRetryCount = 0;
   systemEnabled = true;
 
   Serial.println(F("Time,Pos,Err"));
@@ -1992,6 +2016,7 @@ void setTargetLane(int lane) {
   moveStartTime = millis();
   targetReached = false;
   stuckCounter = 0;  // Reset stuck detection for new movement
+  positionRetryCount = 0;  // Reset retry counter for new movement
   
   long currentPos = encoder.read();
   long error = desiredPosition - currentPos;
