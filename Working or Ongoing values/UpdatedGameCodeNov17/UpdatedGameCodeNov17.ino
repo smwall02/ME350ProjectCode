@@ -183,7 +183,7 @@ int stuckCounter = 0;
 // Retry logic for positioning accuracy
 int positionRetryCount = 0;
 const int MAX_POSITION_RETRIES = 1;
-const int RETRY_ERROR_THRESHOLD = 5;
+const int RETRY_ERROR_THRESHOLD = 3;  // Retry if stuck at error > 3
 
 const int MIN_VEL_COMP_COUNT = 2;
 const long MIN_VEL_COMP_TIME = 10000;
@@ -807,8 +807,8 @@ void runMotionControl() {
 
   // Retry logic: if stuck outside target band for too long, retry once
   if (abs(error) > RETRY_ERROR_THRESHOLD && abs(error) < 50) {
-    // Check if we've been stuck at this error for 1 second
-    if (millis() - moveStartTime > 1000 && positionRetryCount < MAX_POSITION_RETRIES) {
+    // Check if we've been stuck at this error for 500ms
+    if (millis() - moveStartTime > 500 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
       Serial.print(F("⚠️  Stuck at error = "));
       Serial.print(abs(error));
@@ -930,13 +930,13 @@ void runMotionControl() {
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 4.0;
+    voltageLimit = 4.5;
   } else if (absErr > 500) {
-    voltageLimit = 3.5;
+    voltageLimit = 4.0;
   } else if (absErr > 300) {
-    voltageLimit = 3.2;
+    voltageLimit = 3.7;
   } else {
-    voltageLimit = 3.0;
+    voltageLimit = 3.5;
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -956,7 +956,7 @@ void runMotionControl() {
 
         // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
         if (stuckCounter >= 2) {
-          float minVoltage = 1.8;  // Minimum to overcome static friction
+          float minVoltage = 2.2;  // Minimum to overcome static friction
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (error < 0) ? -minVoltage : minVoltage;
           }
