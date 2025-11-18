@@ -604,7 +604,7 @@ void runStateMachine() {
           rangeFindingComplete = true;
           startDynamicCalibration();
           desiredPosition = LOWER_BOUND;
-          
+
           Serial.println(F("State: FIND_RANGE → CALIBRATE (sensor cal)\n"));
           currentState = CALIBRATE;
           systemEnabled = true;
