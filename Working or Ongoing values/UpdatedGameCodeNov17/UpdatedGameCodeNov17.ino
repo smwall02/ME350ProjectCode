@@ -113,7 +113,7 @@ ProximitySensor ProxSensors[4];
 
 // Sensor filtering parameters
 const float alpha = 0.925;
-const int stopTimeout = 250;
+const int stopTimeout = 150;  // Faster stopped detection
 const int lowerNoiseLimit = 5;
 const int upperNoiseLimit = 8;
 const int noiseThreshold = 225;
@@ -186,7 +186,7 @@ const long MIN_VEL_COMP_TIME = 10000;
 unsigned long lastControlTime = 0;
 unsigned long lastSensorTime = 0;
 unsigned long arrivalTime = 0;
-const int targetActivateTime = 350;
+const int targetActivateTime = 200;  // Time at position before choosing next target
 
 // ============================================
 // SYSTEM STATE
@@ -210,7 +210,7 @@ const float VEL_STOP_THRESH = 2.0;              // counts/sec considered stopped
 
 // NEW: Target success detection
 unsigned long targetHitTime = 0;
-const unsigned long MIN_HIT_TIME = 150;  // Minimum time to confirm hit
+const unsigned long MIN_HIT_TIME = 100;  // Minimum time to confirm hit
 
 // ============================================
 // PID AUTO-TUNE RESULTS
@@ -304,9 +304,9 @@ void loop() {
       runMotionControl();
     }
     
-    if (autoMode && (currentTime - lastPrintTime >= 500)) {
+    if (autoMode && (currentTime - lastPrintTime >= 200)) {
       lastPrintTime = currentTime;
-      
+
       if (dynamicCalibrationActive) {
         printCalibrationProgress();
       } else {
@@ -705,7 +705,21 @@ void runStateMachine() {
       
       // Standard arrival check
       if (abs(error) <= TARGET_BAND) {
-        if (millis() - arrivalTime > targetActivateTime || WAIT_POS) {
+        if (WAIT_POS) {
+          // At wait position - only reconsider if there's a new forward target
+          bool hasForwardTarget = false;
+          for (int i = 0; i < 4; i++) {
+            if (ProxSensors[i].direction == FORWARD) {
+              hasForwardTarget = true;
+              break;
+            }
+          }
+          if (hasForwardTarget) {
+            Serial.println(F("✓ New threat detected, choosing target"));
+            currentState = CHOOSE_ACTIVE_TARGET;
+          }
+          // Otherwise stay put at wait position
+        } else if (millis() - arrivalTime > targetActivateTime) {
           Serial.println(F("✓ Target activated (timeout), choosing next"));
           currentState = CHOOSE_ACTIVE_TARGET;
         }
