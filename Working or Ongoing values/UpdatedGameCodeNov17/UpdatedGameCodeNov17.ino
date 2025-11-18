@@ -1188,43 +1188,32 @@ void tuneZieglerNichols() {
 
   // Step 2: Move to right limit with stable holding
   Serial.println(F("Finding right limit..."));
-  setMotor(-1.75);  // Move right at moderate speed
+  setMotor(-2.0);  // Move right at good speed
 
   unsigned long rightStart = millis();
-  long lastRightPos = encoder.read();
-  unsigned long stuckTime = 0;
 
-  while ((millis() - rightStart) < 20000) {
-    delay(50);
-    long currentPos = encoder.read();
-
-    // Check if reached right limit switch
-    if (rightPressed()) {
-      Serial.println(F("Right limit hit"));
-      break;
-    }
-
-    // Check if stuck (not moving)
-    if (abs(currentPos - lastRightPos) < 5) {
-      stuckTime += 50;
-      if (stuckTime > 2000) {
-        Serial.println(F("Stopped, assuming limit"));
-        break;
-      }
-    } else {
-      stuckTime = 0;
-      lastRightPos = currentPos;
-    }
+  // Wait until right limit switch is pressed
+  while (!rightPressed() && (millis() - rightStart) < 20000) {
+    delay(10);
   }
+
+  if (!rightPressed()) {
+    stopMotor();
+    Serial.println(F("ERR: Right timeout"));
+    lastTuneResults.valid = false;
+    return;
+  }
+
+  Serial.println(F("Right limit hit"));
 
   // Continue holding at right limit with stable detection
   Serial.println(F("Stabilizing at right..."));
-  lastRightPos = encoder.read();
+  long lastRightPos = encoder.read();
   unsigned long holdStart = millis();
   int stableCount = 0;
 
   while (stableCount < 3 && (millis() - holdStart) < 1500) {
-    setMotor(-1.75);  // Keep same voltage to hold against right limit
+    setMotor(-2.0);  // Keep same voltage to hold against right limit
     delay(100);
 
     long pos = encoder.read();
@@ -1250,14 +1239,46 @@ void tuneZieglerNichols() {
 
   delay(300);
 
-  // Step 3: Move to center position
+  // Step 3: Move to center position using PID control
   long centerPosition = (tuneLeftBound + tuneRightBound) / 2;
   Serial.print(F("Moving to center: ")); Serial.println(centerPosition);
 
+  // Use existing PID gains for accurate positioning
+  long centerError = 0;
+  long centerLastError = 0;
+  float centerIntegral = 0.0;
+
   unsigned long moveStart = millis();
   while (abs(encoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
-    long err = centerPosition - encoder.read();
-    setMotor(constrain(err * 0.01, -4.0, 4.0));
+    long currentPos = encoder.read();
+    centerError = centerPosition - currentPos;
+
+    // PID calculation
+    float pTerm = KP * centerError;
+    centerIntegral += KI * centerError;
+    float dTerm = KD * (centerError - centerLastError);
+    float voltage = pTerm + centerIntegral + dTerm;
+
+    // Add friction compensation
+    float frictionComp = 0.0;
+    if (centerError < -50) {
+      frictionComp = FRICTION_LEFT;
+      voltage -= frictionComp;
+    } else if (centerError > 50) {
+      frictionComp = FRICTION_RIGHT;
+      voltage += frictionComp;
+    }
+
+    // Anti-windup on zero crossing
+    if ((centerError != 0) && (centerError * centerLastError < 0)) {
+      centerIntegral *= 0.5;
+    }
+
+    // Apply voltage with capping
+    float cappedVoltage = constrain(voltage, -4.0, 4.0);
+    setMotor(cappedVoltage);
+
+    centerLastError = centerError;
     delay(10);
   }
   stopMotor();
