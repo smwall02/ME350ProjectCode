@@ -696,14 +696,7 @@ void runMotionControl() {
   float error = desiredPosition - currentPosition;
   
   if (currentState == MOVE_TO_TARGET && autoMode) {
-    if (currentPosition < UPPER_BOUND + 30) {
-      stopMotor();
-      Serial.println(F("⚠️  Too close to right limit!"));
-      desiredPosition = WAIT_POSITION;
-      currentState = CHOOSE_ACTIVE_TARGET;
-      return;
-    }
-    
+    // Check for left-side drift (position should never be > 50)
     if (currentPosition > 50) {
       Serial.println(F("⚠️  Position drift detected - need recalibration"));
       stopMotor();
@@ -1323,14 +1316,6 @@ void tuneZieglerNichols() {
   while (peakCount < TARGET_PEAKS + 4 && millis() - testStart < TIMEOUT) {
     long currentPos = encoder.read();
     long deviation = currentPos - centerPosition;
-
-    // Safety: check limit switches
-    if (leftPressed() || rightPressed()) {
-      Serial.println(F("ERR: Limit hit"));
-      stopMotor();
-      lastTuneResults.valid = false;
-      return;
-    }
 
     // Relay logic with hysteresis
     if (deviation > HYSTERESIS) {
