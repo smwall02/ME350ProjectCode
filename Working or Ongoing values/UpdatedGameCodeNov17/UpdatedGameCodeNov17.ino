@@ -1239,7 +1239,24 @@ void tuneZieglerNichols() {
 
   delay(300);
 
-  // Step 3: Move to center position using PID control
+  // Step 3: Move away from right limit first
+  Serial.println(F("Moving away from right limit..."));
+  setMotor(2.0);  // Move left (positive direction)
+
+  unsigned long clearStart = millis();
+  while (rightPressed() && millis() - clearStart < 2000) {
+    delay(10);
+  }
+
+  // Continue moving left for a bit more to ensure clear
+  delay(200);
+  stopMotor();
+  delay(200);
+
+  Serial.print(F("Cleared right, now at: "));
+  Serial.println(encoder.read());
+
+  // Step 4: Move to center position using PID control
   long centerPosition = (tuneLeftBound + tuneRightBound) / 2;
   Serial.print(F("Moving to center: ")); Serial.println(centerPosition);
 
