@@ -11,7 +11,7 @@
 //
 // Key improvements over V1:
 //   - Follows Lab 11 tutorial structure exactly
-//   - Consistent limit switch logic (active HIGH with INPUT_PULLUP)
+//   - Consistent limit switch logic (active LOW with INPUT_PULLUP)
 //   - Simplified target selection
 //   - Proper dwell time to ensure zombies are pushed back
 //   - Clear comments and maintainable code
@@ -167,7 +167,7 @@ void setup() {
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_IN3, OUTPUT);
 
-  // Configure limit switches (INPUT_PULLUP means active HIGH)
+// Configure limit switches (wired to GND, active LOW with INPUT_PULLUP)
   pinMode(LIMIT_LEFT, INPUT_PULLUP);
   pinMode(LIMIT_RIGHT, INPUT_PULLUP);
 
@@ -256,7 +256,7 @@ void runStateMachine() {
       desiredPosition = LOWER_BOUND;
 
       // Check if we've reached the limit switch and stopped
-      if (digitalRead(LIMIT_LEFT) == HIGH && abs(encoder.read()) < 10) {
+      if (leftPressed() && abs(encoder.read()) < 10) {
         // Zero the encoder
         encoder.write(0);
         LOWER_BOUND = 0;
@@ -448,8 +448,8 @@ void runMotionControl() {
 
   // If in calibrate state, override PID with constant voltage
   if (currentState == CALIBRATE) {
-    // Apply constant voltage to move toward left limit
-    if (!digitalRead(LIMIT_LEFT) == HIGH) {
+    // Apply constant voltage to move toward left limit until the switch closes
+    if (!leftPressed()) {
       setMotor(CALIBRATION_VOLTAGE);
     } else {
       stopMotor();
@@ -551,12 +551,12 @@ void stopMotor() {
 // LIMIT SWITCH SAFETY
 // ============================================
 void checkLimitSwitches() {
-  // Left limit switch (active HIGH with INPUT_PULLUP)
-  if (digitalRead(LIMIT_LEFT) == HIGH) {
+  // Left limit switch (active LOW with INPUT_PULLUP)
+  if (leftPressed()) {
     // Only recalibrate if not already in calibrate state and not moving much
     if (currentState != CALIBRATE) {
       delay(50);  // Debounce
-      if (digitalRead(LIMIT_LEFT) == HIGH) {
+      if (leftPressed()) {
         encoder.write(0);
         LOWER_BOUND = 0;
         errorIntegral = 0;
@@ -565,8 +565,8 @@ void checkLimitSwitches() {
     }
   }
 
-  // Right limit switch (active HIGH with INPUT_PULLUP)
-  if (digitalRead(LIMIT_RIGHT) == HIGH) {
+  // Right limit switch (active LOW with INPUT_PULLUP)
+  if (rightPressed()) {
     stopMotor();
     Serial.println(F("⚠️ RIGHT LIMIT - EMERGENCY STOP!"));
 
@@ -584,11 +584,12 @@ void checkLimitSwitches() {
 }
 
 bool leftPressed() {
-  return digitalRead(LIMIT_LEFT) == HIGH;
+  // INPUT_PULLUP keeps the pin HIGH when open; pressed = LOW
+  return digitalRead(LIMIT_LEFT) == LOW;
 }
 
 bool rightPressed() {
-  return digitalRead(LIMIT_RIGHT) == HIGH;
+  return digitalRead(LIMIT_RIGHT) == LOW;
 }
 
 // ============================================
