@@ -998,10 +998,10 @@ bool rightPressed() {
 // HOMING (Improved soft homing with stable detection)
 // ============================================
 bool homeToLeftLimit() {
-  Serial.println(F("\n🏠 HOMING..."));
+  Serial.println(F("\nHOMING..."));
 
   if (leftPressed()) {
-    Serial.println(F("Already at limit, ensuring stable contact..."));
+    Serial.println(F("At limit, stabilizing..."));
 
     // Hold gently at limit to ensure stable position
     long lastPos = encoder.read();
@@ -1024,7 +1024,6 @@ bool homeToLeftLimit() {
     stopMotor();
     delay(100);
 
-    // Zero encoder multiple times to ensure it sticks
     encoder.write(0);
     delay(50);
     encoder.write(0);
@@ -1032,9 +1031,7 @@ bool homeToLeftLimit() {
     encoder.write(0);
     delay(50);
 
-    Serial.print(F("Zeroed at: "));
-    Serial.println(encoder.read());
-    Serial.println(F("✓ Homed\n"));
+    Serial.println(F("Homed"));
     return true;
   }
 
@@ -1048,7 +1045,7 @@ bool homeToLeftLimit() {
   }
 
   if (leftPressed()) {
-    Serial.println(F("Contact made, stabilizing..."));
+    Serial.println(F("Contact..."));
 
     // Hold gently at limit to remove bounce
     long currentPos = encoder.read();
@@ -1072,7 +1069,6 @@ bool homeToLeftLimit() {
     stopMotor();
     delay(100);
 
-    // Zero encoder multiple times to ensure it sticks
     encoder.write(0);
     delay(50);
     encoder.write(0);
@@ -1080,13 +1076,11 @@ bool homeToLeftLimit() {
     encoder.write(0);
     delay(50);
 
-    Serial.print(F("Final encoder value: "));
-    Serial.println(encoder.read());
-    Serial.println(F("✓ Homed\n"));
+    Serial.println(F("Homed"));
     return true;
   } else {
     stopMotor();
-    Serial.println(F("✗ Timeout\n"));
+    Serial.println(F("Timeout"));
     return false;
   }
 }
@@ -1110,29 +1104,19 @@ float cappedVoltageForError(float voltage, long error) {
 // ============================================
 
 void enterTuningMode() {
-  Serial.println(F("\n╔════════════════════════════════════════════╗"));
-  Serial.println(F("║          PID TUNING MODE                   ║"));
-  Serial.println(F("╚════════════════════════════════════════════╝"));
+  Serial.println(F("\n=== PID TUNING MODE ==="));
 
   bool wasEnabled = systemEnabled;
   bool wasAuto = autoMode;
 
-  // Stop competition mode
   systemEnabled = false;
   autoMode = false;
   stopMotor();
 
-  Serial.println(F("\nCompetition paused. Entering tuning mode..."));
-  Serial.println(F("\nTUNING COMMANDS:"));
-  Serial.println(F("  Z - Ziegler-Nichols Auto-Tune (relay method)"));
-  Serial.println(F("  T - Test current PID gains"));
-  Serial.println(F("  U - Update PID gains manually"));
-  Serial.println(F("  V - View current PID settings"));
-  Serial.println(F("  Q - Quit tuning mode"));
-  Serial.println(F("\nCurrent PID Gains:"));
-  Serial.print(F("  Kp = ")); Serial.println(KP, 6);
-  Serial.print(F("  Ki = ")); Serial.println(KI, 6);
-  Serial.print(F("  Kd = ")); Serial.println(KD, 6);
+  Serial.println(F("Z-AutoTune T-Test U-Update V-View Q-Quit"));
+  Serial.print(F("Kp=")); Serial.print(KP, 4);
+  Serial.print(F(" Ki=")); Serial.print(KI, 4);
+  Serial.print(F(" Kd=")); Serial.println(KD, 4);
 
   while (true) {
     if (Serial.available()) {
@@ -1159,14 +1143,13 @@ void enterTuningMode() {
           break;
 
         case 'Q':
-          Serial.println(F("\nExiting tuning mode..."));
-          Serial.println(F("Returning to competition."));
+          Serial.println(F("Exit tuning"));
           systemEnabled = wasEnabled;
           autoMode = wasAuto;
           return;
 
         default:
-          Serial.println(F("Unknown command. Z/T/U/V/Q"));
+          Serial.println(F("Z/T/U/V/Q"));
           break;
       }
     }
@@ -1174,10 +1157,8 @@ void enterTuningMode() {
 }
 
 void tuneZieglerNichols() {
-  Serial.println(F("\n=== ZIEGLER-NICHOLS AUTO-TUNE ==="));
-  Serial.println(F("This will perform relay oscillation to find Ku and Tu."));
-  Serial.println(F("System will move around Lane 3 position."));
-  Serial.println(F("Press 'Y' to continue..."));
+  Serial.println(F("\n=== AUTO-TUNE ==="));
+  Serial.println(F("Relay test at Lane 3. Press Y..."));
 
   while (Serial.available()) Serial.read();
   char response = 0;
@@ -1193,35 +1174,24 @@ void tuneZieglerNichols() {
     return;
   }
 
-  // Move to Lane 3 (center) position
   long centerPosition = TARGET_3_POSITION;
-  Serial.print(F("Moving to center (Lane 3): "));
-  Serial.println(centerPosition);
+  Serial.print(F("Moving to ")); Serial.println(centerPosition);
 
-  // Use simple proportional control to get close
   unsigned long moveStart = millis();
-
   while (abs(encoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
-    long currentPos = encoder.read();
-    long err = centerPosition - currentPos;
-    float voltage = constrain(err * 0.01, -4.0, 4.0);
-    setMotor(voltage);
+    long err = centerPosition - encoder.read();
+    setMotor(constrain(err * 0.01, -4.0, 4.0));
     delay(10);
   }
   stopMotor();
   delay(500);
 
-  // Relay parameters
   const float TEST_VOLTAGE = 5.0;
   const long HYSTERESIS = abs(UPPER_BOUND - LOWER_BOUND) / 6;
   const int TARGET_PEAKS = 20;
-  const unsigned long TIMEOUT = 120000;  // 2 minutes
+  const unsigned long TIMEOUT = 120000;
 
-  Serial.println(F("Starting relay oscillation..."));
-  Serial.print(F("Test voltage: "));
-  Serial.println(TEST_VOLTAGE);
-  Serial.print(F("Hysteresis: ±"));
-  Serial.println(HYSTERESIS);
+  Serial.println(F("Testing..."));
 
   // Peak detection
   long peaks[TARGET_PEAKS];
@@ -1262,10 +1232,7 @@ void tuneZieglerNichols() {
       peakCount++;
       lastCrossTime = crossTime;
 
-      if (peakCount % 4 == 0) {
-        Serial.print(F("Peaks: "));
-        Serial.println(peakCount);
-      }
+      if (peakCount % 8 == 0) Serial.println(peakCount);
     }
 
     lastAboveCenter = currentAboveCenter;
@@ -1275,85 +1242,57 @@ void tuneZieglerNichols() {
   stopMotor();
 
   if (peakCount < 18) {
-    Serial.println(F("ERROR: Not enough peaks collected."));
+    Serial.println(F("ERR: Low peaks"));
     lastTuneResults.valid = false;
     return;
   }
 
-  // Calculate average amplitude
   long sumAmplitude = 0;
   int peaksUsed = min(peakCount - 4, TARGET_PEAKS);
-  for (int i = 0; i < peaksUsed; i++) {
-    sumAmplitude += peaks[i];
-  }
+  for (int i = 0; i < peaksUsed; i++) sumAmplitude += peaks[i];
   float avgAmplitude = sumAmplitude / (float)peaksUsed;
 
-  // Calculate average period
   unsigned long sumPeriod = 0;
-  for (int i = 0; i < peaksUsed - 1; i++) {
-    sumPeriod += peakTimes[i];
-  }
+  for (int i = 0; i < peaksUsed - 1; i++) sumPeriod += peakTimes[i];
   float avgPeriod = (sumPeriod / (float)(peaksUsed - 1)) / 1000.0;
 
-  // Calculate Ku
   float Ku = (4.0 * TEST_VOLTAGE) / (PI * avgAmplitude);
 
-  // Store results
   lastTuneResults.Ku = Ku;
   lastTuneResults.Tu = avgPeriod * 2;
   lastTuneResults.amplitude = avgAmplitude;
   lastTuneResults.peakCount = peaksUsed;
   lastTuneResults.valid = true;
 
-  Serial.println(F("\n=== AUTO-TUNE RESULTS ==="));
-  Serial.print(F("Peaks: "));
-  Serial.println(peaksUsed);
-  Serial.print(F("Amplitude: "));
-  Serial.print(avgAmplitude);
-  Serial.println(F(" counts"));
-  Serial.print(F("Tu (period): "));
-  Serial.print(lastTuneResults.Tu, 3);
-  Serial.println(F(" s"));
-  Serial.print(F("Ku (gain): "));
-  Serial.println(Ku, 4);
+  Serial.println(F("\n=== RESULTS ==="));
+  Serial.print(F("Ku=")); Serial.print(Ku, 3);
+  Serial.print(F(" Tu=")); Serial.println(lastTuneResults.Tu, 2);
 
-  // Offer tuning presets
-  Serial.println(F("\n=== SELECT TUNING METHOD ==="));
+  Serial.println(F("1-Conserv 2-Classic 3-Aggr 4-Cancel"));
+
   float kp1 = 0.3 * 0.6 * Ku;
   float ki1 = 0.3 * 1.2 * Ku / lastTuneResults.Tu;
   float kd1 = 0.3 * 0.075 * Ku * lastTuneResults.Tu;
 
-  Serial.print(F("1. Conservative (30% ZN) -> Kp="));
-  Serial.print(kp1, 4);
-  Serial.print(F(" Ki="));
-  Serial.print(ki1, 4);
-  Serial.print(F(" Kd="));
-  Serial.println(kd1, 4);
+  Serial.print(F("1: ")); Serial.print(kp1, 3);
+  Serial.print(F(",")); Serial.print(ki1, 3);
+  Serial.print(F(",")); Serial.println(kd1, 3);
 
   float kp2 = 0.6 * Ku;
   float ki2 = 1.2 * Ku / lastTuneResults.Tu;
   float kd2 = 0.075 * Ku * lastTuneResults.Tu;
 
-  Serial.print(F("2. Classic ZN (100%)     -> Kp="));
-  Serial.print(kp2, 4);
-  Serial.print(F(" Ki="));
-  Serial.print(ki2, 4);
-  Serial.print(F(" Kd="));
-  Serial.println(kd2, 4);
+  Serial.print(F("2: ")); Serial.print(kp2, 3);
+  Serial.print(F(",")); Serial.print(ki2, 3);
+  Serial.print(F(",")); Serial.println(kd2, 3);
 
   float kp3 = 0.8 * 0.6 * Ku;
   float ki3 = 0.8 * 1.2 * Ku / lastTuneResults.Tu;
   float kd3 = 0.8 * 0.075 * Ku * lastTuneResults.Tu;
 
-  Serial.print(F("3. Aggressive (80% ZN)   -> Kp="));
-  Serial.print(kp3, 4);
-  Serial.print(F(" Ki="));
-  Serial.print(ki3, 4);
-  Serial.print(F(" Kd="));
-  Serial.println(kd3, 4);
-
-  Serial.println(F("4. Cancel"));
-  Serial.println(F("\nEnter 1-4:"));
+  Serial.print(F("3: ")); Serial.print(kp3, 3);
+  Serial.print(F(",")); Serial.print(ki3, 3);
+  Serial.print(F(",")); Serial.println(kd3, 3);
 
   while (Serial.available()) Serial.read();
   char selection = 0;
@@ -1365,42 +1304,25 @@ void tuneZieglerNichols() {
   }
 
   switch (selection) {
-    case '1':
-      KP = kp1;
-      KI = ki1;
-      KD = kd1;
-      Serial.println(F("Applied CONSERVATIVE gains."));
-      break;
-    case '2':
-      KP = kp2;
-      KI = ki2;
-      KD = kd2;
-      Serial.println(F("Applied CLASSIC ZN gains."));
-      break;
-    case '3':
-      KP = kp3;
-      KI = ki3;
-      KD = kd3;
-      Serial.println(F("Applied AGGRESSIVE gains."));
-      break;
+    case '1': KP = kp1; KI = ki1; KD = kd1; break;
+    case '2': KP = kp2; KI = ki2; KD = kd2; break;
+    case '3': KP = kp3; KI = ki3; KD = kd3; break;
     default:
-      Serial.println(F("Cancelled."));
+      Serial.println(F("Cancel"));
       return;
   }
 
-  Serial.println(F("\nNew PID Gains:"));
-  Serial.print(F("  Kp = ")); Serial.println(KP, 6);
-  Serial.print(F("  Ki = ")); Serial.println(KI, 6);
-  Serial.print(F("  Kd = ")); Serial.println(KD, 6);
+  Serial.print(F("Set: ")); Serial.print(KP, 4);
+  Serial.print(F(",")); Serial.print(KI, 4);
+  Serial.print(F(",")); Serial.println(KD, 4);
 
   savePIDToEEPROM();
-  Serial.println(F("Saved to EEPROM."));
+  Serial.println(F("Saved"));
 }
 
 void testPIDGains() {
-  Serial.println(F("\n=== TEST PID GAINS ==="));
-  Serial.println(F("Will move to Lane 3 and log response."));
-  Serial.println(F("Press 'Y' to continue..."));
+  Serial.println(F("\n=== TEST ==="));
+  Serial.println(F("Move to L3. Y?"));
 
   while (Serial.available()) Serial.read();
   char response = 0;
@@ -1412,18 +1334,15 @@ void testPIDGains() {
   }
 
   if (toupper(response) != 'Y') {
-    Serial.println(F("Cancelled."));
+    Serial.println(F("Cancel"));
     return;
   }
 
-  // Home first
   homeToLeftLimit();
   delay(500);
 
   long targetPos = TARGET_3_POSITION;
-  Serial.print(F("Target: "));
-  Serial.println(targetPos);
-  Serial.println(F("\nTime(s),Position,Error,Voltage"));
+  Serial.println(F("Time,Pos,Err,V"));
 
   // Local PID state variables for testing
   long testError = 0;
@@ -1483,77 +1402,60 @@ void testPIDGains() {
   }
 
   stopMotor();
-  Serial.println(F("\n=== TEST COMPLETE ==="));
-  Serial.print(F("Final error: "));
+  Serial.print(F("Done. Err="));
   Serial.println(testError);
 }
 
 void updatePIDManually() {
-  Serial.println(F("\n=== MANUAL PID UPDATE ==="));
-  Serial.println(F("Current gains:"));
-  Serial.print(F("  Kp = ")); Serial.println(KP, 6);
-  Serial.print(F("  Ki = ")); Serial.println(KI, 6);
-  Serial.print(F("  Kd = ")); Serial.println(KD, 6);
+  Serial.println(F("\n=== UPDATE ==="));
+  Serial.print(F("Kp=")); Serial.print(KP, 4);
+  Serial.print(F(" Ki=")); Serial.print(KI, 4);
+  Serial.print(F(" Kd=")); Serial.println(KD, 4);
 
-  Serial.println(F("\nEnter new Kp (or press Enter to skip):"));
+  Serial.println(F("New Kp (or Enter):"));
   while (Serial.available()) Serial.read();
   delay(100);
   if (Serial.available()) {
     float newKp = Serial.parseFloat();
-    if (newKp > 0) {
-      KP = newKp;
-      Serial.print(F("Updated Kp = "));
-      Serial.println(KP, 6);
-    }
+    if (newKp > 0) KP = newKp;
   }
   while (Serial.available()) Serial.read();
 
-  Serial.println(F("Enter new Ki (or press Enter to skip):"));
+  Serial.println(F("New Ki:"));
   delay(100);
   if (Serial.available()) {
     float newKi = Serial.parseFloat();
-    if (newKi >= 0) {
-      KI = newKi;
-      Serial.print(F("Updated Ki = "));
-      Serial.println(KI, 6);
-    }
+    if (newKi >= 0) KI = newKi;
   }
   while (Serial.available()) Serial.read();
 
-  Serial.println(F("Enter new Kd (or press Enter to skip):"));
+  Serial.println(F("New Kd:"));
   delay(100);
   if (Serial.available()) {
     float newKd = Serial.parseFloat();
-    if (newKd >= 0) {
-      KD = newKd;
-      Serial.print(F("Updated Kd = "));
-      Serial.println(KD, 6);
-    }
+    if (newKd >= 0) KD = newKd;
   }
   while (Serial.available()) Serial.read();
 
-  Serial.println(F("\nUpdated PID Gains:"));
-  Serial.print(F("  Kp = ")); Serial.println(KP, 6);
-  Serial.print(F("  Ki = ")); Serial.println(KI, 6);
-  Serial.print(F("  Kd = ")); Serial.println(KD, 6);
+  Serial.print(F("Set: ")); Serial.print(KP, 4);
+  Serial.print(F(",")); Serial.print(KI, 4);
+  Serial.print(F(",")); Serial.println(KD, 4);
 
   savePIDToEEPROM();
-  Serial.println(F("Saved to EEPROM."));
+  Serial.println(F("Saved"));
 }
 
 void viewPIDSettings() {
-  Serial.println(F("\n=== CURRENT PID SETTINGS ==="));
-  Serial.print(F("Kp = ")); Serial.println(KP, 6);
-  Serial.print(F("Ki = ")); Serial.println(KI, 6);
-  Serial.print(F("Kd = ")); Serial.println(KD, 6);
-  Serial.print(F("Friction LEFT = ")); Serial.println(FRICTION_LEFT, 3);
-  Serial.print(F("Friction RIGHT = ")); Serial.println(FRICTION_RIGHT, 3);
+  Serial.println(F("\n=== SETTINGS ==="));
+  Serial.print(F("Kp=")); Serial.print(KP, 4);
+  Serial.print(F(" Ki=")); Serial.print(KI, 4);
+  Serial.print(F(" Kd=")); Serial.println(KD, 4);
+  Serial.print(F("FrL=")); Serial.print(FRICTION_LEFT, 2);
+  Serial.print(F(" FrR=")); Serial.println(FRICTION_RIGHT, 2);
 
   if (lastTuneResults.valid) {
-    Serial.println(F("\n=== LAST AUTO-TUNE ==="));
-    Serial.print(F("Ku = ")); Serial.println(lastTuneResults.Ku, 4);
-    Serial.print(F("Tu = ")); Serial.print(lastTuneResults.Tu, 3);
-    Serial.println(F(" s"));
+    Serial.print(F("Ku=")); Serial.print(lastTuneResults.Ku, 3);
+    Serial.print(F(" Tu=")); Serial.println(lastTuneResults.Tu, 2);
   }
 }
 
@@ -1563,7 +1465,7 @@ void viewPIDSettings() {
 void loadCalibrationFromEEPROM() {
   byte flag = EEPROM.read(EEPROM_FLAG);
   if (flag != 0xAA) {
-    Serial.println(F("EEPROM flag not set; using defaults."));
+    Serial.println(F("EEPROM not set, using defaults"));
     return;
   }
 
@@ -1573,36 +1475,22 @@ void loadCalibrationFromEEPROM() {
   EEPROM.get(EEPROM_FRICTION_LEFT, FRICTION_LEFT);
   EEPROM.get(EEPROM_FRICTION_RIGHT, FRICTION_RIGHT);
 
-  // Initialize adaptive friction with loaded values
   adaptiveFrictionLeft = FRICTION_LEFT;
   adaptiveFrictionRight = FRICTION_RIGHT;
 
-  // Load lane positions
   for (int i = 0; i < 4; i++) {
     long v;
     EEPROM.get(EEPROM_LANES_BASE + i * sizeof(long), v);
     targetPositions[i] = v;
   }
 
-  // Update individual position variables
   TARGET_1_POSITION = targetPositions[0];
   TARGET_2_POSITION = targetPositions[1];
   TARGET_3_POSITION = targetPositions[2];
   TARGET_4_POSITION = targetPositions[3];
   WAIT_POSITION = TARGET_3_POSITION;
 
-  Serial.println(F("Loaded calibration from EEPROM:"));
-  Serial.print(F("  Kp=")); Serial.print(KP, 6);
-  Serial.print(F(" Ki=")); Serial.print(KI, 6);
-  Serial.print(F(" Kd=")); Serial.println(KD, 6);
-  Serial.print(F("  Fric L=")); Serial.print(FRICTION_LEFT, 3);
-  Serial.print(F(" R=")); Serial.println(FRICTION_RIGHT, 3);
-  Serial.print(F("  Lanes: "));
-  for (int i = 0; i < 4; i++) {
-    Serial.print(targetPositions[i]);
-    if (i < 3) Serial.print(F(", "));
-  }
-  Serial.println();
+  Serial.println(F("Loaded from EEPROM"));
 }
 
 void saveTargetsToEEPROM() {
@@ -1610,7 +1498,7 @@ void saveTargetsToEEPROM() {
   for (int i = 0; i < 4; i++) {
     EEPROM.put(EEPROM_LANES_BASE + i * sizeof(long), targetPositions[i]);
   }
-  Serial.println(F("Lane positions saved to EEPROM."));
+  Serial.println(F("Lanes saved"));
 }
 
 void savePIDToEEPROM() {
@@ -1618,23 +1506,21 @@ void savePIDToEEPROM() {
   EEPROM.put(EEPROM_KP, KP);
   EEPROM.put(EEPROM_KI, KI);
   EEPROM.put(EEPROM_KD, KD);
-  Serial.println(F("PID values saved to EEPROM."));
+  Serial.println(F("PID saved"));
 }
 
 void saveFrictionToEEPROM() {
   EEPROM.write(EEPROM_FLAG, 0xAA);
   EEPROM.put(EEPROM_FRICTION_LEFT, FRICTION_LEFT);
   EEPROM.put(EEPROM_FRICTION_RIGHT, FRICTION_RIGHT);
-  Serial.println(F("Friction values saved to EEPROM."));
+  Serial.println(F("Friction saved"));
 }
 
 // ============================================
 // MANUAL TARGET POSITION CALIBRATION
 // ============================================
 void manualCalibration() {
-  Serial.println(F("\n╔════════════════════════════════════════════╗"));
-  Serial.println(F("║   MANUAL TARGET POSITION CALIBRATION       ║"));
-  Serial.println(F("╚════════════════════════════════════════════╝\n"));
+  Serial.println(F("\n=== MANUAL CALIBRATION ==="));
   
   bool wasEnabled = systemEnabled;
   bool wasAuto = autoMode;
@@ -1825,20 +1711,18 @@ void processCommand() {
       sensorCalibrated = false;
       adaptiveFrictionLeft = FRICTION_LEFT;
       adaptiveFrictionRight = FRICTION_RIGHT;
-      Serial.println(F("\n✓ Reset all calibrations\n"));
+      Serial.println(F("Reset"));
       break;
 
     case 'L':
-      Serial.println(F("\n📥 Loading calibration from EEPROM..."));
       loadCalibrationFromEEPROM();
       break;
 
     case 'W':
-      Serial.println(F("\n💾 Saving all calibration to EEPROM..."));
       saveTargetsToEEPROM();
       savePIDToEEPROM();
       saveFrictionToEEPROM();
-      Serial.println(F("✓ All settings saved!\n"));
+      Serial.println(F("All saved"));
       break;
 
     case 'T':
@@ -1877,39 +1761,15 @@ void setTargetLane(int lane) {
 // DISPLAY FUNCTIONS
 // ============================================
 void printWelcome() {
-  Serial.println(F("\n\n╔════════════════════════════════════════════╗"));
-  Serial.println(F("║   PLANTS VS ZOMBIES - IMPROVED CODE        ║"));
-  Serial.println(F("║   Enhanced Target Switching & PID Control  ║"));
-  Serial.println(F("║   • Soft homing with stable detection      ║"));
-  Serial.println(F("║   • Improved PID with voltage capping      ║"));
-  Serial.println(F("║   • Better friction compensation           ║"));
-  Serial.println(F("║   • EEPROM calibration storage             ║"));
-  Serial.println(F("║   • Flip switch motor override             ║"));
-  Serial.println(F("║   • Integrated PID auto-tune (Press 'T')   ║"));
-  Serial.println(F("╚════════════════════════════════════════════╝\n"));
+  Serial.println(F("\n=== PLANTS VS ZOMBIES - IMPROVED ==="));
+  Serial.println(F("Soft homing | PID tune | EEPROM | Flip switch"));
 }
 
 void printHelp() {
-  Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-  Serial.println(F("COMMANDS:"));
-  Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-  Serial.println(F("  C      🎯 Calibrate target positions (saves to EEPROM)"));
-  Serial.println(F("  Z      🏠 Home to left limit"));
-  Serial.println(F("  G      🎮 Start AUTO (range + sensors + track!)"));
-  Serial.println(F("  S      ⏹  Stop"));
-  Serial.println(F("  T      🔧 PID Tuning Mode (auto-tune, test, adjust)"));
-  Serial.println(F("  1-4    Manual lane control"));
-  Serial.println(F("  P      Status"));
-  Serial.println(F("  D      Display all sensors"));
-  Serial.println(F("  M      Continuous monitor"));
-  Serial.println(F("  R      Reset all calibrations"));
-  Serial.println(F("  L      Load calibration from EEPROM"));
-  Serial.println(F("  W      Save current config to EEPROM"));
-  Serial.println(F("  H      Help"));
-  Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"));
-  Serial.println(F("NOTE: Flip switch on pin 5 provides motor override"));
-  Serial.println(F("      PID, friction, and lane positions auto-load from EEPROM"));
-  Serial.println(F("      Press 'T' to enter PID Tuning Mode for auto-tune\n"));
+  Serial.println(F("\nCOMMANDS:"));
+  Serial.println(F("C-Calibrate Z-Home G-Auto S-Stop T-PIDTune"));
+  Serial.println(F("1-4:Lanes P-Status D-Sensors M-Monitor"));
+  Serial.println(F("R-Reset L-Load W-Save H-Help"));
 }
 
 void printCompactStatus() {
