@@ -1226,24 +1226,7 @@ void tuneZieglerNichols() {
 
   delay(300);
 
-  // Step 3: Move away from right limit
-  Serial.println(F("Moving away from right..."));
-  setMotor(3.0);  // Move left with good speed
-
-  unsigned long clearStart = millis();
-  while (rightPressed() && millis() - clearStart < 2000) {
-    delay(10);
-  }
-
-  // Continue moving left to fully clear (about 200 counts)
-  delay(500);
-  stopMotor();
-  delay(300);
-
-  Serial.print(F("Cleared to: "));
-  Serial.println(encoder.read());
-
-  // Step 4: Move to center using lane movement method
+  // Step 3: Move to center using lane movement method
   long centerPosition = (tuneLeftBound + tuneRightBound) / 2;
 
   // Set target exactly like setTargetLane()
