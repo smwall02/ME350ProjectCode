@@ -1,9 +1,11 @@
 // ============================================================================
 // ME 350 - Plants vs Zombies - COMPETITION CODE - IMPROVED
 // Enhanced target switching and zombie tracking
+// Updated with improved limit switch handling and PID control
 // ============================================================================
 
 #include <Encoder.h>
+#include <EEPROM.h>
 
 // ============================================
 // PIN DEFINITIONS
@@ -15,6 +17,7 @@
 #define MOTOR_IN3 13
 #define LIMIT_LEFT 8
 #define LIMIT_RIGHT 9
+#define ON_OFF_SWITCH_PIN 5  // Flip switch for motor enable/disable
 
 #define PROX_SENSOR_1 A0
 #define PROX_SENSOR_2 A1
@@ -22,6 +25,19 @@
 #define PROX_SENSOR_4 A3
 
 Encoder encoder(ENCODER_A, ENCODER_B);
+
+// ============================================
+// EEPROM LAYOUT (Compatible with PID auto-tune sketch)
+// ============================================
+const int EEPROM_FLAG = 0;
+const int EEPROM_KP = 1;
+const int EEPROM_KI = 5;
+const int EEPROM_KD = 9;
+const int EEPROM_FRICTION_LEFT = 13;
+const int EEPROM_FRICTION_RIGHT = 17;
+const int EEPROM_LEFT_LIMIT = 21;
+const int EEPROM_RIGHT_LIMIT = 25;
+const int EEPROM_LANES_BASE = 29;  // 4 lanes * 4 bytes each
 
 // ============================================
 // STATE MACHINE DEFINITIONS
@@ -112,11 +128,20 @@ float zombieDistances[4];
 bool WAIT_POS = true;
 
 // ============================================
-// FRICTION COMPENSATION
+// FRICTION COMPENSATION (Improved)
 // ============================================
-float FRICTION_COMP_VOLTAGE = 2.2;
-float FRICTION_BIAS = 0.25;
+// NOTE: These values will be loaded from EEPROM if available
+// FRICTION_LEFT: voltage needed when moving TO MORE NEGATIVE positions (away from home)
+// FRICTION_RIGHT: voltage needed when moving TO LESS NEGATIVE positions (toward home)
+float FRICTION_LEFT = 2.2;   // For moving toward more negative (right/away)
+float FRICTION_RIGHT = 0.25; // For moving toward less negative (left/toward home)
 
+// Adaptive friction boost (increases if target not reached)
+float adaptiveFrictionLeft = FRICTION_LEFT;
+float adaptiveFrictionRight = FRICTION_RIGHT;
+const float FRICTION_BOOST_AMOUNT = 0.2;
+
+// Legacy adaptive variables (kept for compatibility)
 float adaptiveFrictionVoltage = 0;
 long lastAdaptivePosition = 0;
 unsigned long adaptiveStartTime = 0;
@@ -171,6 +196,13 @@ const float CALIBRATION_VOLTAGE = 4.0;
 const float HOMING_VOLTAGE = 4.0;
 const float RANGE_FINDING_VOLTAGE = -3.5;
 
+// Improved homing softness parameters
+const float CALIBRATE_EXTRA_VOLTAGE = 0.6;      // Added to overcome friction during homing
+const float CALIBRATE_MIN_VOLTAGE = 2.5;        // Minimum drive voltage during homing
+const unsigned long CALIBRATE_HOLD_TIME = 300;  // ms to hold on limit before zeroing
+const int CALIBRATE_STABLE_TICKS = 3;           // Stable readings required before zeroing
+const float VEL_STOP_THRESH = 2.0;              // counts/sec considered stopped
+
 // NEW: Target success detection
 unsigned long targetHitTime = 0;
 const unsigned long MIN_HIT_TIME = 150;  // Minimum time to confirm hit
@@ -184,7 +216,11 @@ void setup() {
   pinMode(MOTOR_ENA, OUTPUT);
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_IN3, OUTPUT);
-  
+
+  // Flip switch for motor enable/disable
+  pinMode(ON_OFF_SWITCH_PIN, INPUT_PULLUP);
+
+  // Limit switches configured for active HIGH logic
   pinMode(LIMIT_LEFT, INPUT_PULLUP);
   pinMode(LIMIT_RIGHT, INPUT_PULLUP);
   
@@ -210,7 +246,10 @@ void setup() {
   
   stopMotor();
   delay(500);
-  
+
+  // Load PID, friction, and lane calibration from EEPROM (if available)
+  loadCalibrationFromEEPROM();
+
   printWelcome();
   printHelp();
 }
@@ -739,75 +778,143 @@ void runMotionControl() {
   
   float errorDerivative = (error - lastError) / dt;
   
-  float pidVoltage = (KP_active * error) + 
-                     (KI_active * errorIntegral) + 
+  float pidVoltage = (KP_active * error) +
+                     (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
-  
+
+  // Improved friction compensation based on direction
   float frictionComp = 0;
   if (abs(error) > TARGET_BAND) {
+    // Determine direction: negative error means move to MORE NEGATIVE (away from home)
+    // positive error means move to LESS NEGATIVE (toward home)
+    bool movingTowardMoreNegative = (error < 0);
+    float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
+
+    // Scale friction based on error magnitude
     float frictionScale = 1.0;
-    
-    if (abs(error) < 3) {
+    float absError = abs(error);
+
+    if (absError < 3) {
       frictionScale = 0.1;
-    } else if (abs(error) < 10) {
+    } else if (absError < 10) {
       frictionScale = 0.3;
-    } else if (abs(error) < 30) {
+    } else if (absError < 30) {
       frictionScale = 0.6;
-    } else if (abs(error) < 100) {
+    } else if (absError < 100) {
       frictionScale = 0.85;
     }
-    
+
+    // Reduce friction comp if motor is already moving
     if (abs(motorVelocity) < 5) {
       frictionScale *= 0.5;
     }
-    
-    float baseFriction = (adaptiveFrictionVoltage > 0) ? 
-                         adaptiveFrictionVoltage : FRICTION_COMP_VOLTAGE;
-    
+
+    // Apply friction compensation in correct direction
     if (error < 0) {
-      frictionComp = -(baseFriction + FRICTION_BIAS) * frictionScale;
+      frictionComp = -baseFriction * frictionScale;
     } else {
       frictionComp = baseFriction * frictionScale;
     }
   }
-  
+
+  // Velocity feedforward (optional, for smoother large moves)
   float velocityFF = 0;
   if (abs(error) > 50) {
     float desiredVelocity = constrain(error / 0.15, -400, 400);
     velocityFF = 0.008 * desiredVelocity;
   }
-  
+
+  // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF;
-  totalVoltage = constrain(totalVoltage, -MAX_VOLTAGE, MAX_VOLTAGE);
-  
+
+  // Voltage capping based on error magnitude (prevents overshoot)
+  float voltageLimit = MAX_VOLTAGE;
+  long absErr = abs(error);
+  if (absErr > 800) {
+    voltageLimit = 4.0;
+  } else if (absErr > 500) {
+    voltageLimit = 3.5;
+  } else if (absErr > 300) {
+    voltageLimit = 3.2;
+  } else {
+    voltageLimit = 3.0;
+  }
+
+  totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
+
+  // Anti-windup on zero crossing
+  if ((error != 0) && (error * lastError < 0)) {
+    errorIntegral *= 0.5;
+  }
+
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
     setMotor(totalVoltage);
   } else {
     stopMotor();
   }
-  
+
   lastError = error;
 }
 
 // ============================================
-// MOTOR CONTROL
+// MOTOR CONTROL (Improved with flip switch and better limit handling)
 // ============================================
+bool isSwitchEnabled() {
+  return digitalRead(ON_OFF_SWITCH_PIN) == HIGH;
+}
+
 void setMotor(float voltage) {
+  // Master override from flip switch
+  static bool lastSwitchState = true;
+  bool enabled = isSwitchEnabled();
+  if (!enabled) {
+    if (lastSwitchState != enabled) {
+      Serial.println(F("Flip switch OFF - motor disabled"));
+    }
+    lastSwitchState = enabled;
+    digitalWrite(MOTOR_IN2, LOW);
+    digitalWrite(MOTOR_IN3, LOW);
+    analogWrite(MOTOR_ENA, 0);
+    return;
+  }
+  if (lastSwitchState != enabled) {
+    Serial.println(F("Flip switch ON - motor enabled"));
+  }
+  lastSwitchState = enabled;
+
+  // Constrain voltage to safe range
   voltage = constrain(voltage, -10.0, 10.0);
+
+  // Convert voltage to PWM (0-255)
   int pwm = abs(voltage) * 25.5;
-  
+
+  // Safety: Check limit switches and prevent movement into limits
+  if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
+    voltage = 0;
+    pwm = 0;
+  }
+  if (digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
+    voltage = 0;
+    pwm = 0;
+  }
+
+  // Apply voltage to H-bridge
   if (voltage > 0) {
+    // Move LEFT (toward position 0)
     digitalWrite(MOTOR_IN2, HIGH);
     digitalWrite(MOTOR_IN3, LOW);
+    analogWrite(MOTOR_ENA, pwm);
   } else if (voltage < 0) {
+    // Move RIGHT (toward negative positions)
     digitalWrite(MOTOR_IN2, LOW);
     digitalWrite(MOTOR_IN3, HIGH);
+    analogWrite(MOTOR_ENA, pwm);
   } else {
+    // STOP
     digitalWrite(MOTOR_IN2, LOW);
     digitalWrite(MOTOR_IN3, LOW);
+    analogWrite(MOTOR_ENA, 0);
   }
-  
-  analogWrite(MOTOR_ENA, pwm);
 }
 
 void stopMotor() {
@@ -870,65 +977,91 @@ bool rightPressed() {
 }
 
 // ============================================
-// HOMING
+// HOMING (Improved soft homing with stable detection)
 // ============================================
 bool homeToLeftLimit() {
   Serial.println(F("\n🏠 HOMING..."));
-  
+
   if (leftPressed()) {
-    Serial.println(F("Already at limit, ensuring contact..."));
-    setMotor(HOMING_VOLTAGE);
-    delay(400);
+    Serial.println(F("Already at limit, ensuring stable contact..."));
+
+    // Hold gently at limit to ensure stable position
+    long lastPos = encoder.read();
+    unsigned long holdStart = millis();
+    int stableTicks = 0;
+    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+
+    while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
+      setMotor(holdVoltage);
+      delay(10);
+      long pos = encoder.read();
+      if (abs(pos - lastPos) <= 1) {
+        stableTicks++;
+      } else {
+        stableTicks = 0;
+        lastPos = pos;
+      }
+    }
+
     stopMotor();
     delay(100);
-    
+
+    // Zero encoder multiple times to ensure it sticks
     encoder.write(0);
     delay(50);
-    
-    if (encoder.read() != 0) {
-      encoder.write(0);
-      delay(50);
-    }
-    
-    if (encoder.read() != 0) {
-      encoder.write(0);
-      delay(50);
-    }
-    
+    encoder.write(0);
+    delay(50);
+    encoder.write(0);
+    delay(50);
+
     Serial.print(F("Zeroed at: "));
     Serial.println(encoder.read());
     Serial.println(F("✓ Homed\n"));
     return true;
   }
-  
+
+  // Approach limit switch
   unsigned long startTime = millis();
-  setMotor(HOMING_VOLTAGE);
-  
+  float driveVoltage = max(FRICTION_RIGHT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+  setMotor(driveVoltage);
+
   while (!leftPressed() && (millis() - startTime) < 15000) {
     delay(10);
   }
-  
+
   if (leftPressed()) {
-    Serial.println(F("Contact made, holding..."));
-    delay(300);
+    Serial.println(F("Contact made, stabilizing..."));
+
+    // Hold gently at limit to remove bounce
+    long currentPos = encoder.read();
+    long lastPos = currentPos;
+    unsigned long holdStart = millis();
+    int stableTicks = 0;
+    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+
+    while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
+      setMotor(holdVoltage);
+      delay(10);
+      long pos = encoder.read();
+      if (abs(pos - lastPos) <= 1) {
+        stableTicks++;
+      } else {
+        stableTicks = 0;
+        lastPos = pos;
+      }
+    }
+
     stopMotor();
     delay(100);
-    
+
+    // Zero encoder multiple times to ensure it sticks
     encoder.write(0);
     delay(50);
-    
-    if (encoder.read() != 0) {
-      Serial.println(F("  Re-zeroing..."));
-      encoder.write(0);
-      delay(50);
-    }
-    
-    if (encoder.read() != 0) {
-      Serial.println(F("  Re-zeroing again..."));
-      encoder.write(0);
-      delay(50);
-    }
-    
+    encoder.write(0);
+    delay(50);
+    encoder.write(0);
+    delay(50);
+
     Serial.print(F("Final encoder value: "));
     Serial.println(encoder.read());
     Serial.println(F("✓ Homed\n"));
@@ -938,6 +1071,77 @@ bool homeToLeftLimit() {
     Serial.println(F("✗ Timeout\n"));
     return false;
   }
+}
+
+// ============================================
+// EEPROM LOADING AND SAVING
+// ============================================
+void loadCalibrationFromEEPROM() {
+  byte flag = EEPROM.read(EEPROM_FLAG);
+  if (flag != 0xAA) {
+    Serial.println(F("EEPROM flag not set; using defaults."));
+    return;
+  }
+
+  EEPROM.get(EEPROM_KP, KP);
+  EEPROM.get(EEPROM_KI, KI);
+  EEPROM.get(EEPROM_KD, KD);
+  EEPROM.get(EEPROM_FRICTION_LEFT, FRICTION_LEFT);
+  EEPROM.get(EEPROM_FRICTION_RIGHT, FRICTION_RIGHT);
+
+  // Initialize adaptive friction with loaded values
+  adaptiveFrictionLeft = FRICTION_LEFT;
+  adaptiveFrictionRight = FRICTION_RIGHT;
+
+  // Load lane positions
+  for (int i = 0; i < 4; i++) {
+    long v;
+    EEPROM.get(EEPROM_LANES_BASE + i * sizeof(long), v);
+    targetPositions[i] = v;
+  }
+
+  // Update individual position variables
+  TARGET_1_POSITION = targetPositions[0];
+  TARGET_2_POSITION = targetPositions[1];
+  TARGET_3_POSITION = targetPositions[2];
+  TARGET_4_POSITION = targetPositions[3];
+  WAIT_POSITION = TARGET_3_POSITION;
+
+  Serial.println(F("Loaded calibration from EEPROM:"));
+  Serial.print(F("  Kp=")); Serial.print(KP, 6);
+  Serial.print(F(" Ki=")); Serial.print(KI, 6);
+  Serial.print(F(" Kd=")); Serial.println(KD, 6);
+  Serial.print(F("  Fric L=")); Serial.print(FRICTION_LEFT, 3);
+  Serial.print(F(" R=")); Serial.println(FRICTION_RIGHT, 3);
+  Serial.print(F("  Lanes: "));
+  for (int i = 0; i < 4; i++) {
+    Serial.print(targetPositions[i]);
+    if (i < 3) Serial.print(F(", "));
+  }
+  Serial.println();
+}
+
+void saveTargetsToEEPROM() {
+  EEPROM.write(EEPROM_FLAG, 0xAA);
+  for (int i = 0; i < 4; i++) {
+    EEPROM.put(EEPROM_LANES_BASE + i * sizeof(long), targetPositions[i]);
+  }
+  Serial.println(F("Lane positions saved to EEPROM."));
+}
+
+void savePIDToEEPROM() {
+  EEPROM.write(EEPROM_FLAG, 0xAA);
+  EEPROM.put(EEPROM_KP, KP);
+  EEPROM.put(EEPROM_KI, KI);
+  EEPROM.put(EEPROM_KD, KD);
+  Serial.println(F("PID values saved to EEPROM."));
+}
+
+void saveFrictionToEEPROM() {
+  EEPROM.write(EEPROM_FLAG, 0xAA);
+  EEPROM.put(EEPROM_FRICTION_LEFT, FRICTION_LEFT);
+  EEPROM.put(EEPROM_FRICTION_RIGHT, FRICTION_RIGHT);
+  Serial.println(F("Friction values saved to EEPROM."));
 }
 
 // ============================================
@@ -1033,6 +1237,10 @@ void manualCalibration() {
           Serial.print(F("  4: "));
           Serial.println(TARGET_4_POSITION);
           Serial.println();
+
+          // Save to EEPROM
+          saveTargetsToEEPROM();
+
           systemEnabled = wasEnabled;
           autoMode = wasAuto;
           return;
@@ -1131,9 +1339,24 @@ void processCommand() {
       adaptiveLearned = false;
       rangeFindingComplete = false;
       sensorCalibrated = false;
+      adaptiveFrictionLeft = FRICTION_LEFT;
+      adaptiveFrictionRight = FRICTION_RIGHT;
       Serial.println(F("\n✓ Reset all calibrations\n"));
       break;
-    
+
+    case 'L':
+      Serial.println(F("\n📥 Loading calibration from EEPROM..."));
+      loadCalibrationFromEEPROM();
+      break;
+
+    case 'W':
+      Serial.println(F("\n💾 Saving all calibration to EEPROM..."));
+      saveTargetsToEEPROM();
+      savePIDToEEPROM();
+      saveFrictionToEEPROM();
+      Serial.println(F("✓ All settings saved!\n"));
+      break;
+
     default:
       break;
   }
@@ -1168,7 +1391,12 @@ void setTargetLane(int lane) {
 void printWelcome() {
   Serial.println(F("\n\n╔════════════════════════════════════════════╗"));
   Serial.println(F("║   PLANTS VS ZOMBIES - IMPROVED CODE        ║"));
-  Serial.println(F("║   Enhanced Target Switching                ║"));
+  Serial.println(F("║   Enhanced Target Switching & PID Control  ║"));
+  Serial.println(F("║   • Soft homing with stable detection      ║"));
+  Serial.println(F("║   • Improved PID with voltage capping      ║"));
+  Serial.println(F("║   • Better friction compensation           ║"));
+  Serial.println(F("║   • EEPROM calibration storage             ║"));
+  Serial.println(F("║   • Flip switch motor override             ║"));
   Serial.println(F("╚════════════════════════════════════════════╝\n"));
 }
 
@@ -1176,7 +1404,7 @@ void printHelp() {
   Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
   Serial.println(F("COMMANDS:"));
   Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-  Serial.println(F("  C      🎯 Calibrate target positions"));
+  Serial.println(F("  C      🎯 Calibrate target positions (saves to EEPROM)"));
   Serial.println(F("  Z      🏠 Home to left limit"));
   Serial.println(F("  G      🎮 Start AUTO (range + sensors + track!)"));
   Serial.println(F("  S      ⏹  Stop"));
@@ -1185,8 +1413,12 @@ void printHelp() {
   Serial.println(F("  D      Display all sensors"));
   Serial.println(F("  M      Continuous monitor"));
   Serial.println(F("  R      Reset all calibrations"));
+  Serial.println(F("  L      Load calibration from EEPROM"));
+  Serial.println(F("  W      Save current config to EEPROM"));
   Serial.println(F("  H      Help"));
   Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"));
+  Serial.println(F("NOTE: Flip switch on pin 5 provides motor override"));
+  Serial.println(F("      PID, friction, and lane positions auto-load from EEPROM\n"));
 }
 
 void printCompactStatus() {
