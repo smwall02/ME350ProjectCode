@@ -403,14 +403,36 @@ bool findEncoderRange() {
     long currentPos = encoder.read();
     
     if (digitalRead(LIMIT_RIGHT) == HIGH) {
+      Serial.println(F("Right limit hit"));
+      delay(100);
+
+      // Hold and stabilize at right limit
+      Serial.println(F("Stabilizing at right..."));
+      long lastRightPos = encoder.read();
+      unsigned long holdStart = millis();
+      int stableCount = 0;
+
+      while (stableCount < 3 && (millis() - holdStart) < 1500) {
+        setMotor(RANGE_FINDING_VOLTAGE);  // Keep holding against right limit
+        delay(100);
+
+        long pos = encoder.read();
+        if (abs(pos - lastRightPos) < 3) {
+          stableCount++;
+        } else {
+          stableCount = 0;
+          lastRightPos = pos;
+        }
+      }
+
       stopMotor();
-      delay(200);
-      
+      delay(300);
+
       UPPER_BOUND = encoder.read();
-      
+
       Serial.print(F("✓ Found right limit at: "));
       Serial.println(UPPER_BOUND);
-      
+
       Serial.println(F("Returning to home position...\n"));
       delay(500);
       
