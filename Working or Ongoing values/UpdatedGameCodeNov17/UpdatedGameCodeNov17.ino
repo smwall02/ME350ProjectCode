@@ -1188,20 +1188,19 @@ void tuneZieglerNichols() {
 
   // Step 2: Move to right limit with stable holding
   Serial.println(F("Finding right limit..."));
-  setMotor(-3.5);  // Move right slowly (same as range finding)
+  setMotor(-1.5);  // Move right very slowly
 
   unsigned long rightStart = millis();
   long lastRightPos = encoder.read();
   unsigned long stuckTime = 0;
 
-  while ((millis() - rightStart) < 15000) {
+  while ((millis() - rightStart) < 20000) {
     delay(50);
     long currentPos = encoder.read();
 
     // Check if reached right limit switch
     if (rightPressed()) {
-      stopMotor();
-      delay(200);
+      Serial.println(F("Right limit hit"));
       break;
     }
 
@@ -1209,7 +1208,6 @@ void tuneZieglerNichols() {
     if (abs(currentPos - lastRightPos) < 5) {
       stuckTime += 50;
       if (stuckTime > 2000) {
-        stopMotor();
         Serial.println(F("Stopped, assuming limit"));
         break;
       }
@@ -1219,14 +1217,14 @@ void tuneZieglerNichols() {
     }
   }
 
-  // Now hold at right limit with stable detection
+  // Continue holding at right limit with stable detection
   Serial.println(F("Stabilizing at right..."));
   lastRightPos = encoder.read();
   unsigned long holdStart = millis();
   int stableCount = 0;
 
-  while (stableCount < 3 && (millis() - holdStart) < 1000) {
-    setMotor(-0.5);  // Very gentle hold against right limit
+  while (stableCount < 3 && (millis() - holdStart) < 1500) {
+    setMotor(-1.5);  // Keep same voltage to hold against right limit
     delay(100);
 
     long pos = encoder.read();
@@ -1239,7 +1237,7 @@ void tuneZieglerNichols() {
   }
 
   stopMotor();
-  delay(200);
+  delay(300);
 
   long tuneRightBound = encoder.read();
   Serial.print(F("Right=")); Serial.println(tuneRightBound);
