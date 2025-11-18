@@ -175,6 +175,11 @@ float motorVelocity = 0;
 int previousMotorPosition = 0;
 long previousVelCompTime = 0;
 
+// Stuck detection for final positioning
+long lastStuckCheckPos = 0;
+unsigned long lastStuckCheckTime = 0;
+int stuckCounter = 0;
+
 const int MIN_VEL_COMP_COUNT = 2;
 const long MIN_VEL_COMP_TIME = 10000;
 
@@ -648,6 +653,7 @@ void runStateMachine() {
       moveStartTime = millis();
       arrivalTime = millis();
       targetReached = false;
+      stuckCounter = 0;
       currentState = MOVE_TO_TARGET;
       break;
     
@@ -878,6 +884,31 @@ void runMotionControl() {
   // Anti-windup on zero crossing
   if ((error != 0) && (error * lastError < 0)) {
     errorIntegral *= 0.5;
+  }
+
+  // Stuck detection: if outside target band but not moving, apply minimum voltage
+  unsigned long currentTime = millis();
+  if (abs(error) > TARGET_BAND) {
+    // Check if stuck (position hasn't changed in 300ms)
+    if (currentTime - lastStuckCheckTime >= 300) {
+      if (abs(currentPosition - lastStuckCheckPos) < 2) {
+        stuckCounter++;
+
+        // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
+        if (stuckCounter >= 2) {
+          float minVoltage = 1.8;  // Minimum to overcome static friction
+          if (abs(totalVoltage) < minVoltage) {
+            totalVoltage = (error < 0) ? -minVoltage : minVoltage;
+          }
+        }
+      } else {
+        stuckCounter = 0;  // Reset if moving
+      }
+      lastStuckCheckPos = currentPosition;
+      lastStuckCheckTime = currentTime;
+    }
+  } else {
+    stuckCounter = 0;  // Reset when within target band
   }
 
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
@@ -1257,6 +1288,7 @@ void tuneZieglerNichols() {
   lastError = 0;
   moveStartTime = millis();
   targetReached = false;
+  stuckCounter = 0;
   systemEnabled = true;
 
   Serial.print(F("Target center: "));
@@ -1565,6 +1597,7 @@ void testPIDGains() {
   lastError = 0;
   moveStartTime = millis();
   targetReached = false;
+  stuckCounter = 0;
   systemEnabled = true;
 
   Serial.println(F("Time,Pos,Err"));
@@ -1938,12 +1971,13 @@ void processCommand() {
 
 void setTargetLane(int lane) {
   if (lane < 1 || lane > 4) return;
-  
+
   desiredPosition = targetPositions[lane - 1];
   errorIntegral = 0;
   lastError = 0;
   moveStartTime = millis();
   targetReached = false;
+  stuckCounter = 0;  // Reset stuck detection for new movement
   
   long currentPos = encoder.read();
   long error = desiredPosition - currentPos;
