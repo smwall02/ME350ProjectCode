@@ -1239,73 +1239,52 @@ void tuneZieglerNichols() {
 
   delay(300);
 
-  // Step 3: Move away from right limit first
-  Serial.println(F("Moving away from right limit..."));
-  setMotor(2.0);  // Move left (positive direction)
+  // Step 3: Move away from right limit
+  Serial.println(F("Moving away from right..."));
+  setMotor(3.0);  // Move left with good speed
 
   unsigned long clearStart = millis();
   while (rightPressed() && millis() - clearStart < 2000) {
     delay(10);
   }
 
-  // Continue moving left for a bit more to ensure clear
-  delay(200);
+  // Continue moving left to fully clear (about 200 counts)
+  delay(500);
   stopMotor();
-  delay(200);
+  delay(300);
 
-  Serial.print(F("Cleared right, now at: "));
+  Serial.print(F("Cleared to: "));
   Serial.println(encoder.read());
 
-  // Step 4: Move to center position using PID control
+  // Step 4: Move to center using lane movement method
   long centerPosition = (tuneLeftBound + tuneRightBound) / 2;
-  Serial.print(F("Moving to center: ")); Serial.println(centerPosition);
 
-  // Use existing PID gains for accurate positioning
-  long centerError = 0;
-  long centerLastError = 0;
-  float centerIntegral = 0.0;
+  // Set target exactly like setTargetLane()
+  desiredPosition = centerPosition;
+  errorIntegral = 0;
+  lastError = 0;
+  moveStartTime = millis();
+  targetReached = false;
+  systemEnabled = true;
 
+  Serial.print(F("Target center: "));
+  Serial.print(encoder.read());
+  Serial.print(F(" -> "));
+  Serial.println(centerPosition);
+
+  // Let runMotionControl() handle movement (has own safety)
   unsigned long moveStart = millis();
-  while (abs(encoder.read() - centerPosition) > 2 && millis() - moveStart < 5000) {
-    // Safety: check limit switches
-    if (leftPressed() || rightPressed()) {
-      Serial.println(F("ERR: Hit limit during center"));
-      stopMotor();
-      lastTuneResults.valid = false;
-      return;
-    }
-
-    long currentPos = encoder.read();
-    centerError = centerPosition - currentPos;
-
-    // PID calculation
-    float pTerm = KP * centerError;
-    centerIntegral += KI * centerError;
-    float dTerm = KD * (centerError - centerLastError);
-    float voltage = pTerm + centerIntegral + dTerm;
-
-    // Directional friction compensation
-    if (centerError < -50) {
-      // Moving right (negative direction)
-      voltage -= FRICTION_LEFT;
-    } else if (centerError > 50) {
-      // Moving left (positive direction)
-      voltage += FRICTION_RIGHT;
-    }
-
-    // Anti-windup on zero crossing
-    if ((centerError != 0) && (centerError * centerLastError < 0)) {
-      centerIntegral *= 0.5;
-    }
-
-    // Apply voltage with conservative capping
-    float cappedVoltage = constrain(voltage, -3.0, 3.0);
-    setMotor(cappedVoltage);
-
-    centerLastError = centerError;
-    delay(10);
+  while (!targetReached && millis() - moveStart < 8000) {
+    runMotionControl();
+    delay(CONTROL_PERIOD);
   }
+
+  if (!targetReached) {
+    Serial.println(F("WARN: Center timeout"));
+  }
+
   stopMotor();
+  systemEnabled = false;
   delay(500);
 
   // Use locally measured bounds for tuning
