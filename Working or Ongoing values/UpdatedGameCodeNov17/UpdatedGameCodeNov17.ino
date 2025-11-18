@@ -307,42 +307,51 @@ void updateAllSensors() {
   for (int i = 0; i < 4; i++) {
     // Store previous direction
     ProxSensors[i].prevDirection = ProxSensors[i].direction;
-    
-    ProxSensors[i].currVal = alpha * ProxSensors[i].currVal + 
+
+    ProxSensors[i].currVal = alpha * ProxSensors[i].currVal +
                              (1.0 - alpha) * analogRead(ProxSensors[i].pin);
-    
+
     if (ProxSensors[i].currVal >= noiseThreshold) {
       noiseLimit = upperNoiseLimit;
     } else {
       noiseLimit = lowerNoiseLimit;
     }
-    
+
     if (abs(ProxSensors[i].currVal - ProxSensors[i].prevVal) < noiseLimit) {
       if (millis() - ProxSensors[i].prevChangeTime >= stopTimeout) {
         ProxSensors[i].direction = STOPPED;
       }
       ProxSensors[i].forwardCount = 0;
       ProxSensors[i].backwardCount = 0;
-      
+
     } else if (ProxSensors[i].currVal - ProxSensors[i].prevVal < 0) {
       ProxSensors[i].forwardCount++;
       ProxSensors[i].backwardCount = 0;
-      
+
       if (ProxSensors[i].forwardCount > 3) {
         ProxSensors[i].direction = FORWARD;
         ProxSensors[i].prevVal = ProxSensors[i].currVal;
         ProxSensors[i].prevChangeTime = millis();
       }
-      
+
     } else {
       ProxSensors[i].backwardCount++;
       ProxSensors[i].forwardCount = 0;
-      
+
       if (ProxSensors[i].backwardCount > 3) {
         ProxSensors[i].direction = BACKWARD;
         ProxSensors[i].prevVal = ProxSensors[i].currVal;
         ProxSensors[i].prevChangeTime = millis();
       }
+    }
+
+    // Update zombie distances continuously (for display and decision making)
+    if (sensorCalibrated) {
+      zombieDistances[i] = (ProxSensors[i].currVal - ProxRange[i][1]) /
+                           (float)(ProxRange[i][0] - ProxRange[i][1]);
+      zombieDistances[i] = constrain(zombieDistances[i], 0.0, 1.0);
+    } else {
+      zombieDistances[i] = 1.0;  // Default to far away if not calibrated
     }
   }
 }
@@ -565,16 +574,12 @@ void runStateMachine() {
     case CHOOSE_ACTIVE_TARGET:
       activeTargetIndex = -1;
       closestZombieDist = 2.0;
-      
+
+      // Zombie distances are now updated continuously in updateAllSensors()
       for (int i = 0; i < 4; i++) {
-        zombieDistances[i] = (ProxSensors[i].currVal - ProxRange[i][1]) / 
-                             (float)(ProxRange[i][0] - ProxRange[i][1]);
-        
-        zombieDistances[i] = constrain(zombieDistances[i], 0.0, 1.0);
-        
         // IMPROVED: Only target zombies moving FORWARD
         // Lower distance = closer to photo sensor = more dangerous
-        if (ProxSensors[i].direction == FORWARD && 
+        if (ProxSensors[i].direction == FORWARD &&
             zombieDistances[i] < closestZombieDist) {
           closestZombieDist = zombieDistances[i];
           activeTargetIndex = i;
