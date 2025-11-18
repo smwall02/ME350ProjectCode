@@ -5,7 +5,45 @@ This document summarizes the improvements made to the Plants vs Zombies competit
 
 ## Key Improvements
 
-### 1. **Improved Limit Switch Handling**
+### 1. **Integrated PID Auto-Tune Mode** 🆕
+- **Press 'T' at any time** to enter PID Tuning Mode without switching programs
+- **Ziegler-Nichols Auto-Tune**: Industry-standard relay oscillation method
+  - Automatically finds ultimate gain (Ku) and period (Tu)
+  - Offers 3 tuning presets: Conservative (30%), Classic (100%), Aggressive (80%)
+  - All results saved to EEPROM automatically
+- **Test Mode**: Test current PID gains with data logging
+  - CSV output: Time, Position, Error, Voltage
+  - 5-second test move to Lane 3
+- **Manual Update**: Manually enter Kp, Ki, Kd values
+- **View Settings**: Display current PID values and last auto-tune results
+- **Seamless Integration**: Pauses competition, then returns when done
+
+#### Tuning Mode Commands
+```
+T - Enter PID Tuning Mode (from main menu)
+  Z - Ziegler-Nichols Auto-Tune
+  T - Test current PID gains
+  U - Update PID gains manually
+  V - View current settings
+  Q - Quit tuning mode
+```
+
+#### Auto-Tune Process
+1. System moves to Lane 3 (center position)
+2. Applies relay oscillation with 5V amplitude
+3. Collects 20+ peak crossings
+4. Calculates Ku and Tu
+5. Offers 3 tuning presets
+6. Saves selected gains to EEPROM
+
+#### Benefits
+- **No program switching**: Tune PID without uploading different code
+- **Scientific tuning**: Industry-standard Ziegler-Nichols method
+- **Multiple presets**: Choose aggressiveness level
+- **Instant testing**: Test new gains immediately
+- **Persistent storage**: All changes saved automatically
+
+### 2. **Improved Limit Switch Handling**
 - **Soft Homing**: Implemented gentle approach to limit switches with stable position detection
 - **Hold and Stabilize**: System now holds position for 300ms with stable tick detection before zeroing encoder
 - **Multiple Zeroing**: Encoder is zeroed multiple times (3x) to ensure value sticks
@@ -16,7 +54,7 @@ This document summarizes the improvements made to the Plants vs Zombies competit
   - `CALIBRATE_HOLD_TIME = 300ms`: Time to hold at limit before zeroing
   - `CALIBRATE_STABLE_TICKS = 3`: Required stable readings
 
-### 2. **Enhanced PID Control**
+### 3. **Enhanced PID Control**
 
 #### Better Friction Compensation
 - **Directional Friction**: Separate friction values for each direction
@@ -39,7 +77,7 @@ Progressive voltage limits based on error magnitude prevent overshoot:
 - Prevents integral windup during direction changes
 - Improves settling time and reduces overshoot
 
-### 3. **EEPROM Calibration Storage**
+### 4. **EEPROM Calibration Storage**
 
 #### Persistent Storage
 All critical calibration values now persist across power cycles:
@@ -66,13 +104,13 @@ Address 29: Lane positions (4 * 4 bytes long)
 - `W`: Save all calibration to EEPROM
 - `C`: Calibrate lanes (now auto-saves to EEPROM)
 
-### 4. **Flip Switch Motor Override**
+### 5. **Flip Switch Motor Override**
 - **Pin 5 Override**: Physical switch for motor enable/disable
 - **Active HIGH Logic**: HIGH = enabled, LOW = disabled
 - **Safety Feature**: Provides immediate motor shutdown capability
 - **Status Messages**: Console feedback when switch state changes
 
-### 5. **Code Structure Improvements**
+### 6. **Code Structure Improvements**
 - Added comprehensive comments explaining friction direction logic
 - Separated friction compensation into clear directional components
 - Improved variable naming for clarity
