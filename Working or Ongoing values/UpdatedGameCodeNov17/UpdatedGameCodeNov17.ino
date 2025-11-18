@@ -133,7 +133,7 @@ bool WAIT_POS = true;
 // NOTE: These values will be loaded from EEPROM if available
 // FRICTION_LEFT: voltage needed when moving TO MORE NEGATIVE positions (away from home)
 // FRICTION_RIGHT: voltage needed when moving TO LESS NEGATIVE positions (toward home)
-float FRICTION_LEFT = 2.2;   // For moving toward more negative (right/away)
+float FRICTION_LEFT = 0.25;  // Reduced from 2.2 to prevent overshoot to right
 float FRICTION_RIGHT = 0.25; // For moving toward less negative (left/toward home)
 
 // Adaptive friction boost (increases if target not reached)
@@ -153,7 +153,7 @@ bool adaptiveLearned = false;
 // ============================================
 float KP = 0.020;
 float KI = 0.005;
-float KD = 0.004;
+float KD = 0.010;  // Increased from 0.004 to add damping and prevent overshoot
 
 float KP_active = KP;
 float KI_active = KI;
@@ -925,12 +925,13 @@ void runMotionControl() {
     }
   }
 
-  // Velocity feedforward (optional, for smoother large moves)
+  // Velocity feedforward - DISABLED to prevent overshoot
   float velocityFF = 0;
-  if (abs(error) > 50) {
-    float desiredVelocity = constrain(error / 0.15, -400, 400);
-    velocityFF = 0.008 * desiredVelocity;
-  }
+  // Disabled: was adding up to 3.2V extra, causing massive overshoot
+  // if (abs(error) > 50) {
+  //   float desiredVelocity = constrain(error / 0.15, -400, 400);
+  //   velocityFF = 0.008 * desiredVelocity;
+  // }
 
   // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF;
@@ -939,15 +940,15 @@ void runMotionControl() {
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 4.0;  // Reduced to prevent overshoot
+    voltageLimit = 3.0;  // Further reduced to prevent overshoot
   } else if (absErr > 500) {
-    voltageLimit = 3.5;  // Reduced to prevent overshoot
+    voltageLimit = 2.7;  // Further reduced to prevent overshoot
   } else if (absErr > 300) {
-    voltageLimit = 3.2;  // Reduced to prevent overshoot
+    voltageLimit = 2.5;  // Further reduced to prevent overshoot
   } else if (absErr > 100) {
-    voltageLimit = 3.0;  // Reduced to prevent overshoot
+    voltageLimit = 2.3;  // Further reduced to prevent overshoot
   } else {
-    voltageLimit = 2.8;  // Reduced for careful final approach
+    voltageLimit = 2.0;  // Further reduced for careful final approach
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
