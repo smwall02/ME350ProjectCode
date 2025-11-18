@@ -1275,8 +1275,8 @@ void tuneZieglerNichols() {
   delay(500);
 
   // Use locally measured bounds for tuning
-  const float TEST_VOLTAGE = 5.0;
-  const long HYSTERESIS = abs(tuneRightBound - tuneLeftBound) / 6;
+  const float TEST_VOLTAGE = 3.5;  // Reduced for smaller oscillations
+  const long HYSTERESIS = abs(tuneRightBound - tuneLeftBound) / 8;  // Tighter control
   const int TARGET_PEAKS = 20;
   const unsigned long TIMEOUT = 120000;
   const long tuneRange = abs(tuneRightBound - tuneLeftBound);
@@ -1284,10 +1284,10 @@ void tuneZieglerNichols() {
   Serial.print(F("Range=")); Serial.println(tuneRange);
   Serial.println(F("Testing..."));
 
-  // Enhanced peak/trough detection
-  long peaks[TARGET_PEAKS];
-  long troughs[TARGET_PEAKS];
-  unsigned long peakTimes[TARGET_PEAKS];
+  // Enhanced peak/trough detection - MUST initialize arrays
+  long peaks[TARGET_PEAKS] = {0};
+  long troughs[TARGET_PEAKS] = {0};
+  unsigned long peakTimes[TARGET_PEAKS] = {0};
   int peakCount = 0;
   bool lastAboveCenter = (encoder.read() > centerPosition);
   unsigned long lastCrossTime = millis();
