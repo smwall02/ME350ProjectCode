@@ -161,7 +161,7 @@ float KD_active = KD;
 
 const float MAX_VOLTAGE = 10.0;
 const float MIN_CONTROL_VOLTAGE = 0.8;
-const int TARGET_BAND = 5;
+const int TARGET_BAND = 2;  // Position tolerance: +/- 2 counts
 const float MAX_INTEGRAL = 1200.0;
 const unsigned long CONTROL_PERIOD = 10;
 
@@ -1249,7 +1249,7 @@ void tuneZieglerNichols() {
   float centerIntegral = 0.0;
 
   unsigned long moveStart = millis();
-  while (abs(encoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
+  while (abs(encoder.read() - centerPosition) > 2 && millis() - moveStart < 5000) {
     long currentPos = encoder.read();
     centerError = centerPosition - currentPos;
 
