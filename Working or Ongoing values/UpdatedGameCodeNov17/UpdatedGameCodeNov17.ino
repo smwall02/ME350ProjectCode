@@ -1193,19 +1193,31 @@ void tuneZieglerNichols() {
 
   Serial.println(F("Testing..."));
 
-  // Peak detection
+  // Enhanced peak/trough detection
   long peaks[TARGET_PEAKS];
+  long troughs[TARGET_PEAKS];
   unsigned long peakTimes[TARGET_PEAKS];
   int peakCount = 0;
   bool lastAboveCenter = (encoder.read() > centerPosition);
   unsigned long lastCrossTime = millis();
+  long lastExtreme = encoder.read();
+  bool searchingForPeak = lastAboveCenter;
 
   unsigned long testStart = millis();
   bool relayState = true;
+  long lastPos = encoder.read();
 
   while (peakCount < TARGET_PEAKS + 4 && millis() - testStart < TIMEOUT) {
     long currentPos = encoder.read();
     long deviation = currentPos - centerPosition;
+
+    // Safety: check limit switches
+    if (leftPressed() || rightPressed()) {
+      Serial.println(F("ERR: Limit hit"));
+      stopMotor();
+      lastTuneResults.valid = false;
+      return;
+    }
 
     // Relay logic with hysteresis
     if (deviation > HYSTERESIS) {
@@ -1217,15 +1229,32 @@ void tuneZieglerNichols() {
     // Apply relay voltage
     setMotor(relayState ? TEST_VOLTAGE : -TEST_VOLTAGE);
 
-    // Detect center crossings
+    // Track peaks and troughs
+    if (searchingForPeak && currentPos < lastPos) {
+      // Found a peak
+      if (peakCount >= 4 && peakCount < TARGET_PEAKS + 4) {
+        peaks[peakCount - 4] = lastExtreme;
+      }
+      lastExtreme = currentPos;
+      searchingForPeak = false;
+    } else if (!searchingForPeak && currentPos > lastPos) {
+      // Found a trough
+      if (peakCount >= 4 && peakCount < TARGET_PEAKS + 4) {
+        troughs[peakCount - 4] = lastExtreme;
+      }
+      lastExtreme = currentPos;
+      searchingForPeak = true;
+    }
+    lastPos = currentPos;
+
+    // Detect center crossings for period measurement
     bool currentAboveCenter = (currentPos > centerPosition);
 
     if (currentAboveCenter != lastAboveCenter) {
       unsigned long crossTime = millis();
 
-      // Skip first 4 crossings for settling
+      // Record period (half-cycle time)
       if (peakCount >= 4 && peakCount < TARGET_PEAKS + 4) {
-        peaks[peakCount - 4] = abs(currentPos - centerPosition);
         peakTimes[peakCount - 4] = crossTime - lastCrossTime;
       }
 
@@ -1247,48 +1276,120 @@ void tuneZieglerNichols() {
     return;
   }
 
-  long sumAmplitude = 0;
+  // Calculate amplitude using peak-to-peak with outlier rejection
   int peaksUsed = min(peakCount - 4, TARGET_PEAKS);
-  for (int i = 0; i < peaksUsed; i++) sumAmplitude += peaks[i];
-  float avgAmplitude = sumAmplitude / (float)peaksUsed;
+
+  // Calculate amplitudes (peak to center)
+  long amplitudes[TARGET_PEAKS];
+  for (int i = 0; i < peaksUsed; i++) {
+    long peakDist = abs(peaks[i] - centerPosition);
+    long troughDist = abs(troughs[i] - centerPosition);
+    amplitudes[i] = (peakDist + troughDist) / 2;
+  }
+
+  // Sort for median calculation (simple bubble sort - small array)
+  for (int i = 0; i < peaksUsed - 1; i++) {
+    for (int j = 0; j < peaksUsed - i - 1; j++) {
+      if (amplitudes[j] > amplitudes[j + 1]) {
+        long temp = amplitudes[j];
+        amplitudes[j] = amplitudes[j + 1];
+        amplitudes[j + 1] = temp;
+      }
+    }
+  }
+
+  // Use middle 60% of data (reject outliers)
+  int startIdx = peaksUsed / 5;
+  int endIdx = peaksUsed - startIdx;
+  long sumAmplitude = 0;
+  for (int i = startIdx; i < endIdx; i++) sumAmplitude += amplitudes[i];
+  float avgAmplitude = sumAmplitude / (float)(endIdx - startIdx);
+
+  // Calculate period with outlier rejection
+  unsigned long sortedPeriods[TARGET_PEAKS];
+  for (int i = 0; i < peaksUsed; i++) sortedPeriods[i] = peakTimes[i];
+
+  for (int i = 0; i < peaksUsed - 1; i++) {
+    for (int j = 0; j < peaksUsed - i - 1; j++) {
+      if (sortedPeriods[j] > sortedPeriods[j + 1]) {
+        unsigned long temp = sortedPeriods[j];
+        sortedPeriods[j] = sortedPeriods[j + 1];
+        sortedPeriods[j + 1] = temp;
+      }
+    }
+  }
 
   unsigned long sumPeriod = 0;
-  for (int i = 0; i < peaksUsed - 1; i++) sumPeriod += peakTimes[i];
-  float avgPeriod = (sumPeriod / (float)(peaksUsed - 1)) / 1000.0;
+  for (int i = startIdx; i < endIdx; i++) sumPeriod += sortedPeriods[i];
+  float avgPeriod = (sumPeriod / (float)(endIdx - startIdx)) / 1000.0;
+
+  // Stability check: verify oscillations are consistent
+  float amplitudeStdDev = 0;
+  for (int i = startIdx; i < endIdx; i++) {
+    float diff = amplitudes[i] - avgAmplitude;
+    amplitudeStdDev += diff * diff;
+  }
+  amplitudeStdDev = sqrt(amplitudeStdDev / (endIdx - startIdx));
+
+  if (amplitudeStdDev / avgAmplitude > 0.25) {
+    Serial.println(F("WARN: Unstable oscillation"));
+  }
 
   float Ku = (4.0 * TEST_VOLTAGE) / (PI * avgAmplitude);
+  float Tu = avgPeriod * 2;
+
+  // Validate results are physically reasonable
+  if (avgAmplitude < 10 || avgAmplitude > abs(UPPER_BOUND - LOWER_BOUND)) {
+    Serial.println(F("ERR: Bad amplitude"));
+    lastTuneResults.valid = false;
+    return;
+  }
+
+  if (Tu < 0.1 || Tu > 10.0) {
+    Serial.println(F("ERR: Bad period"));
+    lastTuneResults.valid = false;
+    return;
+  }
+
+  if (Ku < 0.001 || Ku > 1.0) {
+    Serial.println(F("ERR: Bad Ku"));
+    lastTuneResults.valid = false;
+    return;
+  }
 
   lastTuneResults.Ku = Ku;
-  lastTuneResults.Tu = avgPeriod * 2;
+  lastTuneResults.Tu = Tu;
   lastTuneResults.amplitude = avgAmplitude;
   lastTuneResults.peakCount = peaksUsed;
   lastTuneResults.valid = true;
 
   Serial.println(F("\n=== RESULTS ==="));
   Serial.print(F("Ku=")); Serial.print(Ku, 3);
-  Serial.print(F(" Tu=")); Serial.println(lastTuneResults.Tu, 2);
+  Serial.print(F(" Tu=")); Serial.println(Tu, 2);
+  Serial.print(F("Amp=")); Serial.print(avgAmplitude);
+  Serial.print(F(" StdDev=")); Serial.println(amplitudeStdDev);
 
   Serial.println(F("1-Conserv 2-Classic 3-Aggr 4-Cancel"));
 
   float kp1 = 0.3 * 0.6 * Ku;
-  float ki1 = 0.3 * 1.2 * Ku / lastTuneResults.Tu;
-  float kd1 = 0.3 * 0.075 * Ku * lastTuneResults.Tu;
+  float ki1 = 0.3 * 1.2 * Ku / Tu;
+  float kd1 = 0.3 * 0.075 * Ku * Tu;
 
   Serial.print(F("1: ")); Serial.print(kp1, 3);
   Serial.print(F(",")); Serial.print(ki1, 3);
   Serial.print(F(",")); Serial.println(kd1, 3);
 
   float kp2 = 0.6 * Ku;
-  float ki2 = 1.2 * Ku / lastTuneResults.Tu;
-  float kd2 = 0.075 * Ku * lastTuneResults.Tu;
+  float ki2 = 1.2 * Ku / Tu;
+  float kd2 = 0.075 * Ku * Tu;
 
   Serial.print(F("2: ")); Serial.print(kp2, 3);
   Serial.print(F(",")); Serial.print(ki2, 3);
   Serial.print(F(",")); Serial.println(kd2, 3);
 
   float kp3 = 0.8 * 0.6 * Ku;
-  float ki3 = 0.8 * 1.2 * Ku / lastTuneResults.Tu;
-  float kd3 = 0.8 * 0.075 * Ku * lastTuneResults.Tu;
+  float ki3 = 0.8 * 1.2 * Ku / Tu;
+  float kd3 = 0.8 * 0.075 * Ku * Tu;
 
   Serial.print(F("3: ")); Serial.print(kp3, 3);
   Serial.print(F(",")); Serial.print(ki3, 3);
