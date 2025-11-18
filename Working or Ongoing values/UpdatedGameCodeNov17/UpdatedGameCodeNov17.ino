@@ -699,28 +699,49 @@ void runStateMachine() {
           targetHitTime = 0;  // Reset if not consistently backward
         }
         
-        // IMPROVED: Also switch if zombie distance is increasing (moving away)
-        // This means we successfully pushed it back
-        if (targetDirection == BACKWARD && 
-            zombieDistances[activeTargetIndex] < 0.15) {
-          Serial.println(F("✓ Target retreating far enough, choosing next"));
+        // IMPROVED: Switch if zombie retreated far away (no longer a threat)
+        // distance > 0.80 means percentage < 20% (far from photo sensor)
+        if (targetDirection == BACKWARD &&
+            zombieDistances[activeTargetIndex] > 0.80) {
+          Serial.println(F("✓ Target retreated far away (safe), choosing next"));
           currentState = CHOOSE_ACTIVE_TARGET;
           break;
         }
+
+        // Check for more dangerous forward-moving zombie
+        for (int i = 0; i < 4; i++) {
+          if (i != activeTargetIndex &&
+              ProxSensors[i].direction == FORWARD &&
+              zombieDistances[i] < zombieDistances[activeTargetIndex] - 0.20) {
+            Serial.print(F("✓ Closer threat in Lane "));
+            Serial.println(i + 1);
+            currentState = CHOOSE_ACTIVE_TARGET;
+            break;
+          }
+        }
       }
       
+      // Check if there are ANY forward-moving zombies to track
+      bool hasForwardZombie = false;
+      for (int i = 0; i < 4; i++) {
+        if (ProxSensors[i].direction == FORWARD) {
+          hasForwardZombie = true;
+          break;
+        }
+      }
+
+      // If no forward zombies and been moving for >1s, go to wait position
+      if (!hasForwardZombie && millis() - moveStartTime > 1000) {
+        Serial.println(F("No forward threats detected, reconsidering"));
+        currentState = CHOOSE_ACTIVE_TARGET;
+        break;
+      }
+
       // Standard arrival check
       if (abs(error) <= TARGET_BAND) {
         if (WAIT_POS) {
           // At wait position - only reconsider if there's a new forward target
-          bool hasForwardTarget = false;
-          for (int i = 0; i < 4; i++) {
-            if (ProxSensors[i].direction == FORWARD) {
-              hasForwardTarget = true;
-              break;
-            }
-          }
-          if (hasForwardTarget) {
+          if (hasForwardZombie) {
             Serial.println(F("✓ New threat detected, choosing target"));
             currentState = CHOOSE_ACTIVE_TARGET;
           }
@@ -778,27 +799,30 @@ void runMotionControl() {
       Serial.print(F(" in "));
       Serial.print(settleTime / 1000.0, 2);
       Serial.println(F("s"));
-
-      // Check if error is too large and retry if needed
-      if (abs(error) > RETRY_ERROR_THRESHOLD && positionRetryCount < MAX_POSITION_RETRIES) {
-        positionRetryCount++;
-        Serial.print(F("⚠️  Error = "));
-        Serial.print(abs(error));
-        Serial.println(F(", retrying..."));
-
-        // Reset for retry
-        targetReached = false;
-        errorIntegral = 0;
-        lastError = 0;
-        moveStartTime = millis();
-        stuckCounter = 0;
-        delay(50);  // Brief pause before retry
-      }
     }
     return;
   }
 
   targetReached = false;
+
+  // Retry logic: if stuck outside target band for too long, retry once
+  if (abs(error) > RETRY_ERROR_THRESHOLD && abs(error) < 50) {
+    // Check if we've been stuck at this error for 1 second
+    if (millis() - moveStartTime > 1000 && positionRetryCount < MAX_POSITION_RETRIES) {
+      positionRetryCount++;
+      Serial.print(F("⚠️  Stuck at error = "));
+      Serial.print(abs(error));
+      Serial.println(F(", retrying..."));
+
+      // Reset for retry
+      errorIntegral = 0;
+      lastError = 0;
+      moveStartTime = millis();
+      stuckCounter = 0;
+      delay(100);
+      return;
+    }
+  }
   
   if (abs(error) > 500 && !adaptiveLearning && !adaptiveLearned) {
     adaptiveLearning = true;
