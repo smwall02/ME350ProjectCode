@@ -66,8 +66,8 @@ long TARGET_4_POSITION = -1080;
 
 const long WAIT_POSITION_OFFSET = 2;
 long WAIT_POSITION = TARGET_3_POSITION;
-long LOWER_BOUND = 0;
-long UPPER_BOUND = -1400;
+long LOWER_BOUND = 0;      // Fixed: Left limit position (home)
+long UPPER_BOUND = -1424;  // Fixed: Right limit position (from calibration)
 
 long targetPositions[4] = {
   TARGET_1_POSITION,
@@ -664,35 +664,18 @@ void runStateMachine() {
     case CALIBRATE:
       desiredPosition = LOWER_BOUND;
 
-      if (!dynamicCalibrationActive && rangeFindingComplete && sensorCalibrated) {
+      if (!dynamicCalibrationActive && sensorCalibrated) {
         Serial.println(F("State: CALIBRATE → CHOOSE_ACTIVE_TARGET (tracking enabled)\n"));
         currentState = CHOOSE_ACTIVE_TARGET;
         systemEnabled = true;
       }
-      else if (!dynamicCalibrationActive && !rangeFindingComplete) {
-        Serial.println(F("State: CALIBRATE → FIND_RANGE\n"));
-        currentState = FIND_RANGE;
-      }
-      break;
-    
-    case FIND_RANGE:
-      if (!rangeFindingComplete) {
-        stopMotor();
-        systemEnabled = false;
-        
-        if (findEncoderRange()) {
-          rangeFindingComplete = true;
-          startDynamicCalibration();
-          desiredPosition = LOWER_BOUND;
-
-          Serial.println(F("State: FIND_RANGE → CALIBRATE (sensor cal)\n"));
-          currentState = CALIBRATE;
-          systemEnabled = true;
-        } else {
-          Serial.println(F("✗ Range finding failed, stopping\n"));
-          autoMode = false;
-          systemEnabled = false;
-        }
+      else if (!dynamicCalibrationActive && !sensorCalibrated) {
+        // Skip range finding - use fixed bounds, go directly to sensor calibration
+        Serial.println(F("State: CALIBRATE → Sensor Calibration (using fixed bounds)\n"));
+        rangeFindingComplete = true;  // Mark as complete since we're using fixed values
+        startDynamicCalibration();
+        desiredPosition = LOWER_BOUND;
+        systemEnabled = true;
       }
       break;
     
@@ -1290,14 +1273,28 @@ bool homeToLeftLimit() {
     stopMotor();
     delay(100);
 
+    // Multiple zeroing attempts to ensure encoder is properly reset
     encoder.write(0);
     delay(50);
+    if (encoder.read() != 0) {
+      encoder.write(0);
+      delay(50);
+    }
     encoder.write(0);
     delay(50);
-    encoder.write(0);
-    delay(50);
+    
+    // Verify encoder is actually zeroed
+    long finalPos = encoder.read();
+    if (abs(finalPos) > 2) {
+      Serial.print(F("⚠️  Warning: Encoder not zeroed, reading: "));
+      Serial.println(finalPos);
+      encoder.write(0);  // Try one more time
+      delay(50);
+    }
 
-    Serial.println(F("Homed"));
+    Serial.print(F("Homed (encoder: "));
+    Serial.print(encoder.read());
+    Serial.println(F(")"));
     return true;
   }
 
@@ -1335,14 +1332,28 @@ bool homeToLeftLimit() {
     stopMotor();
     delay(100);
 
+    // Multiple zeroing attempts to ensure encoder is properly reset
     encoder.write(0);
     delay(50);
+    if (encoder.read() != 0) {
+      encoder.write(0);
+      delay(50);
+    }
     encoder.write(0);
     delay(50);
-    encoder.write(0);
-    delay(50);
+    
+    // Verify encoder is actually zeroed
+    long finalPos = encoder.read();
+    if (abs(finalPos) > 2) {
+      Serial.print(F("⚠️  Warning: Encoder not zeroed, reading: "));
+      Serial.println(finalPos);
+      encoder.write(0);  // Try one more time
+      delay(50);
+    }
 
-    Serial.println(F("Homed"));
+    Serial.print(F("Homed (encoder: "));
+    Serial.print(encoder.read());
+    Serial.println(F(")"));
     return true;
   } else {
     stopMotor();
@@ -2110,20 +2121,58 @@ void processCommand() {
     case 'G':
       if (!autoMode) {
         Serial.println(F("\n🎮 STARTING AUTONOMOUS MODE"));
-        Serial.println(F("Sequence: Home → Find Range → Sensor Cal → Track\n"));
+        Serial.println(F("Sequence: Home → Sensor Cal → Track\n"));
+        Serial.println(F("Using fixed encoder bounds: 0 to -1424\n"));
 
+        // Full rehoming with state reset
+        stopMotor();
+        delay(200);
+        
         if (homeToLeftLimit()) {
+          // Ensure encoder is properly zeroed
+          encoder.write(0);
+          delay(50);
+          if (encoder.read() != 0) {
+            encoder.write(0);
+            delay(50);
+            encoder.write(0);
+          }
+          
+          // Reset all state variables
           autoMode = true;
           systemEnabled = true;
-          rangeFindingComplete = false;  // Run full range finding to establish encoder coordinates
+          rangeFindingComplete = true;  // Using fixed bounds, no need to find range
           sensorCalibrated = false;
-
+          dynamicCalibrationActive = false;
+          
           currentState = CALIBRATE;
           errorIntegral = 0;
+          lastError = 0;
           lastPrintTime = 0;
+          moveStartTime = 0;
+          targetReached = false;
+          stuckCounter = 0;
+          positionRetryCount = 0;
+          fineAdjustmentActive = false;
+          
+          // Reset target tracking
+          activeTargetIndex = -1;
+          previousTargetIndex = -1;
+          WAIT_POS = true;
+          previousZombieDistance = 1.0;
+          
+          // Reset all sensor hit detection
+          for (int i = 0; i < 4; i++) {
+            ProxSensors[i].hitDetected = false;
+            ProxSensors[i].hitTime = 0;
+          }
+          
+          targetHitTime = 0;
 
-          Serial.println(F("✓ HOMING COMPLETE"));
-          Serial.println(F("Next: Finding encoder range...\n"));
+          Serial.println(F("✓ HOMING COMPLETE - Encoder zeroed"));
+          Serial.print(F("Encoder position: "));
+          Serial.println(encoder.read());
+          Serial.println(F("Next: Sensor calibration...\n"));
         } else {
           Serial.println(F("✗ Homing failed\n"));
         }
