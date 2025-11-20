@@ -1572,10 +1572,6 @@ void processCommand() {
       Serial.println(F("All saved"));
       break;
 
-    case 'T':
-      enterTuningMode();
-      break;
-
     default:
       break;
   }
