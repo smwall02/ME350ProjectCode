@@ -898,32 +898,99 @@ void runMotionControl() {
     }
   }
   
-  if (abs(error) > 500 && !adaptiveLearning && !adaptiveLearned) {
+  // IMPROVED: Adaptive friction learning - learns direction-specific friction
+  // Start learning when error is significant but not too large (better for accuracy)
+  if (abs(error) > 100 && abs(error) < 800 && !adaptiveLearning && !adaptiveLearned) {
     adaptiveLearning = true;
-    adaptiveFrictionVoltage = 3.0;
+    adaptiveFrictionVoltage = 1.5;  // Start lower for faster learning
     lastAdaptivePosition = currentPosition;
     adaptiveStartTime = millis();
+    
+    // Determine direction for learning
+    bool movingRight = (error < 0);
+    Serial.print(F("🔍 Learning friction ("));
+    Serial.print(movingRight ? F("RIGHT") : F("LEFT"));
+    Serial.println(F(")..."));
   }
   
   if (adaptiveLearning) {
-    if (abs(currentPosition - lastAdaptivePosition) > 10) {
+    // Check if movement occurred (more sensitive detection)
+    long positionChange = abs(currentPosition - lastAdaptivePosition);
+    unsigned long elapsed = millis() - adaptiveStartTime;
+    
+    // Movement detected - friction learned!
+    if (positionChange >= 5) {  // More sensitive: 5 counts instead of 10
+      bool movingRight = (error < 0);
+      
+      // Store learned friction in appropriate direction variable
+      if (movingRight) {
+        adaptiveFrictionLeft = adaptiveFrictionVoltage;  // Moving right = need left friction
+        FRICTION_LEFT = adaptiveFrictionVoltage;
+      } else {
+        adaptiveFrictionRight = adaptiveFrictionVoltage;  // Moving left = need right friction
+        FRICTION_RIGHT = adaptiveFrictionVoltage;
+      }
+      
       Serial.print(F("  ✓ Learned friction: "));
       Serial.print(adaptiveFrictionVoltage, 2);
-      Serial.println(F("V"));
+      Serial.print(F("V ("));
+      Serial.print(movingRight ? F("LEFT") : F("RIGHT"));
+      Serial.println(F(")"));
+      
       adaptiveLearning = false;
       adaptiveLearned = true;
-    } else if (millis() - adaptiveStartTime > 200) {
-      adaptiveFrictionVoltage += 0.5;
-      adaptiveStartTime = millis();
-      lastAdaptivePosition = currentPosition;
       
-      if (adaptiveFrictionVoltage > 5.5) {
+      // Apply learned friction immediately
+      float voltage = (error < 0) ? -adaptiveFrictionVoltage : adaptiveFrictionVoltage;
+      setMotor(voltage);
+      return;
+    }
+    
+    // No movement yet - increase voltage and try again
+    // Use faster increments: 0.3V every 150ms (was 0.5V every 200ms)
+    if (elapsed >= 150) {
+      adaptiveFrictionVoltage += 0.3;
+      adaptiveStartTime = millis();
+      lastAdaptivePosition = currentPosition;  // Reset position check
+      
+      // Safety limit - if we exceed reasonable friction, use conservative value
+      if (adaptiveFrictionVoltage > 4.5) {
+        Serial.println(F("  ⚠️  Max friction reached, using 2.5V"));
+        adaptiveFrictionVoltage = 2.5;
         adaptiveLearning = false;
         adaptiveLearned = true;
-        adaptiveFrictionVoltage = 3.5;
+        
+        // Store conservative value
+        bool movingRight = (error < 0);
+        if (movingRight) {
+          adaptiveFrictionLeft = 2.5;
+          FRICTION_LEFT = 2.5;
+        } else {
+          adaptiveFrictionRight = 2.5;
+          FRICTION_RIGHT = 2.5;
+        }
       }
     }
     
+    // Timeout protection - if no movement after 2 seconds, give up
+    if (elapsed > 2000) {
+      Serial.println(F("  ⚠️  Friction learning timeout"));
+      adaptiveLearning = false;
+      adaptiveLearned = true;
+      adaptiveFrictionVoltage = 2.0;  // Use conservative default
+      
+      // Store default value
+      bool movingRight = (error < 0);
+      if (movingRight) {
+        adaptiveFrictionLeft = 2.0;
+        FRICTION_LEFT = 2.0;
+      } else {
+        adaptiveFrictionRight = 2.0;
+        FRICTION_RIGHT = 2.0;
+      }
+    }
+    
+    // Apply test voltage
     float voltage = (error < 0) ? -adaptiveFrictionVoltage : adaptiveFrictionVoltage;
     setMotor(voltage);
     return;
@@ -1553,12 +1620,13 @@ void processCommand() {
     
     case 'R':
       adaptiveFrictionVoltage = 0;
+      adaptiveLearning = false;
       adaptiveLearned = false;
       rangeFindingComplete = false;
       sensorCalibrated = false;
       adaptiveFrictionLeft = FRICTION_LEFT;
       adaptiveFrictionRight = FRICTION_RIGHT;
-      Serial.println(F("Reset"));
+      Serial.println(F("Reset - friction learning will restart on next movement"));
       break;
 
     case 'L':
