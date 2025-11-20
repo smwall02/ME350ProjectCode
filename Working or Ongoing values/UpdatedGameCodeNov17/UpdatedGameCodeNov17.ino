@@ -463,7 +463,8 @@ bool findEncoderRange() {
       if (stuckTime > 2000) {
         stopMotor();
         Serial.println(F("⚠️  Movement stopped, assuming limit reached"));
-        UPPER_BOUND = encoder.read() + 20;
+        // Since encoder values are negative when moving right, subtract 20 to get more negative (further right)
+        UPPER_BOUND = encoder.read() - 20;
         
         if (homeToLeftLimit()) {
           return true;
@@ -670,7 +671,8 @@ void runStateMachine() {
       long error = desiredPosition - currentPos;
       
       // Safety check - approaching right limit
-      if (currentPos < UPPER_BOUND - 50) {
+      // UPPER_BOUND is negative (e.g., -1400), so we check if currentPos <= UPPER_BOUND + 50
+      if (currentPos <= UPPER_BOUND + 50) {
         Serial.println(F("⚠️  Approaching right limit, returning to safe zone"));
         currentState = CHOOSE_ACTIVE_TARGET;
         break;
