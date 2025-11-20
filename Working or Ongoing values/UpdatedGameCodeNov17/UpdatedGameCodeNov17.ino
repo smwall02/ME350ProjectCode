@@ -165,6 +165,12 @@ const int TARGET_BAND = 2;  // Position tolerance: +/- 2 counts
 const float MAX_INTEGRAL = 1200.0;
 const unsigned long CONTROL_PERIOD = 10;
 
+// Rightward drift compensation (accounts for momentum when moving right)
+// When moving right (toward more negative positions), the system overshoots by 1-3 counts
+// due to momentum. This offset adjusts the effective target slightly left during control,
+// while arrival detection still uses the original target position.
+const int RIGHTWARD_DRIFT_OFFSET = 2;  // Compensate for 2-count overshoot to the right
+
 // ============================================
 // MOTION CONTROL STATE
 // ============================================
@@ -766,7 +772,17 @@ void runStateMachine() {
 // ============================================
 void runMotionControl() {
   long currentPosition = encoder.read();
-  float error = desiredPosition - currentPosition;
+  
+  // Apply rightward drift compensation: if moving right (toward more negative),
+  // adjust target slightly left to compensate for momentum overshoot
+  long adjustedDesiredPosition = desiredPosition;
+  if (currentPosition > desiredPosition) {
+    // Moving right (current is less negative than target)
+    // Adjust target left by drift offset to compensate for overshoot
+    adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+  }
+  
+  float error = adjustedDesiredPosition - currentPosition;
   
   if (currentState == MOVE_TO_TARGET && autoMode) {
     // Check for left-side drift (position should never be > 50)
@@ -779,6 +795,7 @@ void runMotionControl() {
   
   if (dynamicCalibrationActive) {
     desiredPosition = LOWER_BOUND;
+    adjustedDesiredPosition = LOWER_BOUND;
     error = desiredPosition - currentPosition;
     
     if (abs(error) > 10) {
@@ -790,7 +807,9 @@ void runMotionControl() {
     return;
   }
   
-  if (abs(error) <= TARGET_BAND) {
+  // Check against original target position for arrival (not adjusted one)
+  float originalError = desiredPosition - currentPosition;
+  if (abs(originalError) <= TARGET_BAND) {
     stopMotor();
     errorIntegral = 0;
     adaptiveLearning = false;
@@ -810,12 +829,13 @@ void runMotionControl() {
   targetReached = false;
 
   // Retry logic: if stuck outside target band for too long, retry once
-  if (abs(error) > RETRY_ERROR_THRESHOLD && abs(error) < 50) {
+  // Use original error for retry detection (not adjusted)
+  if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
     // Check if we've been stuck at this error for 500ms
     if (millis() - moveStartTime > 500 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
       Serial.print(F("⚠️  Stuck at error = "));
-      Serial.print(abs(error));
+      Serial.print(abs(originalError));
       Serial.println(F(", retrying..."));
 
       // Reset for retry
@@ -939,8 +959,9 @@ void runMotionControl() {
   }
 
   // Stuck detection: if outside target band but not moving, apply minimum voltage
+  // Use original error for stuck detection (not adjusted)
   unsigned long currentTime = millis();
-  if (abs(error) > TARGET_BAND) {
+  if (abs(originalError) > TARGET_BAND) {
     // Check if stuck (position hasn't changed in 300ms)
     if (currentTime - lastStuckCheckTime >= 300) {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
