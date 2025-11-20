@@ -100,13 +100,19 @@ int dynamicMax[4];
 // ============================================
 struct ProximitySensor {
   float currVal;
-  float prevVal;
+  float prevVal;  // Used for direction detection
+  float prevValForVelocity;  // NEW: Previous value for velocity calculation
   unsigned long prevChangeTime;
+  unsigned long lastVelocityUpdate;  // NEW: Separate timestamp for velocity calculation
   int pin;
   int direction;
-  int prevDirection;  // NEW: Track previous direction
+  int prevDirection;  // Track previous direction
   int forwardCount;
   int backwardCount;
+  float velocity;  // NEW: Rate of change (sensor value change per second)
+  float prevVelocity;  // NEW: Previous velocity for detecting reversals
+  bool hitDetected;  // NEW: Flag for confirmed hit
+  unsigned long hitTime;  // NEW: Time when hit was detected
 };
 
 ProximitySensor ProxSensors[4];
@@ -266,11 +272,17 @@ void setup() {
   for (int i = 0; i < 4; i++) {
     ProxSensors[i].currVal = analogRead(ProxSensors[i].pin);
     ProxSensors[i].prevVal = ProxSensors[i].currVal;
+    ProxSensors[i].prevValForVelocity = ProxSensors[i].currVal;
     ProxSensors[i].prevChangeTime = millis();
+    ProxSensors[i].lastVelocityUpdate = millis();
     ProxSensors[i].direction = STOPPED;
     ProxSensors[i].prevDirection = STOPPED;
     ProxSensors[i].forwardCount = 0;
     ProxSensors[i].backwardCount = 0;
+    ProxSensors[i].velocity = 0.0;
+    ProxSensors[i].prevVelocity = 0.0;
+    ProxSensors[i].hitDetected = false;
+    ProxSensors[i].hitTime = 0;
   }
   
   stopMotor();
@@ -333,12 +345,30 @@ void loop() {
 // SENSOR UPDATE
 // ============================================
 void updateAllSensors() {
+  unsigned long currentTime = millis();
+  
   for (int i = 0; i < 4; i++) {
-    // Store previous direction
+    // Store previous state
     ProxSensors[i].prevDirection = ProxSensors[i].direction;
+    ProxSensors[i].prevVelocity = ProxSensors[i].velocity;
 
+    // Read and filter sensor value
+    float rawReading = analogRead(ProxSensors[i].pin);
     ProxSensors[i].currVal = alpha * ProxSensors[i].currVal +
-                             (1.0 - alpha) * analogRead(ProxSensors[i].pin);
+                             (1.0 - alpha) * rawReading;
+
+    // Calculate velocity (rate of change of sensor value)
+    // Negative velocity = approaching (sensor value decreasing)
+    // Positive velocity = retreating (sensor value increasing)
+    unsigned long timeDelta = currentTime - ProxSensors[i].lastVelocityUpdate;
+    if (timeDelta > 0) {
+      float valueDelta = ProxSensors[i].currVal - ProxSensors[i].prevValForVelocity;
+      ProxSensors[i].velocity = (valueDelta * 1000.0) / timeDelta;  // Change per second
+      ProxSensors[i].lastVelocityUpdate = currentTime;
+      ProxSensors[i].prevValForVelocity = ProxSensors[i].currVal;  // Update for next iteration
+    } else {
+      ProxSensors[i].velocity = 0.0;
+    }
 
     if (ProxSensors[i].currVal >= noiseThreshold) {
       noiseLimit = upperNoiseLimit;
@@ -346,31 +376,68 @@ void updateAllSensors() {
       noiseLimit = lowerNoiseLimit;
     }
 
+    // Direction detection based on filtered value change
     if (abs(ProxSensors[i].currVal - ProxSensors[i].prevVal) < noiseLimit) {
-      if (millis() - ProxSensors[i].prevChangeTime >= stopTimeout) {
+      if (timeDelta >= stopTimeout) {
         ProxSensors[i].direction = STOPPED;
       }
       ProxSensors[i].forwardCount = 0;
       ProxSensors[i].backwardCount = 0;
 
     } else if (ProxSensors[i].currVal - ProxSensors[i].prevVal < 0) {
+      // Sensor value decreasing = zombie approaching
       ProxSensors[i].forwardCount++;
       ProxSensors[i].backwardCount = 0;
 
       if (ProxSensors[i].forwardCount > 3) {
         ProxSensors[i].direction = FORWARD;
         ProxSensors[i].prevVal = ProxSensors[i].currVal;
-        ProxSensors[i].prevChangeTime = millis();
+        ProxSensors[i].prevChangeTime = currentTime;
+        // Reset hit detection when zombie starts moving forward again
+        if (ProxSensors[i].hitDetected) {
+          ProxSensors[i].hitDetected = false;
+          ProxSensors[i].hitTime = 0;
+        }
       }
 
     } else {
+      // Sensor value increasing = zombie retreating
       ProxSensors[i].backwardCount++;
       ProxSensors[i].forwardCount = 0;
 
       if (ProxSensors[i].backwardCount > 3) {
         ProxSensors[i].direction = BACKWARD;
         ProxSensors[i].prevVal = ProxSensors[i].currVal;
-        ProxSensors[i].prevChangeTime = millis();
+        ProxSensors[i].prevChangeTime = currentTime;
+      }
+    }
+
+    // IMPROVED HIT DETECTION: Detect velocity reversal
+    // When velocity switches from negative (approaching) to positive (retreating),
+    // that indicates the zombie hit the target and bounced back
+    const float VELOCITY_THRESHOLD = 5.0;  // Minimum velocity change to detect hit
+    const float HIT_VELOCITY_THRESHOLD = 10.0;  // Minimum retreat velocity to confirm hit
+    
+    if (!ProxSensors[i].hitDetected) {
+      // Check for velocity reversal: was approaching (negative vel) and now retreating (positive vel)
+      bool wasApproaching = (ProxSensors[i].prevVelocity < -VELOCITY_THRESHOLD);
+      bool nowRetreating = (ProxSensors[i].velocity > HIT_VELOCITY_THRESHOLD);
+      
+      // Also check direction change as backup
+      bool directionReversed = (ProxSensors[i].prevDirection == FORWARD && 
+                                 ProxSensors[i].direction == BACKWARD);
+      
+      if ((wasApproaching && nowRetreating) || directionReversed) {
+        ProxSensors[i].hitDetected = true;
+        ProxSensors[i].hitTime = currentTime;
+      }
+    } else {
+      // If already detected hit, check if zombie has moved far enough away to reset
+      if (ProxSensors[i].direction == FORWARD && 
+          ProxSensors[i].velocity < -VELOCITY_THRESHOLD) {
+        // Zombie is approaching again, reset hit detection
+        ProxSensors[i].hitDetected = false;
+        ProxSensors[i].hitTime = 0;
       }
     }
 
@@ -682,12 +749,29 @@ void runStateMachine() {
         break;
       }
       
-      // IMPROVED: Check if target zombie changed direction or stopped
+      // IMPROVED: Velocity-based hit detection
       if (activeTargetIndex >= 0 && !WAIT_POS) {
         int targetDirection = ProxSensors[activeTargetIndex].direction;
-        int prevDirection = ProxSensors[activeTargetIndex].prevDirection;
+        bool hitDetected = ProxSensors[activeTargetIndex].hitDetected;
+        unsigned long hitTime = ProxSensors[activeTargetIndex].hitTime;
         
-        // If zombie was FORWARD and now is BACKWARD or STOPPED, we hit it!
+        // PRIMARY: Use velocity-based hit detection (most reliable)
+        // When velocity switches from negative (approaching) to positive (retreating),
+        // that means the light hit the sensor and the target bounced back
+        if (hitDetected && hitTime > 0) {
+          // Confirm the hit for MIN_HIT_TIME to avoid false positives
+          if (millis() - hitTime >= MIN_HIT_TIME) {
+            Serial.println(F("✓ Target HIT! Velocity reversal detected (light hit sensor), choosing next"));
+            // Reset hit detection for this sensor
+            ProxSensors[activeTargetIndex].hitDetected = false;
+            ProxSensors[activeTargetIndex].hitTime = 0;
+            currentState = CHOOSE_ACTIVE_TARGET;
+            break;
+          }
+        }
+        
+        // BACKUP: Check direction change (for cases where velocity detection might miss)
+        int prevDirection = ProxSensors[activeTargetIndex].prevDirection;
         if (prevDirection == FORWARD && 
             (targetDirection == BACKWARD || targetDirection == STOPPED)) {
           
@@ -697,7 +781,8 @@ void runStateMachine() {
           
           // Confirm the hit for MIN_HIT_TIME before switching
           if (millis() - targetHitTime >= MIN_HIT_TIME) {
-            Serial.println(F("✓ Target HIT! Zombie moving backward/stopped, choosing next"));
+            Serial.println(F("✓ Target HIT! Direction reversed (backup detection), choosing next"));
+            targetHitTime = 0;
             currentState = CHOOSE_ACTIVE_TARGET;
             break;
           }
@@ -753,12 +838,25 @@ void runStateMachine() {
           }
           // Otherwise stay put at wait position
         } else if (millis() - arrivalTime > targetActivateTime) {
-          // Check if targeted zombie is moving backward before leaving
-          if (activeTargetIndex >= 0 && ProxSensors[activeTargetIndex].direction == BACKWARD) {
-            Serial.println(F("✓ Target retreating, choosing next"));
-            currentState = CHOOSE_ACTIVE_TARGET;
+          // Check if targeted zombie was hit (velocity reversal) or is retreating
+          if (activeTargetIndex >= 0) {
+            bool hitDetected = ProxSensors[activeTargetIndex].hitDetected;
+            unsigned long hitTime = ProxSensors[activeTargetIndex].hitTime;
+            
+            // Primary: Check for velocity-based hit detection
+            if (hitDetected && hitTime > 0 && millis() - hitTime >= MIN_HIT_TIME) {
+              Serial.println(F("✓ Target HIT at position (velocity reversal), choosing next"));
+              ProxSensors[activeTargetIndex].hitDetected = false;
+              ProxSensors[activeTargetIndex].hitTime = 0;
+              currentState = CHOOSE_ACTIVE_TARGET;
+            }
+            // Backup: Check if zombie is moving backward
+            else if (ProxSensors[activeTargetIndex].direction == BACKWARD) {
+              Serial.println(F("✓ Target retreating, choosing next"));
+              currentState = CHOOSE_ACTIVE_TARGET;
+            }
+            // Otherwise stay at target position until zombie starts retreating
           }
-          // Otherwise stay at target position until zombie starts retreating
         }
       } else {
         arrivalTime = millis();
