@@ -127,11 +127,18 @@ int noiseLimit = 8;
 
 // Target selection
 int activeTargetIndex = -1;
-int previousTargetIndex = -1;  // NEW: Track previous target
+int previousTargetIndex = -1;  // Track previous target
 long activeTargetPosition = WAIT_POSITION;
 float closestZombieDist = 2.0;
 float zombieDistances[4];
 bool WAIT_POS = true;
+
+// Fine positioning adjustment
+long previousMoveStartPosition = 0;  // Position before last move
+bool fineAdjustmentActive = false;   // Flag for fine adjustment mode
+long fineAdjustmentTarget = 0;       // Fine-tuned target position
+const int FINE_ADJUSTMENT_AMOUNT = 2;  // 1-2 counts adjustment
+float previousZombieDistance = 1.0;  // Track previous distance to detect if getting closer
 
 // ============================================
 // FRICTION COMPENSATION (Improved)
@@ -693,6 +700,9 @@ void runStateMachine() {
       activeTargetIndex = -1;
       closestZombieDist = 2.0;
 
+      // Track previous move start position for fine adjustment logic
+      previousMoveStartPosition = encoder.read();
+
       // Zombie distances are now updated continuously in updateAllSensors()
       for (int i = 0; i < 4; i++) {
         // IMPROVED: Only target zombies moving FORWARD
@@ -707,6 +717,8 @@ void runStateMachine() {
       if (activeTargetIndex >= 0) {
         activeTargetPosition = targetPositions[activeTargetIndex];
         WAIT_POS = false;
+        fineAdjustmentActive = false;  // Reset fine adjustment
+        previousZombieDistance = zombieDistances[activeTargetIndex];  // Initialize distance tracking
         
         int percentToPhoto = (int)((1.0 - zombieDistances[activeTargetIndex]) * 100);
         
@@ -724,6 +736,7 @@ void runStateMachine() {
       } else {
         activeTargetPosition = WAIT_POSITION;
         WAIT_POS = true;
+        fineAdjustmentActive = false;
         Serial.println(F("No active FORWARD targets, moving to wait position"));
       }
       
@@ -737,7 +750,12 @@ void runStateMachine() {
       break;
     
     case MOVE_TO_TARGET:
-      desiredPosition = activeTargetPosition;
+      // Use fine adjustment target if active, otherwise use original target
+      if (fineAdjustmentActive) {
+        desiredPosition = fineAdjustmentTarget;
+      } else {
+        desiredPosition = activeTargetPosition;
+      }
       
       long currentPos = encoder.read();
       long error = desiredPosition - currentPos;
@@ -828,8 +846,12 @@ void runStateMachine() {
         break;
       }
 
-      // Standard arrival check
-      if (abs(error) <= TARGET_BAND) {
+      // Check arrival against current desired position (may be fine-adjusted)
+      long errorToCurrentTarget = desiredPosition - currentPos;
+      // Also check against original target for fine adjustment logic
+      long errorToOriginalTarget = activeTargetPosition - currentPos;
+      
+      if (abs(errorToCurrentTarget) <= TARGET_BAND) {
         if (WAIT_POS) {
           // At wait position - only reconsider if there's a new forward target
           if (hasForwardZombie) {
@@ -855,11 +877,54 @@ void runStateMachine() {
               Serial.println(F("✓ Target retreating, choosing next"));
               currentState = CHOOSE_ACTIVE_TARGET;
             }
+            // FINE POSITIONING: If zombie still approaching and at original target, make small adjustment
+            else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
+                     !fineAdjustmentActive &&
+                     abs(errorToOriginalTarget) <= TARGET_BAND &&  // At original target position
+                     zombieDistances[activeTargetIndex] < 0.20 &&  // Close and still approaching
+                     zombieDistances[activeTargetIndex] < previousZombieDistance) {  // Getting closer
+              
+              // Determine adjustment direction based on previous move
+              // If moved RIGHT (previous position > target), likely overshot right, adjust LEFT
+              // If moved LEFT (previous position < target), likely undershot, adjust RIGHT
+              bool movedRight = (previousMoveStartPosition > activeTargetPosition);
+              
+              if (movedRight) {
+                // Moved right, likely overshot, adjust left (toward less negative)
+                fineAdjustmentTarget = activeTargetPosition + FINE_ADJUSTMENT_AMOUNT;
+                Serial.print(F("🔧 Fine adjust LEFT (+"));
+                Serial.print(FINE_ADJUSTMENT_AMOUNT);
+                Serial.print(F(") - zombie at "));
+                Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
+                Serial.println(F("% getting closer"));
+              } else {
+                // Moved left, likely undershot, adjust right (toward more negative)
+                fineAdjustmentTarget = activeTargetPosition - FINE_ADJUSTMENT_AMOUNT;
+                Serial.print(F("🔧 Fine adjust RIGHT (-"));
+                Serial.print(FINE_ADJUSTMENT_AMOUNT);
+                Serial.print(F(") - zombie at "));
+                Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
+                Serial.println(F("% getting closer"));
+              }
+              
+              fineAdjustmentActive = true;
+              desiredPosition = fineAdjustmentTarget;
+              arrivalTime = millis();  // Reset arrival time for fine adjustment
+            }
+            
+            // Update previous zombie distance for next iteration
+            if (activeTargetIndex >= 0) {
+              previousZombieDistance = zombieDistances[activeTargetIndex];
+            }
             // Otherwise stay at target position until zombie starts retreating
           }
         }
       } else {
         arrivalTime = millis();
+        // Reset fine adjustment if we've moved away from target significantly
+        if (fineAdjustmentActive && abs(errorToCurrentTarget) > TARGET_BAND * 2) {
+          fineAdjustmentActive = false;
+        }
       }
       break;
   }
@@ -1031,22 +1096,21 @@ void runMotionControl() {
   // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF;
 
-  // Voltage capping based on error magnitude (prevents overshoot)
-  // DRASTICALLY reduced - was overshooting by a whole lane
+  // Voltage capping based on error magnitude (increased for faster movement)
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 3.0;  // Very conservative for long moves
+    voltageLimit = 4.5;  // Increased from 3.0 for faster long moves
   } else if (absErr > 500) {
-    voltageLimit = 2.7;  // Conservative
+    voltageLimit = 4.0;  // Increased from 2.7
   } else if (absErr > 300) {
-    voltageLimit = 2.5;  // Conservative
+    voltageLimit = 3.5;  // Increased from 2.5
   } else if (absErr > 100) {
-    voltageLimit = 2.2;  // Conservative
+    voltageLimit = 3.0;  // Increased from 2.2
   } else if (absErr > 50) {
-    voltageLimit = 2.0;  // Very gentle approach
+    voltageLimit = 2.5;  // Increased from 2.0
   } else {
-    voltageLimit = 1.8;  // Very gentle final approach
+    voltageLimit = 2.2;  // Increased from 1.8 for final approach
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
