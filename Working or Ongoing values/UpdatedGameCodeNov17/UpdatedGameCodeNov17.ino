@@ -1309,9 +1309,9 @@ void runMotionControl() {
 
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
-  // Special case: If at a limit switch and trying to move away, ensure we can move
-  bool atLeftLimit = leftPressed() && currentPosition <= 5;
-  bool atRightLimit = rightPressed() && currentPosition >= (UPPER_BOUND - 5);
+  // Special case: If at or near a limit switch and trying to move away, ensure we can move
+  bool atLeftLimit = leftPressed() && currentPosition <= 10;  // Expanded from 5 to 10
+  bool atRightLimit = rightPressed() && currentPosition >= (UPPER_BOUND - 10);  // Expanded from 5 to 10
   bool tryingToMoveAwayFromLeft = atLeftLimit && originalError < 0;  // Want to move right (negative)
   bool tryingToMoveAwayFromRight = atRightLimit && originalError > 0;  // Want to move left (positive)
   
@@ -1323,6 +1323,17 @@ void runMotionControl() {
     }
     // Reset voltage rate limiter to allow immediate movement away from limit
     // (This will be handled by the rate limiter code checking moveStartTime)
+  }
+  
+  // Additional check: If motor is stopped and we have a large error, ensure minimum voltage
+  // This helps when starting from rest or after being stuck
+  if (abs(motorVelocity) < 5 && abs(originalError) > 50 && abs(totalVoltage) < 2.0) {
+    // Motor is essentially stopped but we have a significant error - force minimum voltage
+    float startupVoltage = 2.0;  // Minimum to start movement
+    if (abs(originalError) > 200) {
+      startupVoltage = 2.5;  // Higher for very large errors
+    }
+    totalVoltage = (originalError < 0) ? -startupVoltage : startupVoltage;
   }
 
   // Progressive voltage limiting for smoother deceleration
@@ -1489,7 +1500,12 @@ void runMotionControl() {
   if (abs(originalError) > TARGET_BAND && !voltageRamping) {
     bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
     float baseFrictionVoltage = inLeftHalf ? adaptiveFrictionLeft : adaptiveFrictionRight;
-    float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);
+    // Increase minimum friction voltage to ensure movement, especially for large errors
+    float minFrictionVoltage = max(baseFrictionVoltage, 2.0f);  // Increased from 1.5V
+    // For large errors, use even higher minimum to ensure movement starts
+    if (abs(originalError) > 100) {
+      minFrictionVoltage = max(minFrictionVoltage, 2.5f);  // Higher minimum for large movements
+    }
     if (abs(totalVoltage) < minFrictionVoltage) {
       float pidMagnitude = abs(totalVoltage);
       float finalVoltage = max(pidMagnitude, minFrictionVoltage);
@@ -1510,8 +1526,12 @@ void runMotionControl() {
   
   // Calculate maximum allowed change
   float maxChange = MAX_VOLTAGE_RATE;
-  // Reduce rate limit when close to target for smoother approach
-  if (absError < 30) {
+  
+  // Allow faster startup when starting from rest (lastAppliedVoltage is near zero)
+  // This ensures we can quickly reach minimum friction voltage
+  if (abs(lastAppliedVoltage) < 0.5 && abs(originalError) > 50) {
+    maxChange = 1.2;  // Much faster when starting from rest with large error
+  } else if (absError < 30) {
     maxChange = 0.3;  // Slower changes near target (reduced from 0.4)
   } else if (absError < 100) {
     maxChange = 0.45;  // Medium rate limit (reduced from 0.6)
