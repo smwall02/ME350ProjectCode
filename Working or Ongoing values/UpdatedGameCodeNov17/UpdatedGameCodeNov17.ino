@@ -706,6 +706,17 @@ void runStateMachine() {
           targetHitTime = 0;  // Reset if not consistently backward
         }
         
+        // IMPROVED: Switch immediately when zombie velocity changes (stops approaching or starts retreating)
+        // This responds faster to velocity changes as requested
+        int prevDirection = ProxSensors[activeTargetIndex].prevDirection;
+        if (prevDirection == FORWARD && 
+            (targetDirection == BACKWARD || targetDirection == STOPPED)) {
+          // Zombie was approaching but now retreating or stopped - switch immediately
+          Serial.println(F("✓ Target velocity changed (stopped approaching), choosing next"));
+          currentState = CHOOSE_ACTIVE_TARGET;
+          break;
+        }
+        
         // IMPROVED: Switch if zombie retreated far away (no longer a threat)
         // distance > 0.80 means percentage < 20% (far from photo sensor)
         if (targetDirection == BACKWARD &&
@@ -965,9 +976,10 @@ void runMotionControl() {
 
   // Retry logic: if stuck outside target band for too long, retry once
   // Use original error for retry detection (not adjusted)
+  // Reduced threshold and delay for faster error correction
   if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
-    // Check if we've been stuck at this error for 500ms
-    if (millis() - moveStartTime > 500 && positionRetryCount < MAX_POSITION_RETRIES) {
+    // Check if we've been stuck at this error for 300ms (reduced from 500ms for faster response)
+    if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
       Serial.print(F("⚠️  Stuck at error = "));
       Serial.print(abs(originalError));
@@ -1093,7 +1105,18 @@ void runMotionControl() {
   // Adaptive friction learning (above) temporarily bypasses PID only during initial learning phase
   
   // Adaptive PID gains - increased for faster error correction
-  if (abs(error) > 300) {
+  // Higher gains for very large errors (lane-to-lane moves) to move faster
+  if (abs(error) > 1000) {
+    KP_active = KP * 3.5;  // Very aggressive for large lane-to-lane moves
+    KI_active = 0;
+    KD_active = KD * 0.8;  // Moderate damping for large moves
+    errorIntegral = 0;
+  } else if (abs(error) > 500) {
+    KP_active = KP * 3.0;  // Aggressive for large moves
+    KI_active = 0;
+    KD_active = KD * 0.75;  // Moderate damping
+    errorIntegral = 0;
+  } else if (abs(error) > 300) {
     KP_active = KP * 2.5;  // Increased for faster large error correction
     KI_active = 0;
     KD_active = KD * 0.7;  // Increased damping
@@ -1119,8 +1142,12 @@ void runMotionControl() {
   
   // VELOCITY-BASED MOMENTUM COMPENSATION: Reduce voltage when approaching target to prevent overshoot
   // When moving fast toward target, reduce voltage to allow deceleration
+  // DISABLED for large errors to allow faster movement between targets
   float momentumCompensation = 1.0;  // Multiplier for voltage reduction
-  if (abs(error) < 100 && abs(motorVelocity) > 50) {
+  if (abs(error) > 200) {
+    // Large errors - no momentum compensation to allow maximum speed
+    momentumCompensation = 1.0;
+  } else if (abs(error) < 100 && abs(motorVelocity) > 50) {
     // Close to target and moving fast - reduce voltage to prevent overshoot
     // Scale reduction based on velocity (faster = more reduction)
     float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);  // Normalize to 0-1
@@ -1174,23 +1201,57 @@ void runMotionControl() {
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
   // Voltage capping based on error magnitude - increased for faster error correction
-  float voltageLimit = 6.0;  // Maximum voltage cap (increased for faster movement)
+  // Higher limits for very large errors (lane-to-lane moves) to prevent slow movement
+  float voltageLimit = 7.5;  // Maximum voltage cap (increased for faster large moves)
   long absErr = abs(error);
-  if (absErr > 800) {
-    voltageLimit = 6.0;  // Increased for faster large error correction
+  if (absErr > 1000) {
+    voltageLimit = 7.5;  // Very large moves (lane 4 to lane 1) - maximum speed
+  } else if (absErr > 800) {
+    voltageLimit = 7.0;  // Large moves - high speed
   } else if (absErr > 500) {
-    voltageLimit = 5.5;  // Increased
+    voltageLimit = 6.5;  // Medium-large moves
   } else if (absErr > 300) {
-    voltageLimit = 5.0;  // Increased
+    voltageLimit = 6.0;  // Medium moves
   } else if (absErr > 100) {
-    voltageLimit = 4.5;  // Increased
+    voltageLimit = 5.0;  // Small-medium moves
   } else if (absErr > 50) {
-    voltageLimit = 4.0;  // Increased
+    voltageLimit = 4.5;  // Small moves
   } else {
-    voltageLimit = 3.5;  // Increased for faster final approach
+    voltageLimit = 3.5;  // Fine positioning
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
+
+  // IMPROVED: Limit switch protection - slow down before hitting limits to prevent slamming
+  // This prevents the system from slamming into end stops when making large moves (lane 4 to lane 1)
+  // Applied AFTER voltage calculation to properly limit speed near limits
+  if (currentState == MOVE_TO_TARGET && autoMode) {
+    // Slow down when approaching left limit (moving left, error > 0 means moving toward positive)
+    // Reduce voltage significantly when within 100 counts of left limit
+    if (error > 0 && currentPosition > -100) {
+      // Approaching left limit - reduce voltage to prevent slamming
+      float proximityFactor = (currentPosition + 100) / 100.0;  // 0 at -100, 1 at 0
+      proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+      float limitProtection = 0.3 + (proximityFactor * 0.4);  // Reduce to 30-70% of normal voltage
+      totalVoltage *= limitProtection;
+      if (currentPosition > 0) {
+        // Already past limit - stop immediately
+        stopMotor();
+        return;
+      }
+    }
+    
+    // Slow down when approaching right limit (moving right, error < 0 means moving toward more negative)
+    // Reduce voltage when within 100 counts of right limit
+    if (error < 0 && currentPosition < (UPPER_BOUND + 100)) {
+      // Approaching right limit - reduce voltage to prevent slamming
+      float distanceFromLimit = currentPosition - UPPER_BOUND;  // Negative value, becomes less negative as we approach
+      float proximityFactor = (distanceFromLimit + 100) / 100.0;  // 0 at limit, 1 at 100 counts away
+      proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+      float limitProtection = 0.3 + (proximityFactor * 0.4);  // Reduce to 30-70% of normal voltage
+      totalVoltage *= limitProtection;
+    }
+  }
 
   // Anti-windup on zero crossing
   if ((error != 0) && (error * lastError < 0)) {
@@ -1201,8 +1262,8 @@ void runMotionControl() {
   // Use original error for stuck detection (not adjusted)
   unsigned long currentTime = millis();
   if (abs(originalError) > TARGET_BAND) {
-    // Check if stuck (position hasn't changed in 200ms) - reduced for faster detection
-    if (currentTime - lastStuckCheckTime >= 200) {
+    // Check if stuck (position hasn't changed in 150ms) - reduced for faster detection
+    if (currentTime - lastStuckCheckTime >= 150) {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
         stuckCounter++;
         
