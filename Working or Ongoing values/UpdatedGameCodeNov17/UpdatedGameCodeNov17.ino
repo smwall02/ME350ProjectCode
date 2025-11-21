@@ -540,33 +540,35 @@ void findRange() {
       break;
       
     case RANGE_HOLD_RIGHT:
+      // Check if encoder position has stabilized (stopped changing)
+      if (abs(currentPos - rangeFindingLastPos) <= 1) {
+        rangeFindingStableTicks++;
+      } else {
+        rangeFindingStableTicks = 0;
+        rangeFindingLastPos = currentPos;
+      }
+      
+      // Wait for both time and stability before recording final position
       if (currentTime - rangeFindingHoldStart >= CALIBRATE_HOLD_TIME && rangeFindingStableTicks >= CALIBRATE_STABLE_TICKS) {
         stopMotor();
-        if (currentTime - rangeFindingHoldStart >= CALIBRATE_HOLD_TIME + 200) {
-          UPPER_BOUND = encoder.read();
-          RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;
-          Serial.print(F("Right: "));
-          Serial.print(UPPER_BOUND);
-          Serial.print(F(", Range: "));
-          Serial.println(abs(UPPER_BOUND - LOWER_BOUND));
-          if (abs(UPPER_BOUND - LOWER_BOUND) < 100) {
-            Serial.println(F("ERROR: Range too small. Check limit switches."));
-            rangeFindingActive = false;
-            rangeFindingState = RANGE_IDLE;
-            return;
-          }
-          rangeFindingComplete = true;
+        delay(200);  // Brief pause after stopping
+        // Record final position after encoder has stabilized
+        UPPER_BOUND = encoder.read();
+        RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;
+        Serial.print(F("Right: "));
+        Serial.print(UPPER_BOUND);
+        Serial.print(F(", Range: "));
+        Serial.println(abs(UPPER_BOUND - LOWER_BOUND));
+        if (abs(UPPER_BOUND - LOWER_BOUND) < 100) {
+          Serial.println(F("ERROR: Range too small. Check limit switches."));
           rangeFindingActive = false;
           rangeFindingState = RANGE_IDLE;
-          Serial.println(F("Range complete"));
+          return;
         }
-      } else {
-        if (abs(currentPos - rangeFindingLastPos) <= 1) {
-          rangeFindingStableTicks++;
-        } else {
-          rangeFindingStableTicks = 0;
-          rangeFindingLastPos = currentPos;
-        }
+        rangeFindingComplete = true;
+        rangeFindingActive = false;
+        rangeFindingState = RANGE_IDLE;
+        Serial.println(F("Range complete"));
       }
       break;
       
@@ -1329,40 +1331,80 @@ void stopMotor() {
 
 // LIMIT SWITCHES
 void checkLimitSwitches() {
-  if (digitalRead(LIMIT_LEFT) == HIGH && 
-      currentState != CALIBRATE && 
-      currentState != FIND_RANGE &&
-      !dynamicCalibrationActive &&
-      abs(motorVelocity) < 10) {
-    delay(50);
-    encoder.write(0);
-    delay(30);
-    if (encoder.read() != 0) {
-      encoder.write(0);
-      delay(30);
+  // Only reset encoder at left limit if we're trying to move toward it (positive error/voltage)
+  // or if we're in calibration/range finding states
+  if (digitalRead(LIMIT_LEFT) == HIGH) {
+    if (currentState == CALIBRATE || currentState == FIND_RANGE || dynamicCalibrationActive) {
+      // During calibration, allow reset
+      if (abs(motorVelocity) < 10) {
+        delay(50);
+        encoder.write(0);
+        delay(30);
+        if (encoder.read() != 0) {
+          encoder.write(0);
+          delay(30);
+        }
+        if (encoder.read() != 0) {
+          encoder.write(0);
+        }
+        errorIntegral = 0;
+        Serial.println(F("Recal at left"));
+      }
+    } else if (currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) {
+      // During normal operation, only reset if we're trying to move toward the limit
+      long currentPos = encoder.read();
+      long error = desiredPosition - currentPos;
+      // Only reset if error is positive (trying to move left/positive direction) and velocity is low
+      if (error > 0 && abs(motorVelocity) < 10) {
+        delay(50);
+        encoder.write(0);
+        delay(30);
+        if (encoder.read() != 0) {
+          encoder.write(0);
+          delay(30);
+        }
+        if (encoder.read() != 0) {
+          encoder.write(0);
+        }
+        errorIntegral = 0;
+        Serial.println(F("Recal at left"));
+      }
     }
-    if (encoder.read() != 0) {
-      encoder.write(0);
-    }
-    errorIntegral = 0;
-    Serial.println(F("Recal at left"));
   }
 
-  if (digitalRead(LIMIT_RIGHT) == HIGH && 
-      currentState != CALIBRATE && 
-      currentState != FIND_RANGE &&
-      !dynamicCalibrationActive &&
-      abs(motorVelocity) < 10) {
-    stopMotor();
-    long currentPos = encoder.read();
-    if (abs(currentPos - UPPER_BOUND) > 10) {
-      UPPER_BOUND = currentPos;
-      RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;
-      Serial.print(F("Right limit: "));
-      Serial.println(UPPER_BOUND);
+  // Right limit: only stop/reset if we're trying to move toward it (negative error/voltage)
+  if (digitalRead(LIMIT_RIGHT) == HIGH) {
+    if (currentState == CALIBRATE || currentState == FIND_RANGE || dynamicCalibrationActive) {
+      // During calibration, allow update
+      if (abs(motorVelocity) < 10) {
+        stopMotor();
+        long currentPos = encoder.read();
+        if (abs(currentPos - UPPER_BOUND) > 10) {
+          UPPER_BOUND = currentPos;
+          RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;
+          Serial.print(F("Right limit: "));
+          Serial.println(UPPER_BOUND);
+        }
+        errorIntegral = 0;
+        Serial.println(F("Right limit hit"));
+      }
+    } else if (currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) {
+      // During normal operation, only stop if we're trying to move toward the limit
+      long currentPos = encoder.read();
+      long error = desiredPosition - currentPos;
+      // Only stop if error is negative (trying to move right/negative direction) and velocity is low
+      if (error < 0 && abs(motorVelocity) < 10) {
+        stopMotor();
+        if (abs(currentPos - UPPER_BOUND) > 10) {
+          UPPER_BOUND = currentPos;
+          RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;
+          Serial.print(F("Right limit: "));
+          Serial.println(UPPER_BOUND);
+        }
+        errorIntegral = 0;
+        Serial.println(F("Right limit hit"));
+      }
     }
-    errorIntegral = 0;
-    Serial.println(F("Right limit hit"));
   }
 }
 
