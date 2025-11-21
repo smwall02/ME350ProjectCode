@@ -1034,6 +1034,20 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
+  // Debug: Log position and desired position periodically (every 2 seconds)
+  static unsigned long lastDebugTime = 0;
+  if (millis() - lastDebugTime > 2000 && !autoMode) {
+    Serial.print(F("Motion: pos="));
+    Serial.print(currentPosition);
+    Serial.print(F(" des="));
+    Serial.print(desiredPosition);
+    Serial.print(F(" err="));
+    Serial.print(desiredPosition - currentPosition);
+    Serial.print(F(" sysEn="));
+    Serial.println(systemEnabled ? 1 : 0);
+    lastDebugTime = millis();
+  }
+  
   // CRITICAL: If at left limit, encoder MUST be at 0
   // Only reset if we're actually at the limit AND encoder is not already at 0
   if (leftPressed()) {
@@ -1089,64 +1103,41 @@ void runMotionControl() {
   
   // CRITICAL SAFETY: If at left limit, only prevent leftward movement
   if (leftPressed()) {
-    // Calculate error to see which direction we're trying to move
-    float originalError = desiredPosition - currentPosition;
-    
-    // If trying to move left (positive error), stop and reset encoder
-    if (originalError > 0) {
-      stopMotor();
-      errorIntegral = 0;
-      if (abs(currentPosition) > 2) {
-        encoder.write(0);
-        delay(50);
-        previousMotorPosition = 0;
-        previousVelCompTime = micros();
-        motorVelocity = 0;
-      }
-      return;
-    }
-    
-    // If trying to move right (negative error), allow it but ensure encoder is at 0
+    // Ensure encoder is at 0 when at left limit
     if (abs(currentPosition) > 2) {
-      encoder.write(0);
-      delay(50);
-      previousMotorPosition = 0;
-      previousVelCompTime = micros();
-      motorVelocity = 0;
-      // Recalculate error after encoder reset
-      currentPosition = encoder.read();
-      adjustedDesiredPosition = desiredPosition;
-      if (currentPosition > desiredPosition) {
-        adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
-      }
-      error = adjustedDesiredPosition - currentPosition;
-    }
-  }
-  
-  // CRITICAL: Position validation - encoder should never be positive
-  // If at left limit, position must be 0 or very close
-  if (leftPressed()) {
-    if (currentPosition > 5) {
-      // Encoder drifted positive - force reset to 0
       encoder.write(0);
       delay(50);
       currentPosition = 0;
       previousMotorPosition = 0;
       previousVelCompTime = micros();
       motorVelocity = 0;
-      errorIntegral = 0;
-      // Recalculate error with corrected position
-      adjustedDesiredPosition = desiredPosition;
-      if (currentPosition > desiredPosition) {
-        adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
-      }
-      error = adjustedDesiredPosition - currentPosition;
+    } else {
+      currentPosition = 0;  // Force to 0 even if close
     }
+    
+    // Calculate error to see which direction we're trying to move
+    float originalError = desiredPosition - currentPosition;
+    
+    // If trying to move left (positive error) and in auto mode, stop
+    if (autoMode && originalError > 0) {
+      stopMotor();
+      errorIntegral = 0;
+      return;
+    }
+    
+    // If trying to move right (negative error), allow it - recalculate error
+    adjustedDesiredPosition = desiredPosition;
+    if (currentPosition > desiredPosition) {
+      adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+    }
+    error = adjustedDesiredPosition - currentPosition;
   }
   
-  // Safety: Never allow positive positions
-  if (currentPosition > 10) {
-    // Encoder has drifted significantly positive - reset to 0
+  // CRITICAL: Position validation - encoder should never be positive
+  // If at left limit, position must be 0 or very close (already handled above)
+  // Additional check for positive positions when not at left limit
+  if (!leftPressed() && currentPosition > 10) {
+    // Encoder drifted positive - force reset to 0
     encoder.write(0);
     delay(50);
     currentPosition = 0;
@@ -1161,6 +1152,8 @@ void runMotionControl() {
     }
     error = adjustedDesiredPosition - currentPosition;
   }
+  
+  // Safety: Never allow positive positions (already handled above if not at left limit)
   
   // Safety: Never allow positions beyond upper bound (too far right)
   // Add safety margin to prevent hitting right limit switch
@@ -1237,6 +1230,30 @@ void runMotionControl() {
   // (if at left limit, we already forced it to 0 above)
   if (!leftPressed()) {
     currentPosition = encoder.read();
+    
+    // Safety: If encoder shows a position way off (like -1024), correct it
+    // This can happen if encoder wasn't properly reset or is drifting
+    if (currentPosition < -2000 || (currentPosition > 100 && currentPosition < 1000)) {
+      // Encoder is way off - reset to a reasonable position based on desired position
+      // If desired position is reasonable, use it; otherwise use 0
+      if (desiredPosition >= UPPER_BOUND && desiredPosition <= 0) {
+        encoder.write((long)desiredPosition);
+        currentPosition = desiredPosition;
+        previousMotorPosition = currentPosition;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+        Serial.print(F("Enc corrected: "));
+        Serial.println(currentPosition);
+      } else {
+        // Desired position is also off - reset to 0
+        encoder.write(0);
+        currentPosition = 0;
+        previousMotorPosition = 0;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+        Serial.println(F("Enc reset to 0"));
+      }
+    }
   }
   
   // CRITICAL: Constrain desired position to safe bounds
@@ -1248,10 +1265,19 @@ void runMotionControl() {
     desiredPosition = SAFETY_MARGIN_LEFT;
   }
   
+  // Calculate original error BEFORE any further checks
   float originalError = desiredPosition - currentPosition;
   
+  // Recalculate adjusted error and error after position constraints
+  adjustedDesiredPosition = desiredPosition;
+  if (currentPosition > desiredPosition) {
+    adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+  }
+  error = adjustedDesiredPosition - currentPosition;
+  
   // CRITICAL: Prevent any movement when at limit switches (except during calibration/homing)
-  if (leftPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
+  // For manual mode (not auto), allow movement from limits
+  if (leftPressed() && autoMode && currentState != CALIBRATE && currentState != FIND_RANGE) {
     // At left limit - only allow rightward movement (negative error)
     if (originalError > 0) {
       // Trying to move left - stop immediately
@@ -1270,7 +1296,7 @@ void runMotionControl() {
     }
   }
   
-  if (rightPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
+  if (rightPressed() && autoMode && currentState != CALIBRATE && currentState != FIND_RANGE) {
     // At right limit - correct encoder position and only allow leftward movement
     long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
     if (currentPosition < safeRightLimit) {
@@ -1301,7 +1327,8 @@ void runMotionControl() {
   }
   
   // CRITICAL: Prevent leftward movement when at left limit (backup check)
-  if (leftPressed() && originalError > 0) {
+  // Only apply in auto mode - allow manual movement
+  if (leftPressed() && autoMode && originalError > 0) {
     // At left limit and trying to move left - stop immediately
     stopMotor();
     errorIntegral = 0;
@@ -1319,7 +1346,8 @@ void runMotionControl() {
   }
   
   // CRITICAL: Prevent rightward movement beyond safe limit
-  if (currentPosition <= UPPER_BOUND - SAFETY_MARGIN_RIGHT && originalError < 0) {
+  // Only apply in auto mode - allow manual movement
+  if (autoMode && currentPosition <= UPPER_BOUND - SAFETY_MARGIN_RIGHT && originalError < 0) {
     // Too close to right limit and trying to move further right - stop immediately
     stopMotor();
     errorIntegral = 0;
@@ -1626,18 +1654,40 @@ void runMotionControl() {
   }
 
   // Apply motor voltage - ensure we apply at least friction compensation if error is significant
-  if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
-    setMotor(totalVoltage);
-  } else if (abs(originalError) > TARGET_BAND) {
-    // If error is significant but voltage is low, apply at least friction compensation
-    // This helps overcome static friction for small movements
-    float minFrictionVoltage = (originalError < 0) ? -adaptiveFrictionLeft : adaptiveFrictionRight;
-    if (abs(minFrictionVoltage) > 0.5) {
-      setMotor(minFrictionVoltage);
+  // CRITICAL: Always apply voltage if there's a significant error, even if calculated voltage is small
+  if (abs(originalError) > TARGET_BAND) {
+    // There's a significant error - ensure we apply voltage
+    if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
+      setMotor(totalVoltage);
     } else {
-      stopMotor();
+      // Calculated voltage is too small - apply at least friction compensation + breakaway boost
+      float minFrictionVoltage = (originalError < 0) ? -adaptiveFrictionLeft : adaptiveFrictionRight;
+      // Add breakaway boost for static friction
+      float breakawayBoost = (originalError < 0) ? -BREAKAWAY_VOLTAGE_BOOST : BREAKAWAY_VOLTAGE_BOOST;
+      float appliedVoltage = minFrictionVoltage + breakawayBoost;
+      
+      // Ensure minimum voltage is applied (at least 3.0V to overcome static friction)
+      const float MIN_APPLIED_VOLTAGE = 3.0;
+      if (abs(appliedVoltage) < MIN_APPLIED_VOLTAGE) {
+        appliedVoltage = (originalError < 0) ? -MIN_APPLIED_VOLTAGE : MIN_APPLIED_VOLTAGE;
+      }
+      
+      // Debug output for manual mode
+      static unsigned long lastVoltageDebug = 0;
+      if (!autoMode && millis() - lastVoltageDebug > 1000) {
+        Serial.print(F("LowV: calc="));
+        Serial.print(totalVoltage, 2);
+        Serial.print(F(" app="));
+        Serial.print(appliedVoltage, 2);
+        Serial.print(F(" err="));
+        Serial.println(originalError);
+        lastVoltageDebug = millis();
+      }
+      
+      setMotor(appliedVoltage);
     }
   } else {
+    // Error is within target band - stop motor
     stopMotor();
   }
 
