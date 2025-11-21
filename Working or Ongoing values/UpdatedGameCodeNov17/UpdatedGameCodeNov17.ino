@@ -1609,15 +1609,17 @@ void checkLimitSwitches() {
         lastLeftLimitReset = currentTime;
         Serial.println(F("Recal at left"));
       }
-    } else if (currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) {
-      // During normal operation, only reset if we're trying to move toward the limit
+    } else if ((currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) && autoMode) {
+      // During normal operation in AUTO MODE ONLY, only reset if we're trying to move toward the limit
       long currentPos = encoder.read();
       long error = desiredPosition - currentPos;
-      // Only reset if error is positive (trying to move left/positive direction) 
-      // AND we're actually at or very close to the limit (position <= 5)
-      // AND velocity is low
-      // AND debounce time has passed
-      if (error > 0 && currentPos <= 5 && abs(motorVelocity) < 10 && 
+      // Only reset if:
+      // 1. Error is positive (trying to move left/positive direction) 
+      // 2. We're actually at or very close to the limit (position <= 5)
+      // 3. Velocity is low or negative (not actively moving away)
+      // 4. Debounce time has passed
+      // 5. We're in auto mode (not manual mode)
+      if (error > 0 && currentPos <= 5 && motorVelocity <= 5 && 
           (currentTime - lastLeftLimitReset) > LIMIT_RESET_DEBOUNCE) {
         delay(50);
         encoder.write(0);
@@ -1634,6 +1636,7 @@ void checkLimitSwitches() {
         Serial.println(F("Recal at left"));
       }
     }
+    // In manual mode, don't reset encoder automatically - let the user control it
   }
 
   // Right limit: only stop/reset if we're trying to move toward it (negative error/voltage)
@@ -1653,8 +1656,8 @@ void checkLimitSwitches() {
         lastRightLimitReset = currentTime;
         Serial.println(F("Right limit hit"));
       }
-    } else if (currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) {
-      // During normal operation, only stop if we're trying to move toward the limit
+    } else if ((currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) && autoMode) {
+      // During normal operation in AUTO MODE ONLY, only stop if we're trying to move toward the limit
       // AND we're actually very close to the real UPPER_BOUND (within 20 counts)
       // Do NOT update UPPER_BOUND during normal operation - it was set during range finding
       long currentPos = encoder.read();
@@ -1662,9 +1665,10 @@ void checkLimitSwitches() {
       // Only stop if:
       // 1. Error is negative (trying to move right/negative direction)
       // 2. We're actually very close to the real UPPER_BOUND (within 20 counts)
-      // 3. Velocity is low
+      // 3. Velocity is low or positive (not actively moving away from right limit)
       // 4. Debounce time has passed
-      if (error < 0 && currentPos <= (UPPER_BOUND + 20) && abs(motorVelocity) < 10 &&
+      // 5. We're in auto mode (not manual mode)
+      if (error < 0 && currentPos <= (UPPER_BOUND + 20) && motorVelocity >= -5 &&
           (currentTime - lastRightLimitReset) > LIMIT_RESET_DEBOUNCE) {
         stopMotor();
         errorIntegral = 0;
@@ -1672,6 +1676,7 @@ void checkLimitSwitches() {
         Serial.println(F("Right limit hit"));
       }
     }
+    // In manual mode, don't automatically stop at right limit - let the user control it
   }
 }
 
