@@ -90,8 +90,26 @@ int ProxRange[4][2] = {
 bool sensorCalibrated = false;
 bool dynamicCalibrationActive = false;
 bool rangeFindingComplete = false;
+bool rangeFindingActive = false;
 unsigned long calibrationStartTime = 0;
 const unsigned long DYNAMIC_CALIBRATION_TIME = 10000;
+
+// Range finding state variables
+enum RangeFindingState {
+  RANGE_IDLE,
+  RANGE_MOVE_TO_LEFT,
+  RANGE_HOLD_LEFT,
+  RANGE_MOVE_TO_RIGHT,
+  RANGE_HOLD_RIGHT
+};
+RangeFindingState rangeFindingState = RANGE_IDLE;
+unsigned long rangeFindingStartTime = 0;
+long rangeFindingLastPosition = 0;
+unsigned long rangeFindingLastMoveTime = 0;
+float rangeFindingDriveVoltage = 0;
+long rangeFindingLastPos = 0;
+int rangeFindingStableTicks = 0;
+unsigned long rangeFindingHoldStart = 0;
 
 int dynamicMin[4];
 int dynamicMax[4];
@@ -471,7 +489,189 @@ void updateVelocity() {
   }
 }
 
-// Range finding removed - using fixed bounds (0 to -1424)
+// ============================================
+// RANGE FINDING (Non-blocking state machine)
+// ============================================
+void findRange() {
+  if (!rangeFindingActive) {
+    // Initialize range finding
+    rangeFindingActive = true;
+    rangeFindingState = RANGE_MOVE_TO_LEFT;
+    rangeFindingStartTime = millis();
+    Serial.println(F("\n=== FINDING RANGE ==="));
+    Serial.println(F("Moving to left limit..."));
+    
+    long currentPos = encoder.read();
+    bool inLeftHalf = (currentPos > RANGE_MIDPOINT);
+    float frictionForPosition = inLeftHalf ? FRICTION_LEFT : FRICTION_RIGHT;
+    rangeFindingDriveVoltage = max(frictionForPosition + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+    setMotor(rangeFindingDriveVoltage);
+    rangeFindingLastPosition = currentPos;
+    rangeFindingLastMoveTime = millis();
+    return;
+  }
+  
+  long currentPos = encoder.read();
+  unsigned long currentTime = millis();
+  
+  switch (rangeFindingState) {
+    case RANGE_MOVE_TO_LEFT:
+      // Check if we've reached left limit
+      if (leftPressed()) {
+        rangeFindingState = RANGE_HOLD_LEFT;
+        rangeFindingHoldStart = currentTime;
+        rangeFindingLastPos = currentPos;
+        rangeFindingStableTicks = 0;
+        
+        bool inLeftHalf = (currentPos > RANGE_MIDPOINT);
+        float frictionForPosition = inLeftHalf ? FRICTION_LEFT : FRICTION_RIGHT;
+        float holdVoltage = max(frictionForPosition, CALIBRATE_MIN_VOLTAGE - 0.5);
+        setMotor(holdVoltage);
+        Serial.println(F("Left limit reached, stabilizing..."));
+      } else {
+        // Check for stuck condition
+        if (abs(currentPos - rangeFindingLastPosition) > 2) {
+          rangeFindingLastMoveTime = currentTime;
+          rangeFindingLastPosition = currentPos;
+        } else if (currentTime - rangeFindingLastMoveTime > 3000) {
+          Serial.println(F("WARNING: Motor appears stuck, increasing voltage..."));
+          rangeFindingDriveVoltage = min(rangeFindingDriveVoltage + 0.5, 8.0);
+          setMotor(rangeFindingDriveVoltage);
+          rangeFindingLastMoveTime = currentTime;
+        }
+        
+        // Check timeout
+        if (currentTime - rangeFindingStartTime > 15000) {
+          Serial.println(F("ERROR: Timeout waiting for left limit"));
+          stopMotor();
+          rangeFindingActive = false;
+          rangeFindingState = RANGE_IDLE;
+        }
+      }
+      break;
+      
+    case RANGE_HOLD_LEFT:
+      // Hold at left limit until stable
+      if (currentTime - rangeFindingHoldStart >= CALIBRATE_HOLD_TIME && rangeFindingStableTicks >= CALIBRATE_STABLE_TICKS) {
+        stopMotor();
+        
+        // Small delay for motor to stop, but check if enough time has passed
+        if (currentTime - rangeFindingHoldStart >= CALIBRATE_HOLD_TIME + 200) {
+          // Zero encoder at left limit
+          encoder.write(0);
+          LOWER_BOUND = 0;
+          Serial.println(F("Left limit found, encoder zeroed."));
+          
+          // Move to right limit
+          rangeFindingState = RANGE_MOVE_TO_RIGHT;
+          rangeFindingStartTime = currentTime;
+          rangeFindingLastPosition = 0;
+          rangeFindingLastMoveTime = currentTime;
+          
+          // Use position-based friction (at left limit, in left half)
+          bool inLeftHalf = (encoder.read() > RANGE_MIDPOINT);
+          float frictionForPosition = inLeftHalf ? FRICTION_LEFT : FRICTION_RIGHT;
+          rangeFindingDriveVoltage = -max(frictionForPosition + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+          setMotor(rangeFindingDriveVoltage);
+          Serial.println(F("Moving to right limit..."));
+        }
+      } else {
+        // Check stability
+        if (abs(currentPos - rangeFindingLastPos) <= 1) {
+          rangeFindingStableTicks++;
+        } else {
+          rangeFindingStableTicks = 0;
+          rangeFindingLastPos = currentPos;
+        }
+      }
+      break;
+      
+    case RANGE_MOVE_TO_RIGHT:
+      // Check if we've reached right limit
+      if (rightPressed()) {
+        rangeFindingState = RANGE_HOLD_RIGHT;
+        rangeFindingHoldStart = currentTime;
+        rangeFindingLastPos = currentPos;
+        rangeFindingStableTicks = 0;
+        
+        // Update friction based on current position (now in right half)
+        bool inLeftHalf = (currentPos > RANGE_MIDPOINT);
+        float frictionForPosition = inLeftHalf ? FRICTION_LEFT : FRICTION_RIGHT;
+        float holdVoltageRight = -max(frictionForPosition, CALIBRATE_MIN_VOLTAGE - 0.5);
+        setMotor(holdVoltageRight);
+        Serial.println(F("Right limit reached, stabilizing..."));
+      } else {
+        // Check for stuck condition
+        if (abs(currentPos - rangeFindingLastPosition) > 2) {
+          rangeFindingLastMoveTime = currentTime;
+          rangeFindingLastPosition = currentPos;
+        } else if (currentTime - rangeFindingLastMoveTime > 3000) {
+          Serial.println(F("WARNING: Motor appears stuck, increasing voltage..."));
+          rangeFindingDriveVoltage = max(rangeFindingDriveVoltage - 0.5, -8.0);
+          setMotor(rangeFindingDriveVoltage);
+          rangeFindingLastMoveTime = currentTime;
+        }
+        
+        // Check timeout
+        if (currentTime - rangeFindingStartTime > 15000) {
+          Serial.println(F("ERROR: Timeout waiting for right limit"));
+          stopMotor();
+          rangeFindingActive = false;
+          rangeFindingState = RANGE_IDLE;
+        }
+      }
+      break;
+      
+    case RANGE_HOLD_RIGHT:
+      // Hold at right limit until stable
+      if (currentTime - rangeFindingHoldStart >= CALIBRATE_HOLD_TIME && rangeFindingStableTicks >= CALIBRATE_STABLE_TICKS) {
+        stopMotor();
+        
+        // Small delay for motor to stop, but check if enough time has passed
+        if (currentTime - rangeFindingHoldStart >= CALIBRATE_HOLD_TIME + 200) {
+          // Record right limit position
+          UPPER_BOUND = encoder.read();
+          RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;
+          
+          Serial.print(F("Right limit found at: "));
+          Serial.print(UPPER_BOUND);
+          Serial.println(F(" counts"));
+          
+          Serial.print(F("Total range: "));
+          Serial.print(abs(UPPER_BOUND - LOWER_BOUND));
+          Serial.println(F(" encoder counts"));
+          
+          Serial.print(F("Range midpoint: "));
+          Serial.println(RANGE_MIDPOINT);
+          
+          if (abs(UPPER_BOUND - LOWER_BOUND) < 100) {
+            Serial.println(F("ERROR: Range too small. Check limit switches."));
+            rangeFindingActive = false;
+            rangeFindingState = RANGE_IDLE;
+            return;
+          }
+          
+          rangeFindingComplete = true;
+          rangeFindingActive = false;
+          rangeFindingState = RANGE_IDLE;
+          Serial.println(F("✓ Range finding complete!"));
+        }
+      } else {
+        // Check stability
+        if (abs(currentPos - rangeFindingLastPos) <= 1) {
+          rangeFindingStableTicks++;
+        } else {
+          rangeFindingStableTicks = 0;
+          rangeFindingLastPos = currentPos;
+        }
+      }
+      break;
+      
+    case RANGE_IDLE:
+      // Do nothing
+      break;
+  }
+}
 
 // ============================================
 // DYNAMIC SENSOR CALIBRATION
@@ -576,20 +776,47 @@ void runStateMachine() {
     
     case CALIBRATE:
       desiredPosition = LOWER_BOUND;
-
-      if (!dynamicCalibrationActive && sensorCalibrated) {
-        Serial.println(F("State: CALIBRATE → CHOOSE_ACTIVE_TARGET (tracking enabled)\n"));
-        currentState = CHOOSE_ACTIVE_TARGET;
+      
+      // First, find the range if not already done
+      if (!rangeFindingComplete) {
+        Serial.println(F("State: CALIBRATE → FIND_RANGE\n"));
+        currentState = FIND_RANGE;
         systemEnabled = true;
       }
+      // If range is found but sensors not calibrated, start sensor calibration
       else if (!dynamicCalibrationActive && !sensorCalibrated) {
-        // Skip range finding - use fixed bounds, go directly to sensor calibration
-        Serial.println(F("State: CALIBRATE → Sensor Calibration (using fixed bounds)\n"));
-        rangeFindingComplete = true;  // Mark as complete since we're using fixed values
+        Serial.println(F("State: CALIBRATE → Sensor Calibration\n"));
         startDynamicCalibration();
         desiredPosition = LOWER_BOUND;
         systemEnabled = true;
       }
+      // If everything is ready, start tracking
+      else if (!dynamicCalibrationActive && sensorCalibrated) {
+        Serial.println(F("State: CALIBRATE → CHOOSE_ACTIVE_TARGET (tracking enabled)\n"));
+        currentState = CHOOSE_ACTIVE_TARGET;
+        systemEnabled = true;
+      }
+      break;
+    
+    case FIND_RANGE:
+      // Find the range by moving to both limits (non-blocking)
+      findRange();
+      
+      // After range finding completes, proceed to sensor calibration
+      if (rangeFindingComplete) {
+        Serial.println(F("State: FIND_RANGE → Sensor Calibration\n"));
+        if (!sensorCalibrated) {
+          startDynamicCalibration();
+          desiredPosition = LOWER_BOUND;
+        } else {
+          // Sensors already calibrated, go to tracking
+          currentState = CHOOSE_ACTIVE_TARGET;
+        }
+      } else if (!rangeFindingActive && !rangeFindingComplete) {
+        // Range finding failed or not started yet - will retry on next iteration
+        // Don't print error repeatedly, just stay in FIND_RANGE state
+      }
+      // If rangeFindingActive is true, range finding is in progress - stay in FIND_RANGE
       break;
     
     case CHOOSE_ACTIVE_TARGET:
@@ -1803,8 +2030,7 @@ void processCommand() {
     case 'G':
       if (!autoMode) {
         Serial.println(F("\n🎮 STARTING AUTONOMOUS MODE"));
-        Serial.println(F("Sequence: Home → Sensor Cal → Track\n"));
-        Serial.println(F("Using fixed encoder bounds: 0 to -1424\n"));
+        Serial.println(F("Sequence: Home → Find Range → Sensor Cal → Track\n"));
 
         // Full rehoming with state reset
         stopMotor();
@@ -1823,7 +2049,9 @@ void processCommand() {
           // Reset all state variables
           autoMode = true;
           systemEnabled = true;
-          rangeFindingComplete = true;  // Using fixed bounds, no need to find range
+          rangeFindingComplete = false;  // Will find range first
+          rangeFindingActive = false;  // Reset range finding state
+          rangeFindingState = RANGE_IDLE;
           sensorCalibrated = false;
           dynamicCalibrationActive = false;
           
@@ -1858,7 +2086,7 @@ void processCommand() {
           Serial.println(F("✓ HOMING COMPLETE - Encoder zeroed"));
           Serial.print(F("Encoder position: "));
           Serial.println(encoder.read());
-          Serial.println(F("Next: Sensor calibration...\n"));
+          Serial.println(F("Next: Range finding...\n"));
         } else {
           Serial.println(F("✗ Homing failed\n"));
         }
