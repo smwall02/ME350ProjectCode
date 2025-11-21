@@ -69,6 +69,10 @@ long WAIT_POSITION = TARGET_3_POSITION;
 long LOWER_BOUND = 0;      // Fixed: Left limit position (home)
 long UPPER_BOUND = -1424;  // Fixed: Right limit position (from calibration)
 
+// Safety margins to prevent hitting limit switches
+const long SAFETY_MARGIN_RIGHT = 5;  // Stop 5 counts before right limit
+const long SAFETY_MARGIN_LEFT = 5;    // Stop 5 counts before left limit
+
 long targetPositions[4] = {
   TARGET_1_POSITION,
   TARGET_2_POSITION,
@@ -348,8 +352,6 @@ void loop() {
   // Periodic encoder bounds validation - ensure encoder never shows invalid positions
   if (currentTime - lastControlTime >= CONTROL_PERIOD) {
     long currentPos = encoder.read();
-    const long SAFETY_MARGIN_RIGHT = 30;
-    const long SAFETY_MARGIN_LEFT = 5;
     
     // Validate encoder is within safe bounds (only if not in calibration/homing)
     if (currentState != CALIBRATE && currentState != FIND_RANGE && !dynamicCalibrationActive) {
@@ -583,8 +585,16 @@ void runStateMachine() {
   switch (currentState) {
     
     case CALIBRATE:
+      // Static variables for this state
+      static unsigned long calibrateStartTime = 0;
+      static unsigned long calibrateHoldStart = 0;
+      static unsigned long lastDebugPrint = 0;
+      
       // If at left limit switch, ensure encoder is at 0 and hold position
       if (leftPressed()) {
+        // Reset homing timeout since we're at the limit
+        calibrateStartTime = 0;
+        
         long currentPos = encoder.read();
         if (abs(currentPos) > 1) {
           // Encoder not zeroed - reset it aggressively
@@ -617,10 +627,7 @@ void runStateMachine() {
         currentPos = 0;
         
         // Check if we're in initial range finding sequence
-        static unsigned long calibrateHoldStart = 0;
-        
         // Debug: Print state of initialRangeFinding flag
-        static unsigned long lastDebugPrint = 0;
         if (millis() - lastDebugPrint > 1000) {
           Serial.print(F("CAL: initialRangeFinding="));
           Serial.print(initialRangeFinding ? F("true") : F("false"));
@@ -661,6 +668,25 @@ void runStateMachine() {
         }
       } else {
         // Not at left limit - try to home
+        // Add timeout check to prevent infinite homing attempts
+        if (calibrateStartTime == 0) {
+          calibrateStartTime = millis();
+        }
+        
+        // If homing takes too long (30 seconds), force transition if range finding is complete
+        if (millis() - calibrateStartTime > 30000) {
+          if (!initialRangeFinding && rangeFindingComplete) {
+            // Range finding is complete, but homing failed - try to proceed anyway
+            Serial.println(F("Homing timeout, proceeding..."));
+            calibrateStartTime = 0;
+            currentState = CHOOSE_ACTIVE_TARGET;
+            systemEnabled = true;
+            break;
+          }
+          // Reset timeout if still in initial range finding
+          calibrateStartTime = millis();
+        }
+        
         desiredPosition = LOWER_BOUND;
         systemEnabled = true;
       }
@@ -682,21 +708,21 @@ void runStateMachine() {
         stopMotor();
         delay(300);
         
-        // Back off from limit by a small amount (30 counts for safety)
+        // Back off from limit by safety margin
         long rightLimitPos = encoder.read();
         if (rightLimitPos < -100) {  // Sanity check
-          UPPER_BOUND = rightLimitPos + 30;  // Add 30 counts safety margin
+          UPPER_BOUND = rightLimitPos + SAFETY_MARGIN_RIGHT;  // Add safety margin
         } else {
-          UPPER_BOUND = rightLimitPos + 30;  // Still add margin
+          UPPER_BOUND = rightLimitPos + SAFETY_MARGIN_RIGHT;  // Still add margin
         }
         
-        // Move slightly left to get off the limit switch
-        desiredPosition = rightLimitPos + 50;  // Back off 50 counts
+        // Move slightly left to get off the limit switch (back off more than safety margin)
+        desiredPosition = rightLimitPos + (SAFETY_MARGIN_RIGHT * 2);  // Back off double the safety margin
         systemEnabled = true;
         
         // Wait to move off limit
         unsigned long backoffStart = millis();
-        while (millis() - backoffStart < 1000 && encoder.read() < rightLimitPos + 40) {
+        while (millis() - backoffStart < 1000 && encoder.read() < rightLimitPos + SAFETY_MARGIN_RIGHT) {
           delay(50);
         }
         
@@ -799,8 +825,6 @@ void runStateMachine() {
       }
       
       // Constrain target position to safe bounds
-      const long SAFETY_MARGIN_RIGHT = 30;
-      const long SAFETY_MARGIN_LEFT = 5;
       if (activeTargetPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
         activeTargetPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
       }
@@ -827,8 +851,6 @@ void runStateMachine() {
       }
       
       // Constrain desired position to safe bounds
-      const long SAFETY_MARGIN_RIGHT = 30;
-      const long SAFETY_MARGIN_LEFT = 5;
       if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
         desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
       }
@@ -976,8 +998,6 @@ void runStateMachine() {
               }
               
               // Constrain fine adjustment to safe bounds
-              const long SAFETY_MARGIN_RIGHT = 30;
-              const long SAFETY_MARGIN_LEFT = 5;
               if (fineAdjustmentTarget < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
                 fineAdjustmentTarget = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
               }
@@ -1144,9 +1164,6 @@ void runMotionControl() {
   
   // Safety: Never allow positions beyond upper bound (too far right)
   // Add safety margin to prevent hitting right limit switch
-  const long SAFETY_MARGIN_RIGHT = 30;  // Stop 30 counts before right limit
-  const long SAFETY_MARGIN_LEFT = 5;    // Stop 5 counts before left limit (encoder should be 0)
-  
   if (currentPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
     // Encoder has gone beyond safe range - cap it at safety margin
     long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
@@ -1187,10 +1204,22 @@ void runMotionControl() {
     }
   }
   
+  // Safety check: if encoder shows positive position (shouldn't happen), reset it
   if (currentState == MOVE_TO_TARGET && autoMode) {
-    if (currentPosition > 50) {
-      stopMotor();
-      return;
+    if (currentPosition > 10) {
+      // Encoder drifted positive - reset to 0
+      encoder.write(0);
+      currentPosition = 0;
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+      errorIntegral = 0;
+      // Recalculate error
+      adjustedDesiredPosition = desiredPosition;
+      if (currentPosition > desiredPosition) {
+        adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+      }
+      error = adjustedDesiredPosition - currentPosition;
     }
   }
   
@@ -1216,9 +1245,6 @@ void runMotionControl() {
   }
   
   // CRITICAL: Constrain desired position to safe bounds
-  const long SAFETY_MARGIN_RIGHT = 30;  // Stop 30 counts before right limit
-  const long SAFETY_MARGIN_LEFT = 5;    // Stop 5 counts before left limit
-  
   // Ensure desired position doesn't go beyond safe bounds
   if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
     desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
@@ -1648,8 +1674,6 @@ void setMotor(float voltage) {
   // Safety: Check limit switches and prevent movement into limits
   // Also check encoder position to prevent getting too close to limits
   long currentPos = encoder.read();
-  const long SAFETY_MARGIN_RIGHT = 30;  // Stop 30 counts before right limit
-  const long SAFETY_MARGIN_LEFT = 5;    // Stop 5 counts before left limit
   
   // Prevent leftward movement at or near left limit
   if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
@@ -2657,8 +2681,6 @@ void setTargetLane(int lane) {
   desiredPosition = targetPositions[lane - 1];
   
   // Constrain desired position to safe bounds
-  const long SAFETY_MARGIN_RIGHT = 30;
-  const long SAFETY_MARGIN_LEFT = 5;
   if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
     desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
   }
