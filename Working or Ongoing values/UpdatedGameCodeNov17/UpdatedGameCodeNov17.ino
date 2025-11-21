@@ -708,7 +708,7 @@ void runStateMachine() {
         
         // IMPROVED: Switch immediately when zombie velocity changes (stops approaching or starts retreating)
         // This responds faster to velocity changes as requested
-        int prevDirection = ProxSensors[activeTargetIndex].prevDirection;
+        // Note: prevDirection already declared above, reusing it here
         if (prevDirection == FORWARD && 
             (targetDirection == BACKWARD || targetDirection == STOPPED)) {
           // Zombie was approaching but now retreating or stopped - switch immediately
