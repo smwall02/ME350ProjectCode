@@ -77,18 +77,23 @@ long targetPositions[4] = {
 };
 
 // ============================================
-// DYNAMIC SENSOR CALIBRATION
+// SENSOR CALIBRATION (Permanent values from calibration)
 // ============================================
+// Permanent sensor ranges based on calibration:
+// Lane 1: MIN=86, MAX=585, Range=499
+// Lane 2: MIN=115, MAX=594, Range=479
+// Lane 3: MIN=132, MAX=628, Range=496
+// Lane 4: MIN=84, MAX=601, Range=517
 int ProxRange[4][2] = {
-  {800, 100},
-  {800, 100},
-  {800, 100},
-  {800, 100}
+  {585, 86},   // Lane 1: [MAX, MIN]
+  {594, 115},  // Lane 2: [MAX, MIN]
+  {628, 132},  // Lane 3: [MAX, MIN]
+  {601, 84}    // Lane 4: [MAX, MIN]
 };
 
-bool sensorCalibrated = false;
+bool sensorCalibrated = true;  // Use permanent values, no calibration needed
 bool dynamicCalibrationActive = false;
-bool rangeFindingComplete = false;
+bool rangeFindingComplete = true;  // Using fixed bounds
 unsigned long calibrationStartTime = 0;
 const unsigned long DYNAMIC_CALIBRATION_TIME = 10000;
 
@@ -1514,7 +1519,7 @@ void processCommand() {
     case 'G':
       if (!autoMode) {
         Serial.println(F("\n🎮 STARTING AUTONOMOUS MODE"));
-        Serial.println(F("Sequence: Home → Sensor Cal → Track\n"));
+        Serial.println(F("Sequence: Home → Track (using permanent sensor ranges)\n"));
         Serial.println(F("Using fixed encoder bounds: 0 to -1424\n"));
 
         // Full rehoming with state reset
@@ -1535,7 +1540,7 @@ void processCommand() {
           autoMode = true;
           systemEnabled = true;
           rangeFindingComplete = true;  // Using fixed bounds, no need to find range
-          sensorCalibrated = false;
+          sensorCalibrated = true;  // Using permanent sensor ranges, no calibration needed
           dynamicCalibrationActive = false;
           
           currentState = CALIBRATE;
@@ -1565,7 +1570,7 @@ void processCommand() {
           Serial.println(F("✓ HOMING COMPLETE - Encoder zeroed"));
           Serial.print(F("Encoder position: "));
           Serial.println(encoder.read());
-          Serial.println(F("Next: Sensor calibration...\n"));
+          Serial.println(F("Using permanent sensor ranges - starting target tracking...\n"));
         } else {
           Serial.println(F("✗ Homing failed\n"));
         }
@@ -1622,8 +1627,8 @@ void processCommand() {
       adaptiveFrictionVoltage = 0;
       adaptiveLearning = false;
       adaptiveLearned = false;
-      rangeFindingComplete = false;
-      sensorCalibrated = false;
+      rangeFindingComplete = true;  // Using fixed bounds
+      sensorCalibrated = true;  // Keep permanent sensor ranges
       adaptiveFrictionLeft = FRICTION_LEFT;
       adaptiveFrictionRight = FRICTION_RIGHT;
       Serial.println(F("Reset - friction learning will restart on next movement"));
