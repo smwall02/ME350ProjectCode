@@ -69,6 +69,10 @@ long WAIT_POSITION = TARGET_3_POSITION;
 long LOWER_BOUND = 0;      // Fixed: Left limit position (home)
 long UPPER_BOUND = -1424;  // Fixed: Right limit position (from calibration)
 
+// Safety margins to prevent hitting limit switches
+const long SAFETY_MARGIN_RIGHT = 5;  // Stop 5 counts before right limit
+const long SAFETY_MARGIN_LEFT = 5;    // Stop 5 counts before left limit
+
 long targetPositions[4] = {
   TARGET_1_POSITION,
   TARGET_2_POSITION,
@@ -94,6 +98,7 @@ int ProxRange[4][2] = {
 bool sensorCalibrated = true;  // Use permanent values, no calibration needed
 bool dynamicCalibrationActive = false;
 bool rangeFindingComplete = true;  // Using fixed bounds
+bool initialRangeFinding = false;  // Flag for initial startup range finding
 unsigned long calibrationStartTime = 0;
 const unsigned long DYNAMIC_CALIBRATION_TIME = 10000;
 
@@ -151,8 +156,8 @@ float previousZombieDistance = 1.0;  // Track previous distance to detect if get
 // NOTE: These values will be loaded from EEPROM if available
 // FRICTION_LEFT: voltage needed when moving TO MORE NEGATIVE positions (away from home)
 // FRICTION_RIGHT: voltage needed when moving TO LESS NEGATIVE positions (toward home)
-float FRICTION_LEFT = 0.25;  // Reduced from 2.2 to prevent overshoot to right
-float FRICTION_RIGHT = 0.25; // For moving toward less negative (left/toward home)
+float FRICTION_LEFT = 2.5;  // Increased for static friction overcoming
+float FRICTION_RIGHT = 2.5; // For moving toward less negative (left/toward home)
 
 // Adaptive friction boost (increases if target not reached)
 float adaptiveFrictionLeft = FRICTION_LEFT;
@@ -178,8 +183,9 @@ float KI_active = KI;
 float KD_active = KD;
 
 const float MAX_VOLTAGE = 10.0;
-const float MIN_CONTROL_VOLTAGE = 0.8;
+const float MIN_CONTROL_VOLTAGE = 2.0;  // Increased to overcome static friction
 const int TARGET_BAND = 2;  // Position tolerance: +/- 2 counts
+const float BREAKAWAY_VOLTAGE_BOOST = 1.5;  // Extra voltage when starting from rest
 const float MAX_INTEGRAL = 1200.0;
 const unsigned long CONTROL_PERIOD = 10;
 
@@ -342,6 +348,30 @@ void loop() {
   }
   
   checkLimitSwitches();
+  
+  // Periodic encoder bounds validation - ensure encoder never shows invalid positions
+  if (currentTime - lastControlTime >= CONTROL_PERIOD) {
+    long currentPos = encoder.read();
+    
+    // Validate encoder is within safe bounds (only if not in calibration/homing)
+    if (currentState != CALIBRATE && currentState != FIND_RANGE && !dynamicCalibrationActive) {
+      if (currentPos < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+        // Encoder shows position beyond right safety margin - correct it
+        long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+        encoder.write(safeRightLimit);
+        previousMotorPosition = safeRightLimit;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      if (currentPos > SAFETY_MARGIN_LEFT && !leftPressed()) {
+        // Encoder shows position beyond left safety margin - correct it
+        encoder.write(SAFETY_MARGIN_LEFT);
+        previousMotorPosition = SAFETY_MARGIN_LEFT;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+    }
+  }
 }
 
 // ============================================
@@ -460,6 +490,31 @@ void updateAllSensors() {
 // ============================================
 void updateVelocity() {
   long currentPos = encoder.read();
+  
+  // Safety: If at left limit, ALWAYS force encoder to 0 and reset tracking
+  if (leftPressed()) {
+    if (abs(currentPos) > 1) {
+      // Encoder not at 0 - force reset
+      encoder.write(0);
+      delay(10);
+      currentPos = encoder.read();
+      if (abs(currentPos) > 1) {
+        // Retry
+        encoder.write(0);
+        delay(10);
+        currentPos = 0;
+      } else {
+        currentPos = 0;
+      }
+    } else {
+      currentPos = 0;
+    }
+    previousMotorPosition = 0;
+    previousVelCompTime = micros();
+    motorVelocity = 0;
+    return;
+  }
+  
   long deltaPos = currentPos - previousMotorPosition;
   long deltaTime = micros() - previousVelCompTime;
   
@@ -530,59 +585,207 @@ void runStateMachine() {
   switch (currentState) {
     
     case CALIBRATE:
-      // If at left limit switch, ensure encoder is at 0 and don't try to move
+      // Static variables for this state
+      static unsigned long calibrateStartTime = 0;
+      static unsigned long calibrateHoldStart = 0;
+      static unsigned long lastDebugPrint = 0;
+      
+      // If at left limit switch, ensure encoder is at 0 and hold position
       if (leftPressed()) {
+        // Reset homing timeout since we're at the limit
+        calibrateStartTime = 0;
+        
         long currentPos = encoder.read();
         if (abs(currentPos) > 1) {
           // Encoder not zeroed - reset it aggressively
-          for (int i = 0; i < 5; i++) {
+          stopMotor();
+          delay(200);
+          for (int i = 0; i < 10; i++) {
             encoder.write(0);
-            delay(50);
+            delay(100);
             currentPos = encoder.read();
             if (abs(currentPos) <= 1) {
               break;
             }
           }
-          // Reset velocity tracking
+          // Reset ALL tracking variables
           previousMotorPosition = 0;
           previousVelCompTime = micros();
           motorVelocity = 0;
           errorIntegral = 0;
           lastError = 0;
+          lastStuckCheckPos = 0;
+          lastStuckCheckTime = 0;
+          stuckCounter = 0;
         }
         desiredPosition = LOWER_BOUND;
-        // Stop motor - we're already at the limit
-        stopMotor();
+        // Hold at limit with gentle voltage
+        float holdVoltage = max(FRICTION_RIGHT, 1.5);
+        setMotor(holdVoltage);
         errorIntegral = 0;
+        // Force position to be 0
+        currentPos = 0;
         
-        // Transition to next state since we're already homed
-        if (!dynamicCalibrationActive && sensorCalibrated) {
+        // Check if we're in initial range finding sequence
+        // Debug: Print state of initialRangeFinding flag
+        if (millis() - lastDebugPrint > 1000) {
+          Serial.print(F("CAL: initialRangeFinding="));
+          Serial.print(initialRangeFinding ? F("true") : F("false"));
+          Serial.print(F(" leftPressed="));
+          Serial.println(leftPressed() ? F("true") : F("false"));
+          lastDebugPrint = millis();
+        }
+        
+        if (initialRangeFinding) {
+          // First time at left limit - after holding, go find right range
+          if (calibrateHoldStart == 0) {
+            calibrateHoldStart = millis();
+            Serial.println(F("Holding..."));
+          }
+          if (millis() - calibrateHoldStart > 500) {  // Hold for 500ms
+            calibrateHoldStart = 0;
+            Serial.println(F("Finding range..."));
+            currentState = FIND_RANGE;
+            systemEnabled = true;
+            // Reset encoder to 0 one more time before moving
+            encoder.write(0);
+            delay(100);
+            previousMotorPosition = 0;
+            previousVelCompTime = micros();
+            motorVelocity = 0;
+          }
+        } else {
+          // Not in initial range finding - ready to start operation immediately
+          calibrateHoldStart = 0;
+          Serial.println(F("Range found, starting operation..."));
           currentState = CHOOSE_ACTIVE_TARGET;
           systemEnabled = true;
-        }
-        else if (!dynamicCalibrationActive && !sensorCalibrated) {
           rangeFindingComplete = true;
-          startDynamicCalibration();
-          desiredPosition = LOWER_BOUND;
-          systemEnabled = true;
+          // Stop holding motor
+          stopMotor();
+          // Break immediately to ensure transition takes effect
+          break;
         }
       } else {
-        desiredPosition = LOWER_BOUND;
+        // Not at left limit - try to home
+        // Add timeout check to prevent infinite homing attempts
+        if (calibrateStartTime == 0) {
+          calibrateStartTime = millis();
+        }
         
-        if (!dynamicCalibrationActive && sensorCalibrated) {
-          currentState = CHOOSE_ACTIVE_TARGET;
-          systemEnabled = true;
+        // If homing takes too long (30 seconds), force transition if range finding is complete
+        if (millis() - calibrateStartTime > 30000) {
+          if (!initialRangeFinding && rangeFindingComplete) {
+            // Range finding is complete, but homing failed - try to proceed anyway
+            Serial.println(F("Homing timeout, proceeding..."));
+            calibrateStartTime = 0;
+            currentState = CHOOSE_ACTIVE_TARGET;
+            systemEnabled = true;
+            break;
+          }
+          // Reset timeout if still in initial range finding
+          calibrateStartTime = millis();
         }
-        else if (!dynamicCalibrationActive && !sensorCalibrated) {
-          rangeFindingComplete = true;
-          startDynamicCalibration();
-          desiredPosition = LOWER_BOUND;
-          systemEnabled = true;
+        
+        desiredPosition = LOWER_BOUND;
+        systemEnabled = true;
+      }
+      break;
+    
+    case FIND_RANGE:
+      // Move to right limit to find UPPER_BOUND - gentle approach
+      static unsigned long rangeFindStartTime = 0;
+      static bool rangeFindStarted = false;
+      
+      if (!rangeFindStarted) {
+        rangeFindStartTime = millis();
+        rangeFindStarted = true;
+      }
+      
+      if (rightPressed()) {
+        // At right limit - record position as UPPER_BOUND
+        // Stop immediately and back off slightly
+        stopMotor();
+        delay(300);
+        
+        // Back off from limit by safety margin
+        long rightLimitPos = encoder.read();
+        if (rightLimitPos < -100) {  // Sanity check
+          UPPER_BOUND = rightLimitPos + SAFETY_MARGIN_RIGHT;  // Add safety margin
+        } else {
+          UPPER_BOUND = rightLimitPos + SAFETY_MARGIN_RIGHT;  // Still add margin
         }
+        
+        // Move slightly left to get off the limit switch (back off more than safety margin)
+        desiredPosition = rightLimitPos + (SAFETY_MARGIN_RIGHT * 2);  // Back off double the safety margin
+        systemEnabled = true;
+        
+        // Wait to move off limit
+        unsigned long backoffStart = millis();
+        while (millis() - backoffStart < 1000 && encoder.read() < rightLimitPos + SAFETY_MARGIN_RIGHT) {
+          delay(50);
+        }
+        
+        rangeFindStarted = false;
+        
+        // Clear the initial range finding flag - we've found the range
+        initialRangeFinding = false;
+        
+        // Now home back to left limit
+        currentState = CALIBRATE;
+        desiredPosition = LOWER_BOUND;
+        systemEnabled = true;
+      } else {
+        // Move toward right limit - use gentle, gradual approach
+        long currentPos = encoder.read();
+        long estimatedLimit = -1500;  // Conservative estimate
+        const long APPROACH_MARGIN = 50;  // Start slowing 50 counts before limit
+        
+        // Calculate how close we are
+        long distanceToLimit = currentPos - estimatedLimit;
+        
+        if (distanceToLimit > APPROACH_MARGIN + 200) {
+          // Still far away - move toward estimated limit slowly
+          desiredPosition = estimatedLimit + APPROACH_MARGIN;
+        } else if (distanceToLimit > APPROACH_MARGIN) {
+          // Getting closer - slow down more
+          desiredPosition = currentPos - 10;  // Move only 10 counts at a time
+        } else {
+          // Very close - move very slowly
+          desiredPosition = currentPos - 5;  // Move only 5 counts at a time
+        }
+        
+        // Safety: Never go beyond estimated limit
+        if (desiredPosition < estimatedLimit) {
+          desiredPosition = estimatedLimit;
+        }
+        
+        systemEnabled = true;
       }
       break;
     
     case CHOOSE_ACTIVE_TARGET:
+      // CRITICAL: If at left limit, verify encoder is at 0
+      if (leftPressed()) {
+        long checkPos = encoder.read();
+        if (abs(checkPos) > 1) {
+          // Force reset
+          stopMotor();
+          delay(200);
+          for (int i = 0; i < 5; i++) {
+            encoder.write(0);
+            delay(100);
+            checkPos = encoder.read();
+            if (abs(checkPos) <= 1) {
+              break;
+            }
+          }
+          previousMotorPosition = 0;
+          previousVelCompTime = micros();
+          motorVelocity = 0;
+        }
+      }
+      
       activeTargetIndex = -1;
       closestZombieDist = 2.0;
 
@@ -621,6 +824,14 @@ void runStateMachine() {
         fineAdjustmentActive = false;
       }
       
+      // Constrain target position to safe bounds
+      if (activeTargetPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+        activeTargetPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+      }
+      if (activeTargetPosition > SAFETY_MARGIN_LEFT) {
+        activeTargetPosition = SAFETY_MARGIN_LEFT;
+      }
+      
       desiredPosition = activeTargetPosition;
       moveStartTime = millis();
       arrivalTime = millis();
@@ -639,10 +850,41 @@ void runStateMachine() {
         desiredPosition = activeTargetPosition;
       }
       
+      // Constrain desired position to safe bounds
+      if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+        desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+      }
+      if (desiredPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
+        desiredPosition = SAFETY_MARGIN_LEFT;
+      }
+      
       long currentPos = encoder.read();
+      
+      // Validate encoder position is within bounds
+      if (currentPos < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+        // Too far right - correct encoder
+        long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+        encoder.write(safeRightLimit);
+        delay(50);
+        currentPos = safeRightLimit;
+        previousMotorPosition = safeRightLimit;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      if (currentPos > SAFETY_MARGIN_LEFT && !leftPressed()) {
+        // Too far left (but not at limit) - correct encoder
+        encoder.write(SAFETY_MARGIN_LEFT);
+        delay(50);
+        currentPos = SAFETY_MARGIN_LEFT;
+        previousMotorPosition = SAFETY_MARGIN_LEFT;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      
       long error = desiredPosition - currentPos;
       
-      if (currentPos < UPPER_BOUND - 50) {
+      // Safety check: if beyond safe range, choose new target
+      if (currentPos < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
         currentState = CHOOSE_ACTIVE_TARGET;
         break;
       }
@@ -755,6 +997,14 @@ void runStateMachine() {
                 fineAdjustmentTarget = activeTargetPosition - FINE_ADJUSTMENT_AMOUNT;
               }
               
+              // Constrain fine adjustment to safe bounds
+              if (fineAdjustmentTarget < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+                fineAdjustmentTarget = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+              }
+              if (fineAdjustmentTarget > SAFETY_MARGIN_LEFT && !leftPressed()) {
+                fineAdjustmentTarget = SAFETY_MARGIN_LEFT;
+              }
+              
               fineAdjustmentActive = true;
               desiredPosition = fineAdjustmentTarget;
               arrivalTime = millis();  // Reset arrival time for fine adjustment
@@ -783,6 +1033,48 @@ void runStateMachine() {
 // ============================================
 void runMotionControl() {
   long currentPosition = encoder.read();
+  
+  // CRITICAL: If at left limit, encoder MUST be at 0
+  // Only reset if we're actually at the limit AND encoder is not already at 0
+  if (leftPressed()) {
+    // Check if encoder needs reset
+    if (abs(currentPosition) > 1) {
+      // Encoder not at 0 - reset it
+      stopMotor();
+      encoder.write(0);
+      delay(50);
+      // Verify and retry if needed
+      currentPosition = encoder.read();
+      if (abs(currentPosition) > 1) {
+        for (int i = 0; i < 5; i++) {
+          encoder.write(0);
+          delay(100);
+          currentPosition = encoder.read();
+          if (abs(currentPosition) <= 1) {
+            break;
+          }
+        }
+      }
+      // Force position to 0 if still not correct
+      if (abs(currentPosition) > 1) {
+        currentPosition = 0;
+      }
+      // Reset all tracking to match
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+      errorIntegral = 0;
+      lastError = 0;
+    } else {
+      // Encoder is already at 0 - just ensure tracking variables match
+      if (previousMotorPosition != 0) {
+        previousMotorPosition = 0;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      currentPosition = 0;
+    }
+  }
   
   // Apply rightward drift compensation: if moving right (toward more negative),
   // adjust target slightly left to compensate for momentum overshoot
@@ -871,27 +1163,58 @@ void runMotionControl() {
   }
   
   // Safety: Never allow positions beyond upper bound (too far right)
-  if (currentPosition < UPPER_BOUND - 20) {
-    // Encoder has gone beyond safe range - cap it
-    encoder.write(UPPER_BOUND);
+  // Add safety margin to prevent hitting right limit switch
+  // Only prevent rightward movement - allow leftward movement
+  if (currentPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+    // Too close to right limit - correct encoder position
+    long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+    encoder.write(safeRightLimit);
     delay(50);
-    currentPosition = UPPER_BOUND;
-    previousMotorPosition = UPPER_BOUND;
+    currentPosition = safeRightLimit;
+    previousMotorPosition = safeRightLimit;
     previousVelCompTime = micros();
     motorVelocity = 0;
-    errorIntegral = 0;
-    // Recalculate error with corrected position
+    // Recalculate error after encoder correction
     adjustedDesiredPosition = desiredPosition;
     if (currentPosition > desiredPosition) {
       adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
     }
     error = adjustedDesiredPosition - currentPosition;
+    float originalError = desiredPosition - currentPosition;
+    
+    // Only prevent rightward movement - allow leftward movement
+    if (originalError < 0) {
+      // Trying to move right - stop and prevent
+      stopMotor();
+      errorIntegral = 0;
+      return;
+    }
+    // If trying to move left (positive error), continue with normal control
   }
   
+  if (currentPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
+    // Too close to left limit (but not at it) - ensure we don't go further left
+    if (desiredPosition > SAFETY_MARGIN_LEFT) {
+      desiredPosition = SAFETY_MARGIN_LEFT;
+    }
+  }
+  
+  // Safety check: if encoder shows positive position (shouldn't happen), reset it
   if (currentState == MOVE_TO_TARGET && autoMode) {
-    if (currentPosition > 50) {
-      stopMotor();
-      return;
+    if (currentPosition > 10) {
+      // Encoder drifted positive - reset to 0
+      encoder.write(0);
+      currentPosition = 0;
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+      errorIntegral = 0;
+      // Recalculate error
+      adjustedDesiredPosition = desiredPosition;
+      if (currentPosition > desiredPosition) {
+        adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+      }
+      error = adjustedDesiredPosition - currentPosition;
     }
   }
   
@@ -910,9 +1233,72 @@ void runMotionControl() {
   }
   
   // Check against original target position for arrival (not adjusted one)
-  // Re-read position in case it was reset above
-  currentPosition = encoder.read();
+  // Re-read position in case it was reset above, but only if not at left limit
+  // (if at left limit, we already forced it to 0 above)
+  if (!leftPressed()) {
+    currentPosition = encoder.read();
+  }
+  
+  // CRITICAL: Constrain desired position to safe bounds
+  // Ensure desired position doesn't go beyond safe bounds
+  if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+    desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+  }
+  if (desiredPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
+    desiredPosition = SAFETY_MARGIN_LEFT;
+  }
+  
   float originalError = desiredPosition - currentPosition;
+  
+  // CRITICAL: Prevent any movement when at limit switches (except during calibration/homing)
+  if (leftPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
+    // At left limit - only allow rightward movement (negative error)
+    if (originalError > 0) {
+      // Trying to move left - stop immediately
+      stopMotor();
+      errorIntegral = 0;
+      if (abs(currentPosition) > 2) {
+        encoder.write(0);
+        delay(50);
+        previousMotorPosition = 0;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+        currentPosition = encoder.read();
+        originalError = desiredPosition - currentPosition;
+      }
+      return;
+    }
+  }
+  
+  if (rightPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
+    // At right limit - correct encoder position and only allow leftward movement
+    long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+    if (currentPosition < safeRightLimit) {
+      // Encoder shows position beyond safe limit - correct it
+      encoder.write(safeRightLimit);
+      delay(50);
+      currentPosition = safeRightLimit;
+      previousMotorPosition = safeRightLimit;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+      // Recalculate error with corrected position
+      originalError = desiredPosition - currentPosition;
+      adjustedDesiredPosition = desiredPosition;
+      if (currentPosition > desiredPosition) {
+        adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+      }
+      error = adjustedDesiredPosition - currentPosition;
+    }
+    
+    // Only prevent rightward movement - allow leftward movement
+    if (originalError < 0) {
+      // Trying to move right - stop immediately
+      stopMotor();
+      errorIntegral = 0;
+      return;
+    }
+    // If trying to move left (positive error), continue with normal control below
+  }
   
   // CRITICAL: Prevent leftward movement when at left limit (backup check)
   if (leftPressed() && originalError > 0) {
@@ -928,6 +1314,24 @@ void runMotionControl() {
       motorVelocity = 0;
       currentPosition = encoder.read();
       originalError = desiredPosition - currentPosition;
+    }
+    return;
+  }
+  
+  // CRITICAL: Prevent rightward movement beyond safe limit
+  if (currentPosition <= UPPER_BOUND - SAFETY_MARGIN_RIGHT && originalError < 0) {
+    // Too close to right limit and trying to move further right - stop immediately
+    stopMotor();
+    errorIntegral = 0;
+    // Cap position at safety margin
+    long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+    if (currentPosition < safeRightLimit) {
+      encoder.write(safeRightLimit);
+      delay(50);
+      currentPosition = safeRightLimit;
+      previousMotorPosition = safeRightLimit;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
     }
     return;
   }
@@ -975,7 +1379,7 @@ void runMotionControl() {
   // Start learning when error is significant but not too large (better for accuracy)
   if (abs(error) > 100 && abs(error) < 800 && !adaptiveLearning && !adaptiveLearned) {
     adaptiveLearning = true;
-    adaptiveFrictionVoltage = 1.5;  // Start lower for faster learning
+    adaptiveFrictionVoltage = 2.5;  // Start higher to overcome static friction
     lastAdaptivePosition = currentPosition;
     adaptiveStartTime = millis();
     
@@ -1011,42 +1415,42 @@ void runMotionControl() {
     }
     
     // No movement yet - increase voltage and try again
-    // Use faster increments: 0.3V every 150ms (was 0.5V every 200ms)
-    if (elapsed >= 150) {
-      adaptiveFrictionVoltage += 0.3;
+    // Use faster increments: 0.5V every 100ms for quicker response
+    if (elapsed >= 100) {
+      adaptiveFrictionVoltage += 0.5;
       adaptiveStartTime = millis();
       lastAdaptivePosition = currentPosition;  // Reset position check
       
-      if (adaptiveFrictionVoltage > 4.5) {
-        adaptiveFrictionVoltage = 2.5;
+      if (adaptiveFrictionVoltage > 5.0) {
+        adaptiveFrictionVoltage = 3.0;
         adaptiveLearning = false;
         adaptiveLearned = true;
         
-        // Store conservative value
+        // Store learned value
         bool movingRight = (error < 0);
         if (movingRight) {
-          adaptiveFrictionLeft = 2.5;
-          FRICTION_LEFT = 2.5;
+          adaptiveFrictionLeft = 3.0;
+          FRICTION_LEFT = 3.0;
         } else {
-          adaptiveFrictionRight = 2.5;
-          FRICTION_RIGHT = 2.5;
+          adaptiveFrictionRight = 3.0;
+          FRICTION_RIGHT = 3.0;
         }
       }
     }
     
-    if (elapsed > 2000) {
+    if (elapsed > 1500) {
       adaptiveLearning = false;
       adaptiveLearned = true;
-      adaptiveFrictionVoltage = 2.0;  // Use conservative default
+      adaptiveFrictionVoltage = 2.5;  // Use default value
       
       // Store default value
       bool movingRight = (error < 0);
       if (movingRight) {
-        adaptiveFrictionLeft = 2.0;
-        FRICTION_LEFT = 2.0;
+        adaptiveFrictionLeft = 2.5;
+        FRICTION_LEFT = 2.5;
       } else {
-        adaptiveFrictionRight = 2.0;
-        FRICTION_RIGHT = 2.0;
+        adaptiveFrictionRight = 2.5;
+        FRICTION_RIGHT = 2.5;
       }
     }
     
@@ -1082,22 +1486,29 @@ void runMotionControl() {
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
 
-  // FRICTION COMPENSATION DISABLED - was causing overshoot
+  // FRICTION COMPENSATION - re-enabled with improved scaling
   float frictionComp = 0;
-  // Disabled until proper tuning can be done
-  // if (abs(error) > TARGET_BAND) {
-  //   bool movingTowardMoreNegative = (error < 0);
-  //   float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
-  //   float frictionScale = 1.0;
-  //   float absError = abs(error);
-  //   if (absError < 3) frictionScale = 0.05;
-  //   else if (absError < 10) frictionScale = 0.15;
-  //   else if (absError < 30) frictionScale = 0.4;
-  //   else if (absError < 100) frictionScale = 0.7;
-  //   if (abs(motorVelocity) > 5) frictionScale *= 0.5;
-  //   if (error < 0) frictionComp = -baseFriction * frictionScale;
-  //   else frictionComp = baseFriction * frictionScale;
-  // }
+  if (abs(error) > TARGET_BAND) {
+    bool movingTowardMoreNegative = (error < 0);
+    float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
+    float frictionScale = 1.0;
+    float absError = abs(error);
+    
+    // Scale friction based on error magnitude - more aggressive for larger errors
+    if (absError < 3) frictionScale = 0.1;
+    else if (absError < 10) frictionScale = 0.3;
+    else if (absError < 30) frictionScale = 0.6;
+    else if (absError < 100) frictionScale = 0.8;
+    else frictionScale = 1.0;  // Full friction for large errors
+    
+    // Reduce friction when already moving (dynamic friction is less than static)
+    if (abs(motorVelocity) > 10) frictionScale *= 0.4;
+    else if (abs(motorVelocity) > 5) frictionScale *= 0.6;
+    
+    // Apply friction compensation
+    if (error < 0) frictionComp = -baseFriction * frictionScale;
+    else frictionComp = baseFriction * frictionScale;
+  }
 
   // Velocity feedforward - DISABLED to prevent overshoot
   float velocityFF = 0;
@@ -1109,6 +1520,13 @@ void runMotionControl() {
 
   // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF;
+  
+  // BREAKAWAY VOLTAGE BOOST: Add extra voltage when starting from rest to overcome static friction
+  // If motor is not moving (or moving very slowly) and error is significant, add breakaway boost
+  if (abs(motorVelocity) < 3.0 && abs(originalError) > 5) {
+    float breakawayBoost = (originalError < 0) ? -BREAKAWAY_VOLTAGE_BOOST : BREAKAWAY_VOLTAGE_BOOST;
+    totalVoltage += breakawayBoost;
+  }
   
   // Apply voltage boost during retry mode (for first 300ms of retry)
   if (inRetryMode) {
@@ -1123,20 +1541,39 @@ void runMotionControl() {
   }
 
   // Voltage capping based on error magnitude (increased significantly for faster movement)
+  // Also ensures minimum voltage to overcome static friction
+  // Use lower voltage during range finding for gentler approach
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
-  if (absErr > 800) {
-    voltageLimit = 6.5;  // Increased from 4.5 for much faster long moves
-  } else if (absErr > 500) {
-    voltageLimit = 6.0;  // Increased from 4.0
-  } else if (absErr > 300) {
-    voltageLimit = 5.5;  // Increased from 3.5
-  } else if (absErr > 100) {
-    voltageLimit = 5.0;  // Increased from 3.0
-  } else if (absErr > 50) {
-    voltageLimit = 4.5;  // Increased from 2.5
+  
+  if (currentState == FIND_RANGE) {
+    // Range finding mode - use lower, gentler voltages
+    if (absErr > 500) {
+      voltageLimit = 4.0;  // Gentle for long moves
+    } else if (absErr > 200) {
+      voltageLimit = 3.5;  // Medium speed
+    } else if (absErr > 50) {
+      voltageLimit = 3.0;  // Slower approach
+    } else {
+      voltageLimit = 2.5;  // Very gentle near limit
+    }
   } else {
-    voltageLimit = 3.5;  // Increased from 2.2 for final approach
+    // Normal operation - higher voltages
+    if (absErr > 800) {
+      voltageLimit = 6.5;  // Increased from 4.5 for much faster long moves
+    } else if (absErr > 500) {
+      voltageLimit = 6.0;  // Increased from 4.0
+    } else if (absErr > 300) {
+      voltageLimit = 5.5;  // Increased from 3.5
+    } else if (absErr > 100) {
+      voltageLimit = 5.0;  // Increased from 3.0
+    } else if (absErr > 50) {
+      voltageLimit = 4.5;  // Increased from 2.5
+    } else if (absErr > 10) {
+      voltageLimit = 4.0;  // Increased for medium errors
+    } else {
+      voltageLimit = 3.5;  // Minimum for small errors - enough to overcome static friction
+    }
   }
 
   // Allow higher voltage limit during retry mode (20% boost)
@@ -1162,15 +1599,15 @@ void runMotionControl() {
 
         // If stuck for 2+ consecutive checks, apply aggressive friction-overcoming voltage
         if (stuckCounter >= 2) {
-          // Scale minimum voltage based on error magnitude
+          // Scale minimum voltage based on error magnitude - increased for static friction
           float minVoltage;
           long absError = abs(originalError);
           if (absError > 50) {
-            minVoltage = 5.5;  // Large error - use high voltage
+            minVoltage = 6.0;  // Large error - use high voltage
           } else if (absError > 20) {
-            minVoltage = 4.5;  // Medium error - use medium-high voltage
+            minVoltage = 5.0;  // Medium error - use medium-high voltage
           } else {
-            minVoltage = 3.5;  // Small error - use moderate voltage
+            minVoltage = 4.0;  // Small error - use higher voltage to overcome static friction
           }
           
           // Apply minimum voltage in direction of error
@@ -1188,8 +1625,18 @@ void runMotionControl() {
     stuckCounter = 0;  // Reset when within target band
   }
 
+  // Apply motor voltage - ensure we apply at least friction compensation if error is significant
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
     setMotor(totalVoltage);
+  } else if (abs(originalError) > TARGET_BAND) {
+    // If error is significant but voltage is low, apply at least friction compensation
+    // This helps overcome static friction for small movements
+    float minFrictionVoltage = (originalError < 0) ? -adaptiveFrictionLeft : adaptiveFrictionRight;
+    if (abs(minFrictionVoltage) > 0.5) {
+      setMotor(minFrictionVoltage);
+    } else {
+      stopMotor();
+    }
   } else {
     stopMotor();
   }
@@ -1230,11 +1677,25 @@ void setMotor(float voltage) {
   int pwm = abs(voltage) * 25.5;
 
   // Safety: Check limit switches and prevent movement into limits
+  // Also check encoder position to prevent getting too close to limits
+  long currentPos = encoder.read();
+  
+  // Prevent leftward movement at or near left limit
   if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
     voltage = 0;
     pwm = 0;
+  } else if (currentPos <= SAFETY_MARGIN_LEFT && voltage > 0 && !leftPressed()) {
+    // Too close to left limit - prevent further leftward movement
+    voltage = 0;
+    pwm = 0;
   }
+  
+  // Prevent rightward movement at or near right limit
   if (digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
+    voltage = 0;
+    pwm = 0;
+  } else if (currentPos <= UPPER_BOUND - SAFETY_MARGIN_RIGHT && voltage < 0) {
+    // Too close to right limit - prevent further rightward movement
     voltage = 0;
     pwm = 0;
   }
@@ -1380,14 +1841,33 @@ bool homeToLeftLimit() {
     motorVelocity = 0;
     errorIntegral = 0;
     lastError = 0;
+    lastStuckCheckPos = 0;
+    lastStuckCheckTime = 0;
+    stuckCounter = 0;
     
-    // Force one final encoder read to ensure it's zero
+    // Force one final encoder read with multiple readings for stability
+    delay(100);
     finalPos = encoder.read();
+    delay(50);
+    long pos2 = encoder.read();
+    delay(50);
+    long pos3 = encoder.read();
+    
+    // Use the value closest to 0
+    if (abs(pos2) < abs(finalPos)) finalPos = pos2;
+    if (abs(pos3) < abs(finalPos)) finalPos = pos3;
+    
     if (abs(finalPos) > 1) {
-      // Last resort - force zero
+      // Last resort - force zero one more time
+      stopMotor();
+      delay(300);
       encoder.write(0);
-      delay(100);
+      delay(200);
       finalPos = encoder.read();
+      // Reset all tracking again
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
     }
     
     Serial.print(F("Homed:"));
@@ -1411,12 +1891,37 @@ bool homeToLeftLimit() {
   float voltageIncrement = 0.2;  // Increase voltage by 0.2V every 200ms
   unsigned long lastVoltageIncrease = millis();
   const unsigned long VOLTAGE_RAMP_INTERVAL = 200;  // Increase voltage every 200ms
+  const unsigned long HOMING_TIMEOUT = 15000;  // 15 second timeout
+  const unsigned long DEBOUNCE_TIME = 100;  // Debounce time for limit switch
+  bool limitDetected = false;
+  unsigned long limitDetectTime = 0;
 
   setMotor(currentVoltage);
 
-  // Wait for limit switch with gradual voltage increase
-  while (!leftPressed() && (millis() - startTime) < 15000) {
+  // Wait for limit switch with gradual voltage increase and debouncing
+  while ((millis() - startTime) < HOMING_TIMEOUT) {
     delay(10);
+    
+    // Check for limit switch with debouncing
+    if (leftPressed()) {
+      if (!limitDetected) {
+        // First detection - start debounce timer
+        limitDetected = true;
+        limitDetectTime = millis();
+      } else {
+        // Already detected - check if debounce time has passed
+        if ((millis() - limitDetectTime) >= DEBOUNCE_TIME) {
+          // Limit switch confirmed - break out of loop
+          break;
+        }
+      }
+    } else {
+      // Limit switch not pressed - reset detection
+      if (limitDetected) {
+        limitDetected = false;
+        limitDetectTime = 0;
+      }
+    }
     
     // Gradually increase voltage if limit switch not reached
     if ((millis() - lastVoltageIncrease) >= VOLTAGE_RAMP_INTERVAL) {
@@ -1433,6 +1938,7 @@ bool homeToLeftLimit() {
   stopMotor();
   delay(200);
 
+  // Check if we successfully reached the limit switch
   if (leftPressed()) {
     Serial.println(F("Contact"));
 
@@ -1490,14 +1996,33 @@ bool homeToLeftLimit() {
     motorVelocity = 0;
     errorIntegral = 0;
     lastError = 0;
+    lastStuckCheckPos = 0;
+    lastStuckCheckTime = 0;
+    stuckCounter = 0;
     
-    // Force one final encoder read to ensure it's zero
+    // Force one final encoder read with multiple readings for stability
+    delay(100);
     finalPos = encoder.read();
+    delay(50);
+    long pos2 = encoder.read();
+    delay(50);
+    long pos3 = encoder.read();
+    
+    // Use the value closest to 0
+    if (abs(pos2) < abs(finalPos)) finalPos = pos2;
+    if (abs(pos3) < abs(finalPos)) finalPos = pos3;
+    
     if (abs(finalPos) > 1) {
-      // Last resort - force zero
+      // Last resort - force zero one more time
+      stopMotor();
+      delay(300);
       encoder.write(0);
-      delay(100);
+      delay(200);
       finalPos = encoder.read();
+      // Reset all tracking again
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
     }
     
     Serial.print(F("Homed:"));
@@ -1512,8 +2037,115 @@ bool homeToLeftLimit() {
     systemEnabled = wasSystemEnabled;
     return true;
   } else {
+    // Timeout - limit switch not reached
     stopMotor();
-    Serial.println(F("Timeout"));
+    delay(500);
+    
+    // Retry: check if we're close to the limit (maybe it bounced)
+    // Try a few more times with lower voltage
+    Serial.println(F("Timeout - retrying..."));
+    for (int retry = 0; retry < 3; retry++) {
+      // Try with lower voltage to avoid bouncing
+      setMotor(2.0);
+      delay(500);
+      
+      if (leftPressed()) {
+        // Found it on retry - proceed with normal homing sequence
+        stopMotor();
+        delay(200);
+        
+        // Hold gently at limit
+        long currentPos = encoder.read();
+        long lastPos = currentPos;
+        unsigned long holdStart = millis();
+        int stableTicks = 0;
+        float holdVoltage = max(FRICTION_RIGHT, 1.5);
+        
+        while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
+          setMotor(holdVoltage);
+          delay(10);
+          long pos = encoder.read();
+          if (abs(pos - lastPos) <= 1) {
+            stableTicks++;
+          } else {
+            stableTicks = 0;
+            lastPos = pos;
+          }
+        }
+        
+        stopMotor();
+        delay(500);
+        
+        // Reset encoder
+        for (int i = 0; i < 10; i++) {
+          encoder.write(0);
+          delay(50);
+          if (abs(encoder.read()) <= 1) {
+            break;
+          }
+        }
+        
+        long finalPos = encoder.read();
+        int attempts = 0;
+        while (abs(finalPos) > 1 && attempts < 5) {
+          encoder.write(0);
+          delay(100);
+          finalPos = encoder.read();
+          attempts++;
+        }
+        
+        stopMotor();
+        delay(300);
+        
+        previousMotorPosition = 0;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+        errorIntegral = 0;
+        lastError = 0;
+        lastStuckCheckPos = 0;
+        lastStuckCheckTime = 0;
+        stuckCounter = 0;
+        
+        delay(100);
+        finalPos = encoder.read();
+        delay(50);
+        long pos2 = encoder.read();
+        delay(50);
+        long pos3 = encoder.read();
+        
+        if (abs(pos2) < abs(finalPos)) finalPos = pos2;
+        if (abs(pos3) < abs(finalPos)) finalPos = pos3;
+        
+        if (abs(finalPos) > 1) {
+          stopMotor();
+          delay(300);
+          encoder.write(0);
+          delay(200);
+          finalPos = encoder.read();
+          previousMotorPosition = 0;
+          previousVelCompTime = micros();
+          motorVelocity = 0;
+        }
+        
+        Serial.print(F("Homed (retry):"));
+        Serial.print(finalPos);
+        if (abs(finalPos) <= 1) {
+          Serial.println(F(" OK"));
+        } else {
+          Serial.print(F(" WARN:"));
+          Serial.println(finalPos);
+        }
+        
+        systemEnabled = wasSystemEnabled;
+        return true;
+      }
+      
+      stopMotor();
+      delay(300);
+    }
+    
+    // All retries failed
+    Serial.println(F("Homing failed after retries"));
     systemEnabled = wasSystemEnabled;
     return false;
   }
@@ -1857,37 +2489,63 @@ void processCommand() {
         delay(200);
         
         if (homeToLeftLimit()) {
-          // Force encoder to zero one more time after homing
-          for (int i = 0; i < 5; i++) {
+          // CRITICAL: Aggressively reset encoder to zero with verification
+          stopMotor();
+          delay(300);
+          
+          // Multiple reset attempts with verification
+          long checkPos = 999;
+          for (int attempt = 0; attempt < 20; attempt++) {
             encoder.write(0);
-            delay(50);
-            if (abs(encoder.read()) <= 1) {
+            delay(100);
+            checkPos = encoder.read();
+            if (abs(checkPos) <= 1) {
               break;
             }
           }
           
-          // Verify encoder is at zero
-          long checkPos = encoder.read();
+          // If still not zero, try one more aggressive reset
           if (abs(checkPos) > 1) {
-            // Force reset
+            stopMotor();
+            delay(200);
+            for (int i = 0; i < 10; i++) {
+              encoder.write(0);
+              delay(150);
+              checkPos = encoder.read();
+              if (abs(checkPos) <= 1) {
+                break;
+              }
+            }
+          }
+          
+          // Final verification - if still not zero, report error but continue
+          checkPos = encoder.read();
+          if (abs(checkPos) > 1) {
+            Serial.print(F("ERROR: Encoder not zero after reset: "));
+            Serial.println(checkPos);
+            // Force one last time
             encoder.write(0);
-            delay(100);
+            delay(200);
             checkPos = encoder.read();
           }
           
-          // Reset velocity tracking variables to match encoder reset
+          // CRITICAL: Reset ALL position tracking variables to match encoder
           previousMotorPosition = 0;
           previousVelCompTime = micros();
           motorVelocity = 0;
           errorIntegral = 0;
           lastError = 0;
+          lastStuckCheckPos = 0;
+          lastStuckCheckTime = 0;
+          stuckCounter = 0;
           
           // Reset all state variables
           autoMode = true;
           systemEnabled = true;
-          rangeFindingComplete = true;  // Using fixed bounds, no need to find range
           sensorCalibrated = true;  // Using permanent sensor ranges, no calibration needed
           dynamicCalibrationActive = false;
+          initialRangeFinding = true;  // Start with range finding sequence
+          rangeFindingComplete = false;  // Will be set after range is found
           
           currentState = CALIBRATE;
           errorIntegral = 0;
@@ -1913,25 +2571,31 @@ void processCommand() {
           
           targetHitTime = 0;
 
+          // Final verification - read encoder one more time
           long finalEncoderPos = encoder.read();
+          
+          // If encoder is still not zero, this is a critical error
           if (abs(finalEncoderPos) > 1) {
-            // Force one more reset
-            for (int i = 0; i < 3; i++) {
-              encoder.write(0);
-              delay(100);
-              finalEncoderPos = encoder.read();
-              if (abs(finalEncoderPos) <= 1) {
-                break;
-              }
-            }
+            Serial.print(F("CRITICAL: Encoder reset failed, reading: "));
+            Serial.println(finalEncoderPos);
+            // Last resort - try resetting one more time
+            stopMotor();
+            delay(500);
+            encoder.write(0);
+            delay(200);
+            finalEncoderPos = encoder.read();
+            // Force all tracking to match
+            previousMotorPosition = 0;
+            previousVelCompTime = micros();
+            motorVelocity = 0;
           }
           
           Serial.print(F("Ready (enc:"));
           Serial.print(finalEncoderPos);
           if (abs(finalEncoderPos) <= 1) {
-            Serial.println(F(")"));
+            Serial.println(F(" OK)"));
           } else {
-            Serial.print(F(" WARN:"));
+            Serial.print(F(" FAIL:"));
             Serial.println(finalEncoderPos);
           }
         } else {
@@ -2020,6 +2684,15 @@ void setTargetLane(int lane) {
   if (lane < 1 || lane > 4) return;
 
   desiredPosition = targetPositions[lane - 1];
+  
+  // Constrain desired position to safe bounds
+  if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+    desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+  }
+  if (desiredPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
+    desiredPosition = SAFETY_MARGIN_LEFT;
+  }
+  
   errorIntegral = 0;
   lastError = 0;
   moveStartTime = millis();
