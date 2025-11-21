@@ -574,7 +574,19 @@ void runStateMachine() {
   switch (currentState) {
     
     case CALIBRATE:
-      desiredPosition = LOWER_BOUND;
+      // If at left limit switch, ensure encoder is at 0 and don't try to move
+      if (leftPressed()) {
+        long currentPos = encoder.read();
+        if (abs(currentPos) > 5) {
+          // Encoder not zeroed - reset it
+          encoder.write(0);
+          delay(50);
+        }
+        desiredPosition = LOWER_BOUND;
+        // Don't try to move - we're already at the limit
+      } else {
+        desiredPosition = LOWER_BOUND;
+      }
 
       if (!dynamicCalibrationActive && sensorCalibrated) {
         Serial.println(F("State: CALIBRATE → CHOOSE_ACTIVE_TARGET (tracking enabled)\n"));
@@ -832,6 +844,18 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
+  // Safety: Prevent movement into left limit switch (except during calibration/homing)
+  if (leftPressed() && currentState != CALIBRATE && !dynamicCalibrationActive) {
+    // At left limit - stop motor and ensure encoder is at 0
+    if (currentPosition > 5) {
+      // Encoder drifted - reset it
+      encoder.write(0);
+      delay(50);
+    }
+    stopMotor();
+    return;
+  }
+  
   // Apply rightward drift compensation: if moving right (toward more negative),
   // adjust target slightly left to compensate for momentum overshoot
   long adjustedDesiredPosition = desiredPosition;
@@ -881,6 +905,17 @@ void runMotionControl() {
       Serial.print(F(" in "));
       Serial.print(settleTime / 1000.0, 2);
       Serial.println(F("s"));
+    }
+    return;
+  }
+  
+  // Additional safety: If at left limit and trying to move left (positive error), stop
+  if (leftPressed() && originalError > 0) {
+    stopMotor();
+    errorIntegral = 0;
+    // Ensure encoder is at 0 if we're at the limit
+    if (abs(currentPosition) > 5) {
+      encoder.write(0);
     }
     return;
   }
@@ -1269,6 +1304,10 @@ bool rightPressed() {
 bool homeToLeftLimit() {
   Serial.println(F("\nHOMING..."));
 
+  // Stop motor first to ensure clean state
+  stopMotor();
+  delay(100);
+
   if (leftPressed()) {
     Serial.println(F("At limit, stabilizing..."));
 
@@ -1291,17 +1330,17 @@ bool homeToLeftLimit() {
     }
 
     stopMotor();
-    delay(100);
+    delay(200);  // Longer delay to ensure motor stops
 
     // Multiple zeroing attempts to ensure encoder is properly reset
     encoder.write(0);
-    delay(50);
+    delay(100);
     if (encoder.read() != 0) {
       encoder.write(0);
-      delay(50);
+      delay(100);
     }
     encoder.write(0);
-    delay(50);
+    delay(100);
     
     // Verify encoder is actually zeroed
     long finalPos = encoder.read();
@@ -1309,9 +1348,13 @@ bool homeToLeftLimit() {
       Serial.print(F("⚠️  Warning: Encoder not zeroed, reading: "));
       Serial.println(finalPos);
       encoder.write(0);  // Try one more time
-      delay(50);
+      delay(100);
     }
 
+    // Final stop and verify
+    stopMotor();
+    delay(100);
+    
     Serial.print(F("Homed (encoder: "));
     Serial.print(encoder.read());
     Serial.println(F(")"));
@@ -1325,6 +1368,10 @@ bool homeToLeftLimit() {
 
   while (!leftPressed() && (millis() - startTime) < 15000) {
     delay(10);
+    // Safety: stop if limit switch is pressed
+    if (leftPressed()) {
+      break;
+    }
   }
 
   if (leftPressed()) {
@@ -1350,17 +1397,17 @@ bool homeToLeftLimit() {
     }
 
     stopMotor();
-    delay(100);
+    delay(200);  // Longer delay to ensure motor stops
 
     // Multiple zeroing attempts to ensure encoder is properly reset
     encoder.write(0);
-    delay(50);
+    delay(100);
     if (encoder.read() != 0) {
       encoder.write(0);
-      delay(50);
+      delay(100);
     }
     encoder.write(0);
-    delay(50);
+    delay(100);
     
     // Verify encoder is actually zeroed
     long finalPos = encoder.read();
@@ -1368,9 +1415,13 @@ bool homeToLeftLimit() {
       Serial.print(F("⚠️  Warning: Encoder not zeroed, reading: "));
       Serial.println(finalPos);
       encoder.write(0);  // Try one more time
-      delay(50);
+      delay(100);
     }
 
+    // Final stop and verify
+    stopMotor();
+    delay(100);
+    
     Serial.print(F("Homed (encoder: "));
     Serial.print(encoder.read());
     Serial.println(F(")"));
