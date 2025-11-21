@@ -75,7 +75,7 @@ const float POSITION_FILTER_ALPHA = 0.85;   // Low-pass filter for position read
 // Control parameters
 const long DEADBAND = 5;  // Encoder counts
 const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz)
-const float TEST_MAX_VOLTAGE = 7.5;  // Base max drive during manual tests (matches game code lane-change voltage)
+const float TEST_MAX_VOLTAGE = 9.0;  // Base max drive during manual tests (matches game code lane-change voltage)
 const unsigned long LOG_INTERVAL_MS = 30; // Logging cadence for manual tests/moves
 
 // Anti-windup parameters
@@ -1938,13 +1938,13 @@ float cappedVoltageForError(float voltage, long error) {
   long absErr = abs(error);
   float cap;
   // Match voltage limits from game code for lane-to-lane moves
-  if (absErr > 1000) cap = 7.5f;      // Very large moves (lane 4 to lane 1) - maximum speed
-  else if (absErr > 800) cap = 7.0f;   // Large moves - high speed
-  else if (absErr > 500) cap = 6.5f;   // Medium-large moves
-  else if (absErr > 300) cap = 6.0f;   // Medium moves
-  else if (absErr > 100) cap = 5.0f;   // Small-medium moves
-  else if (absErr > 50) cap = 4.5f;    // Small moves
-  else cap = 3.5f;                     // Fine positioning
+  if (absErr > 1000) cap = 9.0f;      // Very large moves (lane 4 to lane 1) - maximum speed
+  else if (absErr > 800) cap = 8.5f;   // Large moves - high speed
+  else if (absErr > 500) cap = 8.0f;   // Medium-large moves
+  else if (absErr > 300) cap = 7.5f;   // Medium moves
+  else if (absErr > 100) cap = 6.5f;   // Small-medium moves
+  else if (absErr > 50) cap = 5.5f;    // Small moves
+  else cap = 4.5f;                     // Fine positioning
   cap = min(cap, TEST_MAX_VOLTAGE);
   return constrain(voltage, -cap, cap);
 }

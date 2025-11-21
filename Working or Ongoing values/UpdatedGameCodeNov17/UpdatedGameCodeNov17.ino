@@ -441,7 +441,7 @@ void findRange() {
           rangeFindingLastPosition = currentPos;
         } else if (currentTime - rangeFindingLastMoveTime > 3000) {
           Serial.println(F("Stuck, increasing voltage"));
-          rangeFindingDriveVoltage = min(rangeFindingDriveVoltage + 0.5, 8.0);
+          rangeFindingDriveVoltage = min(rangeFindingDriveVoltage + 0.5, 9.0);
           setMotor(rangeFindingDriveVoltage);
           rangeFindingLastMoveTime = currentTime;
         }
@@ -498,7 +498,7 @@ void findRange() {
           rangeFindingLastPosition = currentPos;
         } else if (currentTime - rangeFindingLastMoveTime > 3000) {
           Serial.println(F("Stuck, increasing voltage"));
-          rangeFindingDriveVoltage = max(rangeFindingDriveVoltage - 0.5, -8.0);
+          rangeFindingDriveVoltage = max(rangeFindingDriveVoltage - 0.5, -9.0);
           setMotor(rangeFindingDriveVoltage);
           rangeFindingLastMoveTime = currentTime;
         }
@@ -1129,22 +1129,22 @@ void runMotionControl() {
 
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
-  float voltageLimit = 7.5;
+  float voltageLimit = 9.0;
   long absErr = abs(error);
   if (absErr > 1000) {
-    voltageLimit = 7.5;
+    voltageLimit = 9.0;
   } else if (absErr > 800) {
-    voltageLimit = 7.0;
+    voltageLimit = 8.5;
   } else if (absErr > 500) {
-    voltageLimit = 6.5;
+    voltageLimit = 8.0;
   } else if (absErr > 300) {
-    voltageLimit = 6.0;
+    voltageLimit = 7.5;
   } else if (absErr > 100) {
-    voltageLimit = 5.0;
+    voltageLimit = 6.5;
   } else if (absErr > 50) {
-    voltageLimit = 4.5;
+    voltageLimit = 5.5;
   } else {
-    voltageLimit = 3.5;
+    voltageLimit = 4.5;
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
