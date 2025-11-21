@@ -742,8 +742,9 @@ void runStateMachine() {
       // Also check against original target for fine adjustment logic
       long errorToOriginalTarget = activeTargetPosition - currentPos;
       
-      // EARLY FINE ADJUSTMENT: If close to target (within 5 counts) and zombie still approaching, make adjustment
+      // EARLY FINE ADJUSTMENT: If close to target and zombie still approaching, immediately correct error
       // This helps account for gear backlash when making large moves (e.g., lane 4 to lane 1)
+      // IMMEDIATE CORRECTION: Apply correction proportional to error, no waiting
       if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
           abs(errorToOriginalTarget) <= 5 &&  // Close to target (slightly larger than TARGET_BAND)
@@ -752,15 +753,18 @@ void runStateMachine() {
           !ProxSensors[activeTargetIndex].hitDetected &&
           zombieDistances[activeTargetIndex] < 0.30) {  // Zombie is close (within 30% of photo)
         
-        // Determine adjustment based on error direction
-        int adjustmentDirection = (errorToOriginalTarget > 0) ? +FINE_ADJUSTMENT_AMOUNT : -FINE_ADJUSTMENT_AMOUNT;
-        fineAdjustmentTarget = activeTargetPosition + adjustmentDirection;
+        // IMMEDIATE CORRECTION: Calculate correction directly from error (multiply by 1.5 to overcome backlash)
+        long immediateCorrection = (long)(errorToOriginalTarget * 1.5);
+        immediateCorrection = constrain(immediateCorrection, -5, 5);
+        fineAdjustmentTarget = activeTargetPosition + immediateCorrection;
         
         fineAdjustmentCount++;
-        Serial.print(F("🔧 Early fine adjust "));
-        Serial.print((adjustmentDirection > 0) ? F("LEFT (+") : F("RIGHT (-"));
-        Serial.print(abs(adjustmentDirection));
-        Serial.print(F(") - close to target, zombie approaching at "));
+        Serial.print(F("🔧 Early fine adjust IMMEDIATE "));
+        Serial.print((immediateCorrection > 0) ? F("LEFT (+") : F("RIGHT (-"));
+        Serial.print(abs(immediateCorrection));
+        Serial.print(F(") - correcting error="));
+        Serial.print(errorToOriginalTarget);
+        Serial.print(F(", zombie approaching at "));
         Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
         Serial.print(F("% ("));
         Serial.print(fineAdjustmentCount);
@@ -797,84 +801,75 @@ void runStateMachine() {
               Serial.println(F("✓ Target retreating, choosing next"));
               currentState = CHOOSE_ACTIVE_TARGET;
             }
-            // FINE POSITIONING: If zombie still approaching and at original target, make small adjustment
+            // FINE POSITIONING: If zombie still approaching and at/near target, immediately correct position error
             // This accounts for gear backlash/gaps - zombie may still be moving forward even when at encoder target
+            // IMMEDIATE CORRECTION: Apply correction voltage directly proportional to error, no incremental moves
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      !fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
-                     abs(errorToOriginalTarget) <= TARGET_BAND &&  // At original target position
+                     abs(errorToOriginalTarget) <= TARGET_BAND + 3 &&  // At or very close to target (allow 3 counts tolerance)
                      !ProxSensors[activeTargetIndex].hitDetected) {  // Not yet hit
               
-              // Check if we've been at target for a short time (allows PID to settle)
-              unsigned long timeAtTarget = millis() - arrivalTime;
-              if (timeAtTarget >= 100) {  // Wait 100ms after arrival before fine adjustment
-                
-                // Determine adjustment direction based on previous move direction
-                // If moved RIGHT (previous position > target), likely overshot right, adjust LEFT
-                // If moved LEFT (previous position < target), likely undershot, adjust RIGHT
-                bool movedRight = (previousMoveStartPosition > activeTargetPosition);
-                
-                // Also check current position relative to target to determine if we need adjustment
-                // If slightly to the right of target (more negative), might need to go left
-                // If slightly to the left of target (less negative), might need to go right
-                bool currentlyRightOfTarget = (currentPos < activeTargetPosition);
-                
-                // Use movement direction as primary indicator, position as secondary
-                int adjustmentDirection = 0;
-                if (movedRight) {
-                  // Moved right to get here, likely overshot, adjust left (toward less negative)
-                  adjustmentDirection = +FINE_ADJUSTMENT_AMOUNT;
-                } else {
-                  // Moved left to get here, likely undershot, adjust right (toward more negative)
-                  adjustmentDirection = -FINE_ADJUSTMENT_AMOUNT;
-                }
-                
-                // If we're already slightly off target, adjust toward target first
-                if (abs(errorToOriginalTarget) > 1) {
-                  // Small error - adjust to correct it
-                  adjustmentDirection = (errorToOriginalTarget > 0) ? +FINE_ADJUSTMENT_AMOUNT : -FINE_ADJUSTMENT_AMOUNT;
-                }
-                
-                fineAdjustmentTarget = activeTargetPosition + adjustmentDirection;
-                
-                fineAdjustmentCount++;
-                Serial.print(F("🔧 Fine adjust "));
-                Serial.print((adjustmentDirection > 0) ? F("LEFT (+") : F("RIGHT (-"));
-                Serial.print(abs(adjustmentDirection));
-                Serial.print(F(") - zombie still approaching at "));
-                Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
-                Serial.print(F("% (pos: "));
-                Serial.print(currentPos);
-                Serial.print(F("→"));
-                Serial.print(fineAdjustmentTarget);
-                Serial.print(F(", "));
-                Serial.print(fineAdjustmentCount);
-                Serial.println(F("/3)"));
-                
-                fineAdjustmentActive = true;
-                desiredPosition = fineAdjustmentTarget;
-                arrivalTime = millis();  // Reset arrival time for fine adjustment
+              // IMMEDIATE CORRECTION: Calculate correction based on current error and movement direction
+              // Determine likely correction direction based on previous move
+              bool movedRight = (previousMoveStartPosition > activeTargetPosition);
+              
+              // Calculate immediate correction target to fix any error
+              // If there's an error, correct it directly; otherwise apply small correction based on movement direction
+              long immediateCorrection = 0;
+              
+              if (abs(errorToOriginalTarget) > 0) {
+                // There's an error - correct it directly (multiply by 1.5 to ensure we overshoot slightly to overcome backlash)
+                immediateCorrection = (long)(errorToOriginalTarget * 1.5);
+              } else {
+                // No error, but zombie still approaching - apply small correction based on movement direction
+                // If moved right, likely need to go left slightly; if moved left, go right slightly
+                immediateCorrection = movedRight ? +FINE_ADJUSTMENT_AMOUNT : -FINE_ADJUSTMENT_AMOUNT;
               }
+              
+              // Constrain correction to reasonable range (max 5 counts)
+              immediateCorrection = constrain(immediateCorrection, -5, 5);
+              fineAdjustmentTarget = activeTargetPosition + immediateCorrection;
+              
+              fineAdjustmentCount++;
+              Serial.print(F("🔧 Fine adjust IMMEDIATE "));
+              Serial.print((immediateCorrection > 0) ? F("LEFT (+") : F("RIGHT (-"));
+              Serial.print(abs(immediateCorrection));
+              Serial.print(F(") - correcting error="));
+              Serial.print(errorToOriginalTarget);
+              Serial.print(F(", zombie at "));
+              Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
+              Serial.print(F("% ("));
+              Serial.print(fineAdjustmentCount);
+              Serial.println(F("/3)"));
+              
+              fineAdjustmentActive = true;
+              desiredPosition = fineAdjustmentTarget;
+              arrivalTime = millis();  // Reset arrival time
             }
             
-            // ADDITIONAL FINE ADJUSTMENT: If already fine-adjusted but zombie still approaching, try opposite direction
+            // CONTINUOUS FINE ADJUSTMENT: If already fine-adjusted but zombie still approaching and there's still error, correct it
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
-                     abs(errorToCurrentTarget) <= TARGET_BAND &&  // At fine-adjusted position
+                     abs(errorToCurrentTarget) > 1 &&  // Still have error at fine-adjusted position
                      !ProxSensors[activeTargetIndex].hitDetected &&  // Not yet hit
-                     (millis() - arrivalTime) >= 200) {  // Been at fine-adjusted position for 200ms
+                     (millis() - arrivalTime) >= 50) {  // Been at position for 50ms (faster response)
               
-              // Try opposite direction adjustment
-              long currentAdjustment = fineAdjustmentTarget - activeTargetPosition;
-              long oppositeAdjustment = -currentAdjustment;
-              fineAdjustmentTarget = activeTargetPosition + oppositeAdjustment;
+              // Calculate immediate correction to fix remaining error
+              long remainingError = errorToCurrentTarget;
+              long additionalCorrection = (long)(remainingError * 1.5);  // Multiply to ensure correction
+              additionalCorrection = constrain(additionalCorrection, -5, 5);
+              
+              fineAdjustmentTarget = activeTargetPosition + (fineAdjustmentTarget - activeTargetPosition) + additionalCorrection;
               
               fineAdjustmentCount++;
-              Serial.print(F("🔧 Fine adjust REVERSE "));
-              Serial.print((oppositeAdjustment > 0) ? F("LEFT (+") : F("RIGHT (-"));
-              Serial.print(abs(oppositeAdjustment));
-              Serial.print(F(") - trying opposite direction, zombie at "));
+              Serial.print(F("🔧 Fine adjust CONTINUOUS "));
+              Serial.print((additionalCorrection > 0) ? F("LEFT (+") : F("RIGHT (-"));
+              Serial.print(abs(additionalCorrection));
+              Serial.print(F(") - correcting remaining error="));
+              Serial.print(remainingError);
+              Serial.print(F(", zombie at "));
               Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
               Serial.print(F("% ("));
               Serial.print(fineAdjustmentCount);
@@ -1133,8 +1128,17 @@ void runMotionControl() {
   //   velocityFF = 0.008 * desiredVelocity;
   // }
 
+  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add extra voltage to overcome backlash quickly
+  float fineAdjustmentBoost = 0;
+  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 10) {
+    // Apply proportional boost based on error direction to quickly correct position
+    // Use aggressive boost (2.0V per count of error) to overcome gear backlash immediately
+    fineAdjustmentBoost = error * 2.0;
+    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -4.0, 4.0);  // Limit to reasonable range
+  }
+
   // Calculate total voltage
-  float totalVoltage = pidVoltage + frictionComp + velocityFF;
+  float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
   // Voltage capping based on error magnitude (increased for faster movement)
   float voltageLimit = MAX_VOLTAGE;
