@@ -776,30 +776,6 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
-  // CRITICAL SAFETY: If at left limit, stop immediately and reset encoder
-  if (leftPressed()) {
-    // Stop motor immediately
-    stopMotor();
-    
-    // Reset encoder if it's not at zero
-    if (abs(currentPosition) > 2) {
-      encoder.write(0);
-      delay(50);
-      // Reset velocity tracking to match
-      previousMotorPosition = 0;
-      previousVelCompTime = micros();
-      motorVelocity = 0;
-    }
-    
-    // Clear error integral to prevent windup
-    errorIntegral = 0;
-    
-    // Only allow movement if we're in CALIBRATE state (homing)
-    if (currentState != CALIBRATE && !dynamicCalibrationActive) {
-      return;  // Exit immediately - don't try to move
-    }
-  }
-  
   // Apply rightward drift compensation: if moving right (toward more negative),
   // adjust target slightly left to compensate for momentum overshoot
   long adjustedDesiredPosition = desiredPosition;
@@ -810,6 +786,42 @@ void runMotionControl() {
   }
   
   float error = adjustedDesiredPosition - currentPosition;
+  
+  // CRITICAL SAFETY: If at left limit, only prevent leftward movement
+  if (leftPressed()) {
+    // Calculate error to see which direction we're trying to move
+    float originalError = desiredPosition - currentPosition;
+    
+    // If trying to move left (positive error), stop and reset encoder
+    if (originalError > 0) {
+      stopMotor();
+      errorIntegral = 0;
+      if (abs(currentPosition) > 2) {
+        encoder.write(0);
+        delay(50);
+        previousMotorPosition = 0;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      return;
+    }
+    
+    // If trying to move right (negative error), allow it but ensure encoder is at 0
+    if (abs(currentPosition) > 2) {
+      encoder.write(0);
+      delay(50);
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+      // Recalculate error after encoder reset
+      currentPosition = encoder.read();
+      adjustedDesiredPosition = desiredPosition;
+      if (currentPosition > desiredPosition) {
+        adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+      }
+      error = adjustedDesiredPosition - currentPosition;
+    }
+  }
   
   if (currentState == MOVE_TO_TARGET && autoMode) {
     if (currentPosition > 50) {
@@ -833,9 +845,11 @@ void runMotionControl() {
   }
   
   // Check against original target position for arrival (not adjusted one)
+  // Re-read position in case it was reset above
+  currentPosition = encoder.read();
   float originalError = desiredPosition - currentPosition;
   
-  // CRITICAL: Prevent leftward movement when at left limit
+  // CRITICAL: Prevent leftward movement when at left limit (backup check)
   if (leftPressed() && originalError > 0) {
     // At left limit and trying to move left - stop immediately
     stopMotor();
@@ -847,6 +861,8 @@ void runMotionControl() {
       previousMotorPosition = 0;
       previousVelCompTime = micros();
       motorVelocity = 0;
+      currentPosition = encoder.read();
+      originalError = desiredPosition - currentPosition;
     }
     return;
   }
@@ -1095,9 +1111,6 @@ void runMotionControl() {
           // Apply minimum voltage in direction of error
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (originalError < 0) ? -minVoltage : minVoltage;
-            Serial.print(F("Boost:"));
-            Serial.print(minVoltage, 1);
-            Serial.print(F("V"));
           }
         }
       } else {
