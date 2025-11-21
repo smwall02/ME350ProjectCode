@@ -963,20 +963,21 @@ void runMotionControl() {
 
   // Retry logic: if stuck outside target band for too long, retry once
   // Use original error for retry detection (not adjusted)
-  if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
-    // Check if we've been stuck at this error for 500ms
-    if (millis() - moveStartTime > 500 && positionRetryCount < MAX_POSITION_RETRIES) {
+  // Made more aggressive - triggers faster and allows retries for larger errors
+  if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 60) {
+    // Check if we've been stuck at this error for 300ms (reduced from 500ms for faster response)
+    if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
       Serial.print(F("⚠️  Stuck at error = "));
       Serial.print(abs(originalError));
-      Serial.println(F(", retrying..."));
+      Serial.println(F(", retrying with increased voltage..."));
 
-      // Reset for retry
+      // Reset for retry with more aggressive settings
       errorIntegral = 0;
       lastError = 0;
       moveStartTime = millis();
       stuckCounter = 0;
-      delay(100);
+      delay(50);  // Reduced delay for faster response
       return;
     }
   }
@@ -1093,9 +1094,18 @@ void runMotionControl() {
     KI_active = KI * 0.6;  // Increased from 0.5
     KD_active = KD * 1.1;  // Slightly increased for better control
   } else {
-    KP_active = KP * 1.1;  // Slightly increased for better responsiveness
-    KI_active = KI * 1.1;  // Slightly increased
-    KD_active = KD * 1.1;  // Slightly increased for better damping
+    // Increased gains for small errors to speed up fine adjustments
+    // Check if we're in fine adjustment or retry mode for even more aggressive gains
+    bool isFineAdjusting = (fineAdjustmentActive || positionRetryCount > 0);
+    if (isFineAdjusting) {
+      KP_active = KP * 2.0;  // Much more aggressive for fine adjustments
+      KI_active = KI * 1.5;  // Increased integral for faster correction
+      KD_active = KD * 1.2;  // Slightly increased damping
+    } else {
+      KP_active = KP * 1.5;  // Increased from 1.1 for better responsiveness
+      KI_active = KI * 1.3;  // Increased from 1.1
+      KD_active = KD * 1.2;  // Increased from 1.1 for better damping
+    }
     
     errorIntegral += error * dt;
     errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
@@ -1150,35 +1160,40 @@ void runMotionControl() {
   //   velocityFF = 0.008 * desiredVelocity;
   // }
 
-  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add small voltage to overcome backlash
-  // Very conservative boost to prevent overcompensation, especially on leftward moves (lane 4 to lane 1)
+  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add voltage to overcome backlash
+  // Increased aggressiveness for faster fine adjustments
   float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 3 && abs(motorVelocity) < 10) {
-    // Apply very small boost only for tiny errors when nearly stopped
-    // Use minimal multiplier to avoid overshoot
-    float boostMultiplier = 0.5;  // Very conservative - just enough to overcome static friction
+  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 5 && abs(motorVelocity) < 15) {
+    // Apply boost for small errors - more aggressive for faster correction
+    float boostMultiplier = 1.5;  // Increased from 0.5 for faster fine adjustments
     fineAdjustmentBoost = error * boostMultiplier;
-    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -1.0, 1.0);  // Very small limit
+    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.5, 2.5);  // Increased from 1.0V limit
   }
 
   // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
-  // Voltage capping based on error magnitude - reduced to ~5V max for slower, more controlled motion
+  // Voltage capping based on error magnitude - increased for small errors to speed up fine adjustments
   float voltageLimit = 5.0;  // Maximum voltage cap
   long absErr = abs(error);
+  
+  // When making fine adjustments or retrying, allow higher voltage for faster correction
+  bool isFineAdjusting = (fineAdjustmentActive || positionRetryCount > 0);
+  
   if (absErr > 800) {
-    voltageLimit = 5.0;  // Reduced from 4.5 for slower, controlled movement
+    voltageLimit = 5.0;
   } else if (absErr > 500) {
-    voltageLimit = 4.5;  // Reduced from 4.0
+    voltageLimit = 4.5;
   } else if (absErr > 300) {
-    voltageLimit = 4.0;  // Reduced from 3.5
+    voltageLimit = 4.0;
   } else if (absErr > 100) {
-    voltageLimit = 3.5;  // Reduced from 3.0
+    voltageLimit = 3.5;
   } else if (absErr > 50) {
-    voltageLimit = 3.0;  // Reduced from 2.5
+    // Increased for fine adjustments
+    voltageLimit = isFineAdjusting ? 3.5 : 3.0;
   } else {
-    voltageLimit = 2.5;  // Reduced from 2.2 for final approach
+    // Significantly increased for small errors during fine adjustments
+    voltageLimit = isFineAdjusting ? 3.5 : 2.5;  // Much higher when fine adjusting
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -1198,9 +1213,10 @@ void runMotionControl() {
         stuckCounter++;
 
         // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
-        // Reduced voltage for lower overall operation voltage
+        // Increased voltage for faster correction, especially during fine adjustments
         if (stuckCounter >= 2) {
-          float minVoltage = 2.0;  // Reduced from 2.5 for lower voltage operation
+          bool isFineAdjusting = (fineAdjustmentActive || positionRetryCount > 0);
+          float minVoltage = isFineAdjusting ? 3.0 : 2.5;  // Higher voltage when fine adjusting
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (error < 0) ? -minVoltage : minVoltage;
           }
@@ -1256,15 +1272,13 @@ void setMotor(float voltage) {
   // Convert voltage to PWM (0-255)
   int pwm = abs(voltage) * 25.5;
 
-  // Safety: Check limit switches and prevent movement into limits
+  // Safety: Check left limit switch and prevent movement into limit
+  // Right limit switch is disabled
   if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
     voltage = 0;
     pwm = 0;
   }
-  if (digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
-    voltage = 0;
-    pwm = 0;
-  }
+  // Right limit switch disabled - no check needed
 
   // Apply voltage to H-bridge
   if (voltage > 0) {
