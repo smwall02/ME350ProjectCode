@@ -1226,16 +1226,16 @@ void runMotionControl() {
     errorIntegral += error * dt * 0.7;  // Reduced from 0.8
   } else if (absError > 10) {
     // Near target - reduce gains for smoother approach
-    KP_active = KP * 0.8;  // Reduced from 1.0
-    KI_active = KI * 0.4;  // Reduced from 0.6
-    KD_active = KD * 1.2;  // Reduced from 1.5
-    errorIntegral += error * dt * 0.4;  // Reduced from 0.5
+    KP_active = KP * 0.6;  // Further reduced from 0.8
+    KI_active = KI * 0.3;  // Further reduced from 0.4
+    KD_active = KD * 1.0;  // Reduced from 1.2
+    errorIntegral += error * dt * 0.3;  // Reduced from 0.4
   } else {
     // Very close to target - minimal gains to prevent oscillation
-    KP_active = KP * 0.4;  // Reduced from 0.6
-    KI_active = KI * 0.2;  // Reduced from 0.3
-    KD_active = KD * 1.4;  // Reduced from 1.8
-    errorIntegral += error * dt * 0.2;  // Reduced from 0.3
+    KP_active = KP * 0.2;  // Further reduced from 0.4
+    KI_active = KI * 0.1;  // Further reduced from 0.2
+    KD_active = KD * 1.2;  // Reduced from 1.4
+    errorIntegral += error * dt * 0.1;  // Reduced from 0.2
   }
   
   // Constrain integral to prevent windup
@@ -1325,35 +1325,25 @@ void runMotionControl() {
     // (This will be handled by the rate limiter code checking moveStartTime)
   }
   
-  // Additional check: If motor is stopped and we have a large error, ensure minimum voltage
-  // This helps when starting from rest or after being stuck
-  if (abs(motorVelocity) < 5 && abs(originalError) > 50 && abs(totalVoltage) < 2.0) {
-    // Motor is essentially stopped but we have a significant error - force minimum voltage
-    float startupVoltage = 2.0;  // Minimum to start movement
-    if (abs(originalError) > 200) {
-      startupVoltage = 2.5;  // Higher for very large errors
-    }
-    totalVoltage = (originalError < 0) ? -startupVoltage : startupVoltage;
-  }
-
   // Progressive voltage limiting for smoother deceleration
   // Further reduced limits to prevent jerky movements
   float voltageLimit = 9.0;
-  if (absError > 1000) {
+  long absOriginalError = abs(originalError);
+  if (absOriginalError > 1000) {
     voltageLimit = 8.5;  // Reduced from 9.0
-  } else if (absError > 800) {
+  } else if (absOriginalError > 800) {
     voltageLimit = 8.0;  // Reduced from 8.5
-  } else if (absError > 500) {
+  } else if (absOriginalError > 500) {
     voltageLimit = 7.0;  // Reduced from 8.0
-  } else if (absError > 300) {
+  } else if (absOriginalError > 300) {
     voltageLimit = 6.0;  // Reduced from 7.5
-  } else if (absError > 100) {
+  } else if (absOriginalError > 100) {
     voltageLimit = 5.0;  // Reduced from 6.5
-  } else if (absError > 50) {
+  } else if (absOriginalError > 50) {
     voltageLimit = 4.0;  // Reduced from 5.5
-  } else if (absError > 20) {
+  } else if (absOriginalError > 20) {
     voltageLimit = 3.0;  // Reduced from 4.0
-  } else if (absError > 10) {
+  } else if (absOriginalError > 10) {
     voltageLimit = 2.0;  // Reduced from 3.0
   } else {
     voltageLimit = 1.5;  // Reduced from 2.0
@@ -1361,9 +1351,34 @@ void runMotionControl() {
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
   
-  // Add deadband - stop motor if error and velocity are very small (prevent hunting)
-  if (absError <= 1 && abs(motorVelocity) < 5) {
+  // Add deadband FIRST - stop motor if error and velocity are very small (prevent hunting)
+  // Use originalError to match atTarget check
+  // More aggressive: stop if within target band OR if very close with low velocity
+  if (absOriginalError <= TARGET_BAND) {
+    if (abs(motorVelocity) < 10) {
+      totalVoltage = 0;
+      errorIntegral *= 0.8;  // Decay integral when at target to prevent buildup
+    } else {
+      // Still moving - apply gentle damping
+      totalVoltage = -constrain(motorVelocity * 0.015, -1.0, 1.0);
+    }
+  } else if (absOriginalError <= (TARGET_BAND + 2) && abs(motorVelocity) < 5) {
+    // Very close to target with low velocity - stop to prevent oscillation
     totalVoltage = 0;
+    errorIntegral *= 0.9;  // Decay integral
+  }
+  
+  // Additional check: If motor is stopped and we have a large error, ensure minimum voltage
+  // This helps when starting from rest or after being stuck
+  // BUT only if we're NOT at target AND not very close (to prevent oscillation)
+  if (!atTarget && absOriginalError > 10 && abs(motorVelocity) < 5 && absOriginalError > 50 && abs(totalVoltage) < 2.0) {
+    // Motor is essentially stopped but we have a significant error - force minimum voltage
+    // Only apply if we're far enough from target (error > 10) to avoid oscillation
+    float startupVoltage = 2.0;  // Minimum to start movement
+    if (absOriginalError > 200) {
+      startupVoltage = 2.5;  // Higher for very large errors
+    }
+    totalVoltage = (originalError < 0) ? -startupVoltage : startupVoltage;
   }
 
   if (currentState == MOVE_TO_TARGET && autoMode) {
@@ -1497,7 +1512,8 @@ void runMotionControl() {
     voltageRamping = false;
   }
 
-  if (abs(originalError) > TARGET_BAND && !voltageRamping) {
+  // Only apply minimum friction voltage if NOT at target (to prevent oscillation)
+  if (!atTarget && abs(originalError) > TARGET_BAND && !voltageRamping) {
     bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
     float baseFrictionVoltage = inLeftHalf ? adaptiveFrictionLeft : adaptiveFrictionRight;
     // Increase minimum friction voltage to ensure movement, especially for large errors
@@ -1544,13 +1560,20 @@ void runMotionControl() {
   }
   
   // Limit the rate of voltage change
-  float voltageChange = totalVoltage - lastAppliedVoltage;
-  if (abs(voltageChange) > maxChange) {
-    totalVoltage = lastAppliedVoltage + (voltageChange > 0 ? maxChange : -maxChange);
+  // BUT: if we're at target (deadband applied), allow immediate stop (voltage = 0)
+  // This prevents the rate limiter from causing oscillation
+  if (absOriginalError <= TARGET_BAND && abs(motorVelocity) < 10 && totalVoltage == 0) {
+    // At target and trying to stop - bypass rate limiter to stop immediately
+    lastAppliedVoltage = 0;
+  } else {
+    // Normal rate limiting
+    float voltageChange = totalVoltage - lastAppliedVoltage;
+    if (abs(voltageChange) > maxChange) {
+      totalVoltage = lastAppliedVoltage + (voltageChange > 0 ? maxChange : -maxChange);
+    }
+    // Update last applied voltage
+    lastAppliedVoltage = totalVoltage;
   }
-  
-  // Update last applied voltage
-  lastAppliedVoltage = totalVoltage;
 
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
     setMotor(totalVoltage);
