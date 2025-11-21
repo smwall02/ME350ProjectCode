@@ -94,6 +94,7 @@ int ProxRange[4][2] = {
 bool sensorCalibrated = true;  // Use permanent values, no calibration needed
 bool dynamicCalibrationActive = false;
 bool rangeFindingComplete = true;  // Using fixed bounds
+bool initialRangeFinding = false;  // Flag for initial startup range finding
 unsigned long calibrationStartTime = 0;
 const unsigned long DYNAMIC_CALIBRATION_TIME = 10000;
 
@@ -461,8 +462,24 @@ void updateAllSensors() {
 void updateVelocity() {
   long currentPos = encoder.read();
   
-  // Safety: If at left limit, ensure previous position is also 0
-  if (leftPressed() && abs(currentPos) <= 1) {
+  // Safety: If at left limit, ALWAYS force encoder to 0 and reset tracking
+  if (leftPressed()) {
+    if (abs(currentPos) > 1) {
+      // Encoder not at 0 - force reset
+      encoder.write(0);
+      delay(10);
+      currentPos = encoder.read();
+      if (abs(currentPos) > 1) {
+        // Retry
+        encoder.write(0);
+        delay(10);
+        currentPos = 0;
+      } else {
+        currentPos = 0;
+      }
+    } else {
+      currentPos = 0;
+    }
     previousMotorPosition = 0;
     previousVelCompTime = micros();
     motorVelocity = 0;
@@ -539,7 +556,7 @@ void runStateMachine() {
   switch (currentState) {
     
     case CALIBRATE:
-      // If at left limit switch, ensure encoder is at 0 and don't try to move
+      // If at left limit switch, ensure encoder is at 0 and hold position
       if (leftPressed()) {
         long currentPos = encoder.read();
         if (abs(currentPos) > 1) {
@@ -565,36 +582,68 @@ void runStateMachine() {
           stuckCounter = 0;
         }
         desiredPosition = LOWER_BOUND;
-        // Stop motor - we're already at the limit
-        stopMotor();
+        // Hold at limit with gentle voltage
+        float holdVoltage = max(FRICTION_RIGHT, 1.5);
+        setMotor(holdVoltage);
         errorIntegral = 0;
         // Force position to be 0
         currentPos = 0;
         
-        // Transition to next state since we're already homed
-        if (!dynamicCalibrationActive && sensorCalibrated) {
+        // Check if we're in initial range finding sequence
+        static unsigned long calibrateHoldStart = 0;
+        
+        if (initialRangeFinding) {
+          // First time at left limit - after holding, go find right range
+          if (calibrateHoldStart == 0) {
+            calibrateHoldStart = millis();
+          }
+          if (millis() - calibrateHoldStart > 500) {  // Hold for 500ms
+            calibrateHoldStart = 0;
+            currentState = FIND_RANGE;
+            systemEnabled = true;
+            // Reset encoder to 0 one more time before moving
+            encoder.write(0);
+            delay(100);
+            previousMotorPosition = 0;
+            previousVelCompTime = micros();
+            motorVelocity = 0;
+          }
+        } else {
+          // Not in initial range finding - ready to start operation
+          calibrateHoldStart = 0;
           currentState = CHOOSE_ACTIVE_TARGET;
           systemEnabled = true;
-        }
-        else if (!dynamicCalibrationActive && !sensorCalibrated) {
           rangeFindingComplete = true;
-          startDynamicCalibration();
-          desiredPosition = LOWER_BOUND;
-          systemEnabled = true;
         }
       } else {
+        // Not at left limit - try to home
         desiredPosition = LOWER_BOUND;
+        systemEnabled = true;
+      }
+      break;
+    
+    case FIND_RANGE:
+      // Move to right limit to find UPPER_BOUND
+      if (rightPressed()) {
+        // At right limit - record position as UPPER_BOUND
+        long rightLimitPos = encoder.read();
+        if (rightLimitPos < -100) {  // Sanity check
+          UPPER_BOUND = rightLimitPos;
+        }
+        stopMotor();
+        delay(300);
         
-        if (!dynamicCalibrationActive && sensorCalibrated) {
-          currentState = CHOOSE_ACTIVE_TARGET;
-          systemEnabled = true;
-        }
-        else if (!dynamicCalibrationActive && !sensorCalibrated) {
-          rangeFindingComplete = true;
-          startDynamicCalibration();
-          desiredPosition = LOWER_BOUND;
-          systemEnabled = true;
-        }
+        // Clear the initial range finding flag - we've found the range
+        initialRangeFinding = false;
+        
+        // Now home back to left limit
+        currentState = CALIBRATE;
+        desiredPosition = LOWER_BOUND;
+        systemEnabled = true;
+      } else {
+        // Move toward right limit
+        desiredPosition = -2000;  // Move far right to find limit
+        systemEnabled = true;
       }
       break;
     
@@ -821,27 +870,32 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
-  // CRITICAL: If at left limit, encoder MUST be at 0
+  // CRITICAL: If at left limit, encoder MUST be at 0 - ALWAYS force it
   if (leftPressed()) {
+    // Always reset encoder to 0 when at left limit, regardless of current reading
+    stopMotor();
+    encoder.write(0);
+    delay(50);
+    // Verify and retry if needed
+    currentPosition = encoder.read();
     if (abs(currentPosition) > 1) {
-      // Encoder is not zero - force reset immediately
-      stopMotor();
-      for (int i = 0; i < 10; i++) {
+      for (int i = 0; i < 5; i++) {
         encoder.write(0);
-        delay(50);
+        delay(100);
         currentPosition = encoder.read();
         if (abs(currentPosition) <= 1) {
           break;
         }
       }
-      // Reset all tracking
-      previousMotorPosition = 0;
-      previousVelCompTime = micros();
-      motorVelocity = 0;
-      errorIntegral = 0;
-      lastError = 0;
     }
-    currentPosition = 0;  // Force position to 0 if at limit
+    // Force position to 0 regardless of encoder reading
+    currentPosition = 0;
+    // Reset all tracking to match
+    previousMotorPosition = 0;
+    previousVelCompTime = micros();
+    motorVelocity = 0;
+    errorIntegral = 0;
+    lastError = 0;
   }
   
   // Apply rightward drift compensation: if moving right (toward more negative),
@@ -2008,9 +2062,10 @@ void processCommand() {
           // Reset all state variables
           autoMode = true;
           systemEnabled = true;
-          rangeFindingComplete = true;  // Using fixed bounds, no need to find range
           sensorCalibrated = true;  // Using permanent sensor ranges, no calibration needed
           dynamicCalibrationActive = false;
+          initialRangeFinding = true;  // Start with range finding sequence
+          rangeFindingComplete = false;  // Will be set after range is found
           
           currentState = CALIBRATE;
           errorIntegral = 0;
