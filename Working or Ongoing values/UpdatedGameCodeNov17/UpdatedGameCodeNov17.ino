@@ -344,6 +344,32 @@ void loop() {
   }
   
   checkLimitSwitches();
+  
+  // Periodic encoder bounds validation - ensure encoder never shows invalid positions
+  if (currentTime - lastControlTime >= CONTROL_PERIOD) {
+    long currentPos = encoder.read();
+    const long SAFETY_MARGIN_RIGHT = 30;
+    const long SAFETY_MARGIN_LEFT = 5;
+    
+    // Validate encoder is within safe bounds (only if not in calibration/homing)
+    if (currentState != CALIBRATE && currentState != FIND_RANGE && !dynamicCalibrationActive) {
+      if (currentPos < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+        // Encoder shows position beyond right safety margin - correct it
+        long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+        encoder.write(safeRightLimit);
+        previousMotorPosition = safeRightLimit;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      if (currentPos > SAFETY_MARGIN_LEFT && !leftPressed()) {
+        // Encoder shows position beyond left safety margin - correct it
+        encoder.write(SAFETY_MARGIN_LEFT);
+        previousMotorPosition = SAFETY_MARGIN_LEFT;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+    }
+  }
 }
 
 // ============================================
@@ -624,15 +650,40 @@ void runStateMachine() {
       break;
     
     case FIND_RANGE:
-      // Move to right limit to find UPPER_BOUND
+      // Move to right limit to find UPPER_BOUND - gentle approach
+      static unsigned long rangeFindStartTime = 0;
+      static bool rangeFindStarted = false;
+      
+      if (!rangeFindStarted) {
+        rangeFindStartTime = millis();
+        rangeFindStarted = true;
+      }
+      
       if (rightPressed()) {
         // At right limit - record position as UPPER_BOUND
-        long rightLimitPos = encoder.read();
-        if (rightLimitPos < -100) {  // Sanity check
-          UPPER_BOUND = rightLimitPos;
-        }
+        // Stop immediately and back off slightly
         stopMotor();
         delay(300);
+        
+        // Back off from limit by a small amount (30 counts for safety)
+        long rightLimitPos = encoder.read();
+        if (rightLimitPos < -100) {  // Sanity check
+          UPPER_BOUND = rightLimitPos + 30;  // Add 30 counts safety margin
+        } else {
+          UPPER_BOUND = rightLimitPos + 30;  // Still add margin
+        }
+        
+        // Move slightly left to get off the limit switch
+        desiredPosition = rightLimitPos + 50;  // Back off 50 counts
+        systemEnabled = true;
+        
+        // Wait to move off limit
+        unsigned long backoffStart = millis();
+        while (millis() - backoffStart < 1000 && encoder.read() < rightLimitPos + 40) {
+          delay(50);
+        }
+        
+        rangeFindStarted = false;
         
         // Clear the initial range finding flag - we've found the range
         initialRangeFinding = false;
@@ -642,8 +693,30 @@ void runStateMachine() {
         desiredPosition = LOWER_BOUND;
         systemEnabled = true;
       } else {
-        // Move toward right limit
-        desiredPosition = -2000;  // Move far right to find limit
+        // Move toward right limit - use gentle, gradual approach
+        long currentPos = encoder.read();
+        long estimatedLimit = -1500;  // Conservative estimate
+        const long APPROACH_MARGIN = 50;  // Start slowing 50 counts before limit
+        
+        // Calculate how close we are
+        long distanceToLimit = currentPos - estimatedLimit;
+        
+        if (distanceToLimit > APPROACH_MARGIN + 200) {
+          // Still far away - move toward estimated limit slowly
+          desiredPosition = estimatedLimit + APPROACH_MARGIN;
+        } else if (distanceToLimit > APPROACH_MARGIN) {
+          // Getting closer - slow down more
+          desiredPosition = currentPos - 10;  // Move only 10 counts at a time
+        } else {
+          // Very close - move very slowly
+          desiredPosition = currentPos - 5;  // Move only 5 counts at a time
+        }
+        
+        // Safety: Never go beyond estimated limit
+        if (desiredPosition < estimatedLimit) {
+          desiredPosition = estimatedLimit;
+        }
+        
         systemEnabled = true;
       }
       break;
@@ -708,6 +781,16 @@ void runStateMachine() {
         fineAdjustmentActive = false;
       }
       
+      // Constrain target position to safe bounds
+      const long SAFETY_MARGIN_RIGHT = 30;
+      const long SAFETY_MARGIN_LEFT = 5;
+      if (activeTargetPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+        activeTargetPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+      }
+      if (activeTargetPosition > SAFETY_MARGIN_LEFT) {
+        activeTargetPosition = SAFETY_MARGIN_LEFT;
+      }
+      
       desiredPosition = activeTargetPosition;
       moveStartTime = millis();
       arrivalTime = millis();
@@ -726,10 +809,43 @@ void runStateMachine() {
         desiredPosition = activeTargetPosition;
       }
       
+      // Constrain desired position to safe bounds
+      const long SAFETY_MARGIN_RIGHT = 30;
+      const long SAFETY_MARGIN_LEFT = 5;
+      if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+        desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+      }
+      if (desiredPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
+        desiredPosition = SAFETY_MARGIN_LEFT;
+      }
+      
       long currentPos = encoder.read();
+      
+      // Validate encoder position is within bounds
+      if (currentPos < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+        // Too far right - correct encoder
+        long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+        encoder.write(safeRightLimit);
+        delay(50);
+        currentPos = safeRightLimit;
+        previousMotorPosition = safeRightLimit;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      if (currentPos > SAFETY_MARGIN_LEFT && !leftPressed()) {
+        // Too far left (but not at limit) - correct encoder
+        encoder.write(SAFETY_MARGIN_LEFT);
+        delay(50);
+        currentPos = SAFETY_MARGIN_LEFT;
+        previousMotorPosition = SAFETY_MARGIN_LEFT;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      
       long error = desiredPosition - currentPos;
       
-      if (currentPos < UPPER_BOUND - 50) {
+      // Safety check: if beyond safe range, choose new target
+      if (currentPos < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
         currentState = CHOOSE_ACTIVE_TARGET;
         break;
       }
@@ -840,6 +956,16 @@ void runStateMachine() {
                 fineAdjustmentTarget = activeTargetPosition + FINE_ADJUSTMENT_AMOUNT;
               } else {
                 fineAdjustmentTarget = activeTargetPosition - FINE_ADJUSTMENT_AMOUNT;
+              }
+              
+              // Constrain fine adjustment to safe bounds
+              const long SAFETY_MARGIN_RIGHT = 30;
+              const long SAFETY_MARGIN_LEFT = 5;
+              if (fineAdjustmentTarget < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+                fineAdjustmentTarget = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+              }
+              if (fineAdjustmentTarget > SAFETY_MARGIN_LEFT && !leftPressed()) {
+                fineAdjustmentTarget = SAFETY_MARGIN_LEFT;
               }
               
               fineAdjustmentActive = true;
@@ -1000,12 +1126,17 @@ void runMotionControl() {
   }
   
   // Safety: Never allow positions beyond upper bound (too far right)
-  if (currentPosition < UPPER_BOUND - 20) {
-    // Encoder has gone beyond safe range - cap it
-    encoder.write(UPPER_BOUND);
+  // Add safety margin to prevent hitting right limit switch
+  const long SAFETY_MARGIN_RIGHT = 30;  // Stop 30 counts before right limit
+  const long SAFETY_MARGIN_LEFT = 5;    // Stop 5 counts before left limit (encoder should be 0)
+  
+  if (currentPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+    // Encoder has gone beyond safe range - cap it at safety margin
+    long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+    encoder.write(safeRightLimit);
     delay(50);
-    currentPosition = UPPER_BOUND;
-    previousMotorPosition = UPPER_BOUND;
+    currentPosition = safeRightLimit;
+    previousMotorPosition = safeRightLimit;
     previousVelCompTime = micros();
     motorVelocity = 0;
     errorIntegral = 0;
@@ -1015,6 +1146,28 @@ void runMotionControl() {
       adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
     }
     error = adjustedDesiredPosition - currentPosition;
+  }
+  
+  // Safety: Prevent movement beyond safe bounds
+  if (currentPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+    // Too close to right limit - stop and correct
+    stopMotor();
+    long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+    encoder.write(safeRightLimit);
+    delay(50);
+    currentPosition = safeRightLimit;
+    previousMotorPosition = safeRightLimit;
+    previousVelCompTime = micros();
+    motorVelocity = 0;
+    errorIntegral = 0;
+    return;
+  }
+  
+  if (currentPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
+    // Too close to left limit (but not at it) - ensure we don't go further left
+    if (desiredPosition > SAFETY_MARGIN_LEFT) {
+      desiredPosition = SAFETY_MARGIN_LEFT;
+    }
   }
   
   if (currentState == MOVE_TO_TARGET && autoMode) {
@@ -1044,7 +1197,60 @@ void runMotionControl() {
   if (!leftPressed()) {
     currentPosition = encoder.read();
   }
+  
+  // CRITICAL: Constrain desired position to safe bounds
+  const long SAFETY_MARGIN_RIGHT = 30;  // Stop 30 counts before right limit
+  const long SAFETY_MARGIN_LEFT = 5;    // Stop 5 counts before left limit
+  
+  // Ensure desired position doesn't go beyond safe bounds
+  if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+    desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+  }
+  if (desiredPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
+    desiredPosition = SAFETY_MARGIN_LEFT;
+  }
+  
   float originalError = desiredPosition - currentPosition;
+  
+  // CRITICAL: Prevent any movement when at limit switches (except during calibration/homing)
+  if (leftPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
+    // At left limit - only allow rightward movement (negative error)
+    if (originalError > 0) {
+      // Trying to move left - stop immediately
+      stopMotor();
+      errorIntegral = 0;
+      if (abs(currentPosition) > 2) {
+        encoder.write(0);
+        delay(50);
+        previousMotorPosition = 0;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+        currentPosition = encoder.read();
+        originalError = desiredPosition - currentPosition;
+      }
+      return;
+    }
+  }
+  
+  if (rightPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
+    // At right limit - only allow leftward movement (positive error)
+    if (originalError < 0) {
+      // Trying to move right - stop immediately
+      stopMotor();
+      errorIntegral = 0;
+      long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+      if (currentPosition < safeRightLimit) {
+        encoder.write(safeRightLimit);
+        delay(50);
+        previousMotorPosition = safeRightLimit;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+        currentPosition = encoder.read();
+        originalError = desiredPosition - currentPosition;
+      }
+      return;
+    }
+  }
   
   // CRITICAL: Prevent leftward movement when at left limit (backup check)
   if (leftPressed() && originalError > 0) {
@@ -1060,6 +1266,24 @@ void runMotionControl() {
       motorVelocity = 0;
       currentPosition = encoder.read();
       originalError = desiredPosition - currentPosition;
+    }
+    return;
+  }
+  
+  // CRITICAL: Prevent rightward movement beyond safe limit
+  if (currentPosition <= UPPER_BOUND - SAFETY_MARGIN_RIGHT && originalError < 0) {
+    // Too close to right limit and trying to move further right - stop immediately
+    stopMotor();
+    errorIntegral = 0;
+    // Cap position at safety margin
+    long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+    if (currentPosition < safeRightLimit) {
+      encoder.write(safeRightLimit);
+      delay(50);
+      currentPosition = safeRightLimit;
+      previousMotorPosition = safeRightLimit;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
     }
     return;
   }
@@ -1270,22 +1494,38 @@ void runMotionControl() {
 
   // Voltage capping based on error magnitude (increased significantly for faster movement)
   // Also ensures minimum voltage to overcome static friction
+  // Use lower voltage during range finding for gentler approach
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
-  if (absErr > 800) {
-    voltageLimit = 6.5;  // Increased from 4.5 for much faster long moves
-  } else if (absErr > 500) {
-    voltageLimit = 6.0;  // Increased from 4.0
-  } else if (absErr > 300) {
-    voltageLimit = 5.5;  // Increased from 3.5
-  } else if (absErr > 100) {
-    voltageLimit = 5.0;  // Increased from 3.0
-  } else if (absErr > 50) {
-    voltageLimit = 4.5;  // Increased from 2.5
-  } else if (absErr > 10) {
-    voltageLimit = 4.0;  // Increased for medium errors
+  
+  if (currentState == FIND_RANGE) {
+    // Range finding mode - use lower, gentler voltages
+    if (absErr > 500) {
+      voltageLimit = 4.0;  // Gentle for long moves
+    } else if (absErr > 200) {
+      voltageLimit = 3.5;  // Medium speed
+    } else if (absErr > 50) {
+      voltageLimit = 3.0;  // Slower approach
+    } else {
+      voltageLimit = 2.5;  // Very gentle near limit
+    }
   } else {
-    voltageLimit = 3.5;  // Minimum for small errors - enough to overcome static friction
+    // Normal operation - higher voltages
+    if (absErr > 800) {
+      voltageLimit = 6.5;  // Increased from 4.5 for much faster long moves
+    } else if (absErr > 500) {
+      voltageLimit = 6.0;  // Increased from 4.0
+    } else if (absErr > 300) {
+      voltageLimit = 5.5;  // Increased from 3.5
+    } else if (absErr > 100) {
+      voltageLimit = 5.0;  // Increased from 3.0
+    } else if (absErr > 50) {
+      voltageLimit = 4.5;  // Increased from 2.5
+    } else if (absErr > 10) {
+      voltageLimit = 4.0;  // Increased for medium errors
+    } else {
+      voltageLimit = 3.5;  // Minimum for small errors - enough to overcome static friction
+    }
   }
 
   // Allow higher voltage limit during retry mode (20% boost)
@@ -1389,11 +1629,27 @@ void setMotor(float voltage) {
   int pwm = abs(voltage) * 25.5;
 
   // Safety: Check limit switches and prevent movement into limits
+  // Also check encoder position to prevent getting too close to limits
+  long currentPos = encoder.read();
+  const long SAFETY_MARGIN_RIGHT = 30;  // Stop 30 counts before right limit
+  const long SAFETY_MARGIN_LEFT = 5;    // Stop 5 counts before left limit
+  
+  // Prevent leftward movement at or near left limit
   if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
     voltage = 0;
     pwm = 0;
+  } else if (currentPos <= SAFETY_MARGIN_LEFT && voltage > 0 && !leftPressed()) {
+    // Too close to left limit - prevent further leftward movement
+    voltage = 0;
+    pwm = 0;
   }
+  
+  // Prevent rightward movement at or near right limit
   if (digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
+    voltage = 0;
+    pwm = 0;
+  } else if (currentPos <= UPPER_BOUND - SAFETY_MARGIN_RIGHT && voltage < 0) {
+    // Too close to right limit - prevent further rightward movement
     voltage = 0;
     pwm = 0;
   }
@@ -2382,6 +2638,17 @@ void setTargetLane(int lane) {
   if (lane < 1 || lane > 4) return;
 
   desiredPosition = targetPositions[lane - 1];
+  
+  // Constrain desired position to safe bounds
+  const long SAFETY_MARGIN_RIGHT = 30;
+  const long SAFETY_MARGIN_LEFT = 5;
+  if (desiredPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
+    desiredPosition = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+  }
+  if (desiredPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
+    desiredPosition = SAFETY_MARGIN_LEFT;
+  }
+  
   errorIntegral = 0;
   lastError = 0;
   moveStartTime = millis();
