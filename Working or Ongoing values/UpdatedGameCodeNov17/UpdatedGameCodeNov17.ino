@@ -68,6 +68,7 @@ const long WAIT_POSITION_OFFSET = 2;
 long WAIT_POSITION = TARGET_3_POSITION;
 long LOWER_BOUND = 0;      // Fixed: Left limit position (home)
 long UPPER_BOUND = -1424;  // Fixed: Right limit position (from calibration)
+long RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;  // Midpoint for position-based friction selection
 
 long targetPositions[4] = {
   TARGET_1_POSITION,
@@ -148,10 +149,11 @@ const unsigned long MIN_FINE_ADJUSTMENT_INTERVAL = 50;  // Minimum time between 
 // FRICTION COMPENSATION (Improved)
 // ============================================
 // NOTE: These values will be loaded from EEPROM if available
-// FRICTION_LEFT: voltage needed when moving TO MORE NEGATIVE positions (away from home)
-// FRICTION_RIGHT: voltage needed when moving TO LESS NEGATIVE positions (toward home)
+// FRICTION_LEFT: voltage needed when mechanism is in LEFT HALF of range (positions closer to 0)
+// FRICTION_RIGHT: voltage needed when mechanism is in RIGHT HALF of range (positions closer to UPPER_BOUND)
+// Friction is position-based, not direction-based, as the mechanism characteristics change based on physical position
 float FRICTION_LEFT = 0.25;  // Reduced from 2.2 to prevent overshoot to right
-float FRICTION_RIGHT = 0.25; // For moving toward less negative (left/toward home)
+float FRICTION_RIGHT = 0.25; // For right half of range
 
 // Adaptive friction boost (increases if target not reached)
 float adaptiveFrictionLeft = FRICTION_LEFT;
@@ -997,7 +999,7 @@ void runMotionControl() {
     }
   }
   
-  // IMPROVED: Adaptive friction learning - learns direction-specific friction
+  // IMPROVED: Adaptive friction learning - learns position-based friction
   // Start learning when error is significant but not too large (better for accuracy)
   if (abs(error) > 100 && abs(error) < 800 && !adaptiveLearning && !adaptiveLearned) {
     adaptiveLearning = true;
@@ -1005,10 +1007,10 @@ void runMotionControl() {
     lastAdaptivePosition = currentPosition;
     adaptiveStartTime = millis();
     
-    // Determine direction for learning
-    bool movingRight = (error < 0);
+    // Determine which half of range we're in for learning
+    bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
     Serial.print(F("🔍 Learning friction ("));
-    Serial.print(movingRight ? F("RIGHT") : F("LEFT"));
+    Serial.print(inLeftHalf ? F("LEFT half") : F("RIGHT half"));
     Serial.println(F(")..."));
   }
   
@@ -1019,21 +1021,22 @@ void runMotionControl() {
     
     // Movement detected - friction learned!
     if (positionChange >= 5) {  // More sensitive: 5 counts instead of 10
-      bool movingRight = (error < 0);
+      // Determine which half of range we're in based on current position
+      bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
       
-      // Store learned friction in appropriate direction variable
-      if (movingRight) {
-        adaptiveFrictionLeft = adaptiveFrictionVoltage;  // Moving right = need left friction
+      // Store learned friction in appropriate position-based variable
+      if (inLeftHalf) {
+        adaptiveFrictionLeft = adaptiveFrictionVoltage;  // Left half of range
         FRICTION_LEFT = adaptiveFrictionVoltage;
       } else {
-        adaptiveFrictionRight = adaptiveFrictionVoltage;  // Moving left = need right friction
+        adaptiveFrictionRight = adaptiveFrictionVoltage;  // Right half of range
         FRICTION_RIGHT = adaptiveFrictionVoltage;
       }
       
       Serial.print(F("  ✓ Learned friction: "));
       Serial.print(adaptiveFrictionVoltage, 2);
       Serial.print(F("V ("));
-      Serial.print(movingRight ? F("LEFT") : F("RIGHT"));
+      Serial.print(inLeftHalf ? F("LEFT half") : F("RIGHT half"));
       Serial.println(F(")"));
       
       adaptiveLearning = false;
@@ -1059,9 +1062,9 @@ void runMotionControl() {
         adaptiveLearning = false;
         adaptiveLearned = true;
         
-        // Store conservative value
-        bool movingRight = (error < 0);
-        if (movingRight) {
+        // Store conservative value based on current position
+        bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
+        if (inLeftHalf) {
           adaptiveFrictionLeft = 2.5;
           FRICTION_LEFT = 2.5;
         } else {
@@ -1078,9 +1081,9 @@ void runMotionControl() {
       adaptiveLearned = true;
       adaptiveFrictionVoltage = 2.0;  // Use conservative default
       
-      // Store default value
-      bool movingRight = (error < 0);
-      if (movingRight) {
+      // Store default value based on current position
+      bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
+      if (inLeftHalf) {
         adaptiveFrictionLeft = 2.0;
         FRICTION_LEFT = 2.0;
       } else {
@@ -1166,8 +1169,9 @@ void runMotionControl() {
   float frictionComp = 0;
   // Disabled until proper tuning can be done
   // if (abs(error) > TARGET_BAND) {
-  //   bool movingTowardMoreNegative = (error < 0);
-  //   float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
+  //   // Use position-based friction (which half of range we're in)
+  //   bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
+  //   float baseFriction = inLeftHalf ? adaptiveFrictionLeft : adaptiveFrictionRight;
   //   float frictionScale = 1.0;
   //   float absError = abs(error);
   //   if (absError < 3) frictionScale = 0.05;
@@ -1277,9 +1281,9 @@ void runMotionControl() {
         if (stuckCounter >= 2) {
           voltageRamping = true;
           
-          // Calculate minimum voltage based on friction for this direction
-          bool movingRight = (error < 0);
-          float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
+          // Calculate minimum voltage based on friction for current position (which half of range)
+          bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
+          float baseFrictionVoltage = inLeftHalf ? adaptiveFrictionLeft : adaptiveFrictionRight;
           
           // Ensure minimum is at least 2.0V to overcome friction
           float minFrictionVoltage = max(baseFrictionVoltage, 2.0f);
@@ -1336,8 +1340,9 @@ void runMotionControl() {
   // This helps overcome static friction when correcting errors
   // IMPORTANT: This preserves PID voltage when it's already sufficient, only boosts when too low
   if (abs(originalError) > TARGET_BAND && !voltageRamping) {
-    bool movingRight = (error < 0);
-    float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
+    // Use position-based friction (which half of range we're in)
+    bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
+    float baseFrictionVoltage = inLeftHalf ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);  // At least 1.5V to overcome friction
     
     // If PID voltage is less than friction voltage, boost to friction voltage
@@ -1474,10 +1479,14 @@ bool homeToLeftLimit() {
     Serial.println(F("At limit, stabilizing..."));
 
     // Hold gently at limit to ensure stable position
+    // Use position-based friction (at left limit, we're in left half)
+    long currentPos = encoder.read();
+    bool inLeftHalf = (currentPos > RANGE_MIDPOINT);
+    float frictionForPosition = inLeftHalf ? FRICTION_LEFT : FRICTION_RIGHT;
     long lastPos = encoder.read();
     unsigned long holdStart = millis();
     int stableTicks = 0;
-    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+    float holdVoltage = max(frictionForPosition, CALIBRATE_MIN_VOLTAGE - 0.5);
 
     while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
       setMotor(holdVoltage);
@@ -1520,8 +1529,12 @@ bool homeToLeftLimit() {
   }
 
   // Approach limit switch
+  // Use position-based friction based on current position
+  long currentPos = encoder.read();
+  bool inLeftHalf = (currentPos > RANGE_MIDPOINT);
+  float frictionForPosition = inLeftHalf ? FRICTION_LEFT : FRICTION_RIGHT;
   unsigned long startTime = millis();
-  float driveVoltage = max(FRICTION_RIGHT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+  float driveVoltage = max(frictionForPosition + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
   setMotor(driveVoltage);
 
   while (!leftPressed() && (millis() - startTime) < 15000) {
@@ -1532,11 +1545,14 @@ bool homeToLeftLimit() {
     Serial.println(F("Contact..."));
 
     // Hold gently at limit to remove bounce
+    // Use position-based friction (at left limit, we're in left half)
     long currentPos = encoder.read();
+    bool inLeftHalf = (currentPos > RANGE_MIDPOINT);
+    float frictionForPosition = inLeftHalf ? FRICTION_LEFT : FRICTION_RIGHT;
     long lastPos = currentPos;
     unsigned long holdStart = millis();
     int stableTicks = 0;
-    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+    float holdVoltage = max(frictionForPosition, CALIBRATE_MIN_VOLTAGE - 0.5);
 
     while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
       setMotor(holdVoltage);
