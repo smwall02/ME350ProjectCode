@@ -574,6 +574,11 @@ void findRange() {
         rangeFindingActive = false;
         rangeFindingState = RANGE_IDLE;
         Serial.println(F("Range complete"));
+        
+        // After range finding, we're at the right limit. 
+        // Move back to left limit and reset encoder to 0 before starting normal operation
+        // This will be handled by the state machine transitioning to sensor calibration
+        // and then to CHOOSE_ACTIVE_TARGET, which will move to the wait position
       }
       break;
       
@@ -687,8 +692,25 @@ void runStateMachine() {
         systemEnabled = true;
       }
       else if (!dynamicCalibrationActive && sensorCalibrated) {
-        currentState = CHOOSE_ACTIVE_TARGET;
-        systemEnabled = true;
+        // After sensor calibration, ensure we're at the left limit (position 0)
+        // Move there if we're not already there
+        long currentPos = encoder.read();
+        if (currentPos < -50) {
+          // We're still at or near the right limit, move to left limit first
+          desiredPosition = LOWER_BOUND;
+          // Stay in CALIBRATE state until we reach the left limit
+        } else {
+          // We're close to the left limit, reset encoder to 0 and proceed
+          if (leftPressed() && abs(currentPos) <= 10) {
+            encoder.write(0);
+            delay(50);
+            if (encoder.read() != 0) {
+              encoder.write(0);
+            }
+          }
+          currentState = CHOOSE_ACTIVE_TARGET;
+          systemEnabled = true;
+        }
       }
       break;
     
@@ -699,16 +721,15 @@ void runStateMachine() {
           startDynamicCalibration();
           desiredPosition = LOWER_BOUND;
         } else {
-          // Ensure encoder is at 0 after range finding
+          // After range finding, we're at the right limit (UPPER_BOUND)
+          // Move back to left limit and reset encoder to 0
+          // But first, ensure encoder position is correct
           long currentPos = encoder.read();
-          if (currentPos > 10 || currentPos < -10) {
-            // Encoder drifted, reset it
-            encoder.write(0);
-            delay(50);
-            if (encoder.read() != 0) {
-              encoder.write(0);
-            }
-          }
+          // If we're at the right limit, the encoder should be at UPPER_BOUND
+          // But we want to be at 0 (left limit) for normal operation
+          // So we'll let the motion control move us back to LOWER_BOUND (0)
+          // and checkLimitSwitches will reset the encoder when we hit the left limit
+          desiredPosition = LOWER_BOUND;  // Move to left limit (position 0)
           currentState = CHOOSE_ACTIVE_TARGET;
         }
       }
@@ -1418,21 +1439,18 @@ void checkLimitSwitches() {
       }
     } else if (currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) {
       // During normal operation, only stop if we're trying to move toward the limit
+      // AND we're actually very close to the real UPPER_BOUND (within 20 counts)
+      // Do NOT update UPPER_BOUND during normal operation - it was set during range finding
       long currentPos = encoder.read();
       long error = desiredPosition - currentPos;
-      // Only stop if error is negative (trying to move right/negative direction) 
-      // AND we're actually at or very close to the limit (position >= UPPER_BOUND - 5)
-      // AND velocity is low
-      // AND debounce time has passed
-      if (error < 0 && currentPos >= (UPPER_BOUND - 5) && abs(motorVelocity) < 10 &&
+      // Only stop if:
+      // 1. Error is negative (trying to move right/negative direction)
+      // 2. We're actually very close to the real UPPER_BOUND (within 20 counts)
+      // 3. Velocity is low
+      // 4. Debounce time has passed
+      if (error < 0 && currentPos <= (UPPER_BOUND + 20) && abs(motorVelocity) < 10 &&
           (currentTime - lastRightLimitReset) > LIMIT_RESET_DEBOUNCE) {
         stopMotor();
-        if (abs(currentPos - UPPER_BOUND) > 10) {
-          UPPER_BOUND = currentPos;
-          RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;
-          Serial.print(F("Right limit: "));
-          Serial.println(UPPER_BOUND);
-        }
         errorIntegral = 0;
         lastRightLimitReset = currentTime;
         Serial.println(F("Right limit hit"));
