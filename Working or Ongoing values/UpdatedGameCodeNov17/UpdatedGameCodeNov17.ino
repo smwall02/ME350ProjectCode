@@ -1085,6 +1085,13 @@ void runMotionControl() {
   
   float dt = CONTROL_PERIOD / 1000.0;
   
+  // ============================================
+  // PID CONTROL CALCULATION (Primary control method)
+  // ============================================
+  // NOTE: PID values (KP, KI, KD) are ALWAYS used as the base for motor control
+  // The following sections may add boosts or minimums, but PID is always the foundation
+  // Adaptive friction learning (above) temporarily bypasses PID only during initial learning phase
+  
   // Adaptive PID gains - increased for faster error correction
   if (abs(error) > 300) {
     KP_active = KP * 2.5;  // Increased for faster large error correction
@@ -1162,7 +1169,8 @@ void runMotionControl() {
     fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);  // Increased limit for faster correction
   }
 
-  // Calculate total voltage
+  // Calculate total voltage - PID is the base, with optional boosts added
+  // totalVoltage = PID (primary) + friction compensation + velocity feedforward + fine adjustment boost
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
   // Voltage capping based on error magnitude - increased for faster error correction
@@ -1237,9 +1245,14 @@ void runMotionControl() {
           // Cap at voltage limit for current error range
           rampVoltage = min(rampVoltage, voltageLimit);
           
-          // Apply ramped voltage if current voltage is less
+          // Apply ramped voltage only if PID voltage is insufficient
+          // Use maximum of PID voltage and ramp voltage to ensure PID is respected when sufficient
+          // This ensures PID control is primary, with ramping as backup when stuck
           if (abs(totalVoltage) < rampVoltage) {
-            totalVoltage = (error < 0) ? -rampVoltage : rampVoltage;
+            // Preserve PID direction and use max of PID and ramp voltage
+            float pidMagnitude = abs(totalVoltage);
+            float finalVoltage = max(pidMagnitude, rampVoltage);
+            totalVoltage = (error < 0) ? -finalVoltage : finalVoltage;
           }
         }
       } else {
@@ -1260,15 +1273,19 @@ void runMotionControl() {
 
   // Ensure minimum voltage for error correction (at least friction voltage)
   // This helps overcome static friction when correcting errors
+  // IMPORTANT: This preserves PID voltage when it's already sufficient, only boosts when too low
   if (abs(originalError) > TARGET_BAND && !voltageRamping) {
     bool movingRight = (error < 0);
     float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);  // At least 1.5V to overcome friction
     
-    // If calculated voltage is less than friction voltage, boost to friction voltage
-    // This ensures we can overcome static friction during error correction
+    // If PID voltage is less than friction voltage, boost to friction voltage
+    // Preserve PID direction and use max to ensure PID is respected when sufficient
     if (abs(totalVoltage) < minFrictionVoltage) {
-      totalVoltage = (error < 0) ? -minFrictionVoltage : minFrictionVoltage;
+      // Use max to preserve PID magnitude when it's already above minimum
+      float pidMagnitude = abs(totalVoltage);
+      float finalVoltage = max(pidMagnitude, minFrictionVoltage);
+      totalVoltage = (error < 0) ? -finalVoltage : finalVoltage;
     }
   }
 
