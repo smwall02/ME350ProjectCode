@@ -1164,8 +1164,9 @@ void runMotionControl() {
   
   // Safety: Never allow positions beyond upper bound (too far right)
   // Add safety margin to prevent hitting right limit switch
+  // Only prevent rightward movement - allow leftward movement
   if (currentPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
-    // Encoder has gone beyond safe range - cap it at safety margin
+    // Too close to right limit - correct encoder position
     long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
     encoder.write(safeRightLimit);
     delay(50);
@@ -1173,28 +1174,22 @@ void runMotionControl() {
     previousMotorPosition = safeRightLimit;
     previousVelCompTime = micros();
     motorVelocity = 0;
-    errorIntegral = 0;
-    // Recalculate error with corrected position
+    // Recalculate error after encoder correction
     adjustedDesiredPosition = desiredPosition;
     if (currentPosition > desiredPosition) {
       adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
     }
     error = adjustedDesiredPosition - currentPosition;
-  }
-  
-  // Safety: Prevent movement beyond safe bounds
-  if (currentPosition < UPPER_BOUND - SAFETY_MARGIN_RIGHT) {
-    // Too close to right limit - stop and correct
-    stopMotor();
-    long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
-    encoder.write(safeRightLimit);
-    delay(50);
-    currentPosition = safeRightLimit;
-    previousMotorPosition = safeRightLimit;
-    previousVelCompTime = micros();
-    motorVelocity = 0;
-    errorIntegral = 0;
-    return;
+    float originalError = desiredPosition - currentPosition;
+    
+    // Only prevent rightward movement - allow leftward movement
+    if (originalError < 0) {
+      // Trying to move right - stop and prevent
+      stopMotor();
+      errorIntegral = 0;
+      return;
+    }
+    // If trying to move left (positive error), continue with normal control
   }
   
   if (currentPosition > SAFETY_MARGIN_LEFT && !leftPressed()) {
@@ -1276,23 +1271,33 @@ void runMotionControl() {
   }
   
   if (rightPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
-    // At right limit - only allow leftward movement (positive error)
+    // At right limit - correct encoder position and only allow leftward movement
+    long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
+    if (currentPosition < safeRightLimit) {
+      // Encoder shows position beyond safe limit - correct it
+      encoder.write(safeRightLimit);
+      delay(50);
+      currentPosition = safeRightLimit;
+      previousMotorPosition = safeRightLimit;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+      // Recalculate error with corrected position
+      originalError = desiredPosition - currentPosition;
+      adjustedDesiredPosition = desiredPosition;
+      if (currentPosition > desiredPosition) {
+        adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+      }
+      error = adjustedDesiredPosition - currentPosition;
+    }
+    
+    // Only prevent rightward movement - allow leftward movement
     if (originalError < 0) {
       // Trying to move right - stop immediately
       stopMotor();
       errorIntegral = 0;
-      long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
-      if (currentPosition < safeRightLimit) {
-        encoder.write(safeRightLimit);
-        delay(50);
-        previousMotorPosition = safeRightLimit;
-        previousVelCompTime = micros();
-        motorVelocity = 0;
-        currentPosition = encoder.read();
-        originalError = desiredPosition - currentPosition;
-      }
       return;
     }
+    // If trying to move left (positive error), continue with normal control below
   }
   
   // CRITICAL: Prevent leftward movement when at left limit (backup check)
