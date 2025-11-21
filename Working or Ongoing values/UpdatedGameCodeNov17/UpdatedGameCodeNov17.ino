@@ -619,13 +619,25 @@ void runStateMachine() {
         // Check if we're in initial range finding sequence
         static unsigned long calibrateHoldStart = 0;
         
+        // Debug: Print state of initialRangeFinding flag
+        static unsigned long lastDebugPrint = 0;
+        if (millis() - lastDebugPrint > 1000) {
+          Serial.print(F("CAL: initialRangeFinding="));
+          Serial.print(initialRangeFinding ? F("true") : F("false"));
+          Serial.print(F(" leftPressed="));
+          Serial.println(leftPressed() ? F("true") : F("false"));
+          lastDebugPrint = millis();
+        }
+        
         if (initialRangeFinding) {
           // First time at left limit - after holding, go find right range
           if (calibrateHoldStart == 0) {
             calibrateHoldStart = millis();
+            Serial.println(F("Holding..."));
           }
           if (millis() - calibrateHoldStart > 500) {  // Hold for 500ms
             calibrateHoldStart = 0;
+            Serial.println(F("Finding range..."));
             currentState = FIND_RANGE;
             systemEnabled = true;
             // Reset encoder to 0 one more time before moving
@@ -636,11 +648,16 @@ void runStateMachine() {
             motorVelocity = 0;
           }
         } else {
-          // Not in initial range finding - ready to start operation
+          // Not in initial range finding - ready to start operation immediately
           calibrateHoldStart = 0;
+          Serial.println(F("Range found, starting operation..."));
           currentState = CHOOSE_ACTIVE_TARGET;
           systemEnabled = true;
           rangeFindingComplete = true;
+          // Stop holding motor
+          stopMotor();
+          // Break immediately to ensure transition takes effect
+          break;
         }
       } else {
         // Not at left limit - try to home
