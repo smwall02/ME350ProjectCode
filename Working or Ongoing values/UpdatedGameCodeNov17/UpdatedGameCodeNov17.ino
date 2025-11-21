@@ -1248,10 +1248,19 @@ void runMotionControl() {
     desiredPosition = SAFETY_MARGIN_LEFT;
   }
   
+  // Calculate original error BEFORE any further checks
   float originalError = desiredPosition - currentPosition;
   
+  // Recalculate adjusted error and error after position constraints
+  adjustedDesiredPosition = desiredPosition;
+  if (currentPosition > desiredPosition) {
+    adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+  }
+  error = adjustedDesiredPosition - currentPosition;
+  
   // CRITICAL: Prevent any movement when at limit switches (except during calibration/homing)
-  if (leftPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
+  // For manual mode (not auto), allow movement from limits
+  if (leftPressed() && autoMode && currentState != CALIBRATE && currentState != FIND_RANGE) {
     // At left limit - only allow rightward movement (negative error)
     if (originalError > 0) {
       // Trying to move left - stop immediately
@@ -1270,7 +1279,7 @@ void runMotionControl() {
     }
   }
   
-  if (rightPressed() && currentState != CALIBRATE && currentState != FIND_RANGE) {
+  if (rightPressed() && autoMode && currentState != CALIBRATE && currentState != FIND_RANGE) {
     // At right limit - correct encoder position and only allow leftward movement
     long safeRightLimit = UPPER_BOUND - SAFETY_MARGIN_RIGHT;
     if (currentPosition < safeRightLimit) {
