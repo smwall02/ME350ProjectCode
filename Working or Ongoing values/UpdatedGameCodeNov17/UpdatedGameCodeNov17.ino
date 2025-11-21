@@ -913,11 +913,12 @@ void runStateMachine() {
 
       long errorToCurrentTarget = desiredPosition - currentPos;
       long errorToOriginalTarget = activeTargetPosition - currentPos;
+      // More conservative fine adjustment - only if error is significant and stable
       if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
-          (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-          abs(motorVelocity) < 30 &&
-          abs(errorToOriginalTarget) <= 8 &&
+          (millis() - lastFineAdjustmentTime) >= (MIN_FINE_ADJUSTMENT_INTERVAL * 2) &&  // Double the interval
+          abs(motorVelocity) < 20 &&  // Lower velocity threshold
+          abs(errorToOriginalTarget) <= 6 &&  // Reduced from 8
           abs(errorToOriginalTarget) > TARGET_BAND &&
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           !ProxSensors[activeTargetIndex].hitDetected &&
@@ -962,12 +963,13 @@ void runStateMachine() {
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      !fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
-                     (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-                     abs(motorVelocity) < 30 &&
-                     abs(errorToOriginalTarget) <= TARGET_BAND + 5 &&
+                     (millis() - lastFineAdjustmentTime) >= (MIN_FINE_ADJUSTMENT_INTERVAL * 3) &&  // Triple the interval
+                     abs(motorVelocity) < 15 &&  // Lower velocity threshold
+                     abs(errorToOriginalTarget) > TARGET_BAND &&  // Only if outside target band
+                     abs(errorToOriginalTarget) <= TARGET_BAND + 3 &&  // Reduced from 5
                      !ProxSensors[activeTargetIndex].hitDetected) {
               
-              if (abs(errorToOriginalTarget) > 0) {
+              if (abs(errorToOriginalTarget) > TARGET_BAND) {
                 fineAdjustmentTarget = activeTargetPosition;
                 fineAdjustmentCount++;
                 lastFineAdjustmentTime = millis();
@@ -984,11 +986,11 @@ void runStateMachine() {
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
-                     (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-                     abs(motorVelocity) < 25 &&
-                     abs(errorToCurrentTarget) > 1 &&
+                     (millis() - lastFineAdjustmentTime) >= (MIN_FINE_ADJUSTMENT_INTERVAL * 2) &&  // Double the interval
+                     abs(motorVelocity) < 15 &&  // Lower velocity threshold
+                     abs(errorToCurrentTarget) > TARGET_BAND &&  // Only if outside target band
                      !ProxSensors[activeTargetIndex].hitDetected &&
-                     (millis() - arrivalTime) >= 100) {
+                     (millis() - arrivalTime) >= 200) {  // Increased from 100ms
               fineAdjustmentTarget = activeTargetPosition;
               fineAdjustmentCount++;
               lastFineAdjustmentTime = millis();
@@ -1062,8 +1064,17 @@ void runMotionControl() {
   bool atTarget = fineAdjustmentActive ? (abs(originalError) <= 1) : (abs(originalError) <= TARGET_BAND);
   
   if (atTarget) {
-    stopMotor();
-    errorIntegral = 0;
+    // If at target but still moving, apply gentle damping instead of abrupt stop
+    if (abs(motorVelocity) > 10) {
+      // Apply velocity damping to smoothly decelerate
+      float dampingVoltage = -constrain(motorVelocity * 0.02, -1.5, 1.5);
+      setMotor(dampingVoltage);
+      errorIntegral *= 0.9;  // Decay integral
+    } else {
+      // Truly stopped at target
+      stopMotor();
+      errorIntegral = 0;
+    }
     adaptiveLearning = false;
 
     if (!targetReached) {
@@ -1181,32 +1192,55 @@ void runMotionControl() {
   
   float dt = CONTROL_PERIOD / 1000.0;
   
-  if (abs(error) > 1000) {
+  // Adaptive PID gains with smoother transitions for more fluid movement
+  long absError = abs(error);
+  if (absError > 1000) {
     KP_active = KP * 3.5;
     KI_active = 0;
     KD_active = KD * 0.8;
     errorIntegral = 0;
-  } else if (abs(error) > 500) {
+  } else if (absError > 500) {
     KP_active = KP * 3.0;
     KI_active = 0;
     KD_active = KD * 0.75;
     errorIntegral = 0;
-  } else if (abs(error) > 300) {
+  } else if (absError > 300) {
     KP_active = KP * 2.5;
     KI_active = 0;
     KD_active = KD * 0.7;
     errorIntegral = 0;
-  } else if (abs(error) > 50) {
+  } else if (absError > 100) {
     KP_active = KP * 2.0;
+    KI_active = KI * 0.6;
+    KD_active = KD * 1.1;
+    // Reduce integral buildup when far from target
+    errorIntegral *= 0.95;
+  } else if (absError > 50) {
+    KP_active = KP * 1.5;
     KI_active = KI * 0.8;
     KD_active = KD * 1.2;
+    // Moderate integral buildup
+    errorIntegral += error * dt * 0.8;
+  } else if (absError > 10) {
+    // Near target - reduce gains for smoother approach
+    KP_active = KP * 1.0;
+    KI_active = KI * 0.6;
+    KD_active = KD * 1.5;  // Higher derivative for damping
+    errorIntegral += error * dt * 0.5;
   } else {
-    KP_active = KP * 1.5;
-    KI_active = KI * 1.3;
-    KD_active = KD * 1.2;
-    
-    errorIntegral += error * dt;
-    errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
+    // Very close to target - minimal gains to prevent oscillation
+    KP_active = KP * 0.6;
+    KI_active = KI * 0.3;
+    KD_active = KD * 1.8;  // High derivative for stability
+    errorIntegral += error * dt * 0.3;
+  }
+  
+  // Constrain integral to prevent windup
+  errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
+  
+  // Decay integral if error sign changes (overshoot detected)
+  if ((error != 0) && (error * lastError < 0)) {
+    errorIntegral *= 0.3;  // More aggressive decay on overshoot
   }
   
   float errorDerivative = (error - lastError) / dt;
@@ -1215,51 +1249,73 @@ void runMotionControl() {
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
   
+  // Enhanced momentum compensation for smoother deceleration
   float momentumCompensation = 1.0;
-  if (abs(error) > 200) {
+  if (absError > 200) {
     momentumCompensation = 1.0;
-  } else if (abs(error) < 100 && abs(motorVelocity) > 50) {
+  } else if (absError < 100 && abs(motorVelocity) > 50) {
     float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.4);
-    momentumCompensation = max(momentumCompensation, 0.6);
-  } else if (abs(error) < 50 && abs(motorVelocity) > 30) {
-    float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.5);
+    momentumCompensation = 1.0 - (velocityFactor * 0.5);  // More aggressive reduction
     momentumCompensation = max(momentumCompensation, 0.5);
+  } else if (absError < 50 && abs(motorVelocity) > 30) {
+    float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
+    momentumCompensation = 1.0 - (velocityFactor * 0.6);  // More aggressive reduction
+    momentumCompensation = max(momentumCompensation, 0.4);
+  } else if (absError < 20 && abs(motorVelocity) > 20) {
+    // Very close - aggressive velocity damping
+    float velocityFactor = constrain(abs(motorVelocity) / 50.0, 0.0, 1.0);
+    momentumCompensation = 1.0 - (velocityFactor * 0.7);
+    momentumCompensation = max(momentumCompensation, 0.3);
   }
   
   pidVoltage *= momentumCompensation;
+  
+  // Additional velocity-based damping when approaching target
+  if (absError < 30 && abs(motorVelocity) > 15) {
+    float velocityDamping = 1.0 - (constrain(abs(motorVelocity) / 40.0, 0.0, 0.6));
+    pidVoltage *= velocityDamping;
+  }
 
   float frictionComp = 0;  // Disabled
   float velocityFF = 0;  // Disabled
   float fineAdjustmentBoost = 0;
   if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 5 && abs(motorVelocity) < 15) {
-    float boostMultiplier = 1.2;
+    // Reduced boost for smoother fine adjustments
+    float boostMultiplier = 0.8;  // Reduced from 1.2
     fineAdjustmentBoost = error * boostMultiplier;
-    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);
+    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -1.5, 1.5);  // Reduced from 2.0
   }
 
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
+  // Progressive voltage limiting for smoother deceleration
   float voltageLimit = 9.0;
-  long absErr = abs(error);
-  if (absErr > 1000) {
+  if (absError > 1000) {
     voltageLimit = 9.0;
-  } else if (absErr > 800) {
+  } else if (absError > 800) {
     voltageLimit = 8.5;
-  } else if (absErr > 500) {
+  } else if (absError > 500) {
     voltageLimit = 8.0;
-  } else if (absErr > 300) {
+  } else if (absError > 300) {
     voltageLimit = 7.5;
-  } else if (absErr > 100) {
+  } else if (absError > 100) {
     voltageLimit = 6.5;
-  } else if (absErr > 50) {
+  } else if (absError > 50) {
     voltageLimit = 5.5;
+  } else if (absError > 20) {
+    voltageLimit = 4.0;  // Reduced for smoother approach
+  } else if (absError > 10) {
+    voltageLimit = 3.0;  // Further reduced near target
   } else {
-    voltageLimit = 4.5;
+    voltageLimit = 2.0;  // Very low near target to prevent oscillation
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
+  
+  // Add deadband - stop motor if error and velocity are very small (prevent hunting)
+  if (absError <= 1 && abs(motorVelocity) < 5) {
+    totalVoltage = 0;
+  }
 
   if (currentState == MOVE_TO_TARGET && autoMode) {
     // Enhanced limit protection for lanes 1 and 4 to prevent slamming into endstops
@@ -1341,15 +1397,21 @@ void runMotionControl() {
   }
 
   unsigned long currentTime = millis();
+  // Improved stuck detection - less sensitive, only trigger when truly stuck
   if (abs(originalError) > TARGET_BAND) {
-    if (currentTime - lastStuckCheckTime >= 150) {
-      if (abs(currentPosition - lastStuckCheckPos) < 2) {
+    if (currentTime - lastStuckCheckTime >= 200) {  // Increased from 150ms
+      // Only consider stuck if position hasn't changed AND we're not very close to target
+      // AND velocity is very low (truly stuck, not just slow approach)
+      if (abs(currentPosition - lastStuckCheckPos) < 3 &&  // Slightly more lenient (was 2)
+          abs(originalError) > 10 &&  // Only if error is significant
+          abs(motorVelocity) < 5) {  // Only if truly not moving
         stuckCounter++;
         if (stuckCounter == 1) {
           stuckStartTime = currentTime;
           voltageRamping = false;
         }
-        if (stuckCounter >= 2) {
+        // Require more stuck detections before ramping (was >= 2, now >= 3)
+        if (stuckCounter >= 3) {
           voltageRamping = true;
           
           bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
