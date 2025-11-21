@@ -141,6 +141,8 @@ const int FINE_ADJUSTMENT_AMOUNT = 2;  // 1-2 counts adjustment
 float previousZombieDistance = 1.0;  // Track previous distance to detect if getting closer
 int fineAdjustmentCount = 0;  // Counter to prevent infinite oscillation
 const int MAX_FINE_ADJUSTMENTS = 3;  // Maximum number of fine adjustments per target
+unsigned long lastFineAdjustmentTime = 0;  // Timestamp of last fine adjustment to prevent rapid triggering
+const unsigned long MIN_FINE_ADJUSTMENT_INTERVAL = 200;  // Minimum time between fine adjustments (ms)
 
 // ============================================
 // FRICTION COMPENSATION (Improved)
@@ -608,6 +610,7 @@ void runStateMachine() {
         WAIT_POS = false;
         fineAdjustmentActive = false;  // Reset fine adjustment
         fineAdjustmentCount = 0;  // Reset fine adjustment counter
+        lastFineAdjustmentTime = 0;  // Reset timestamp
         previousZombieDistance = zombieDistances[activeTargetIndex];  // Initialize distance tracking
         
         int percentToPhoto = (int)((1.0 - zombieDistances[activeTargetIndex]) * 100);
@@ -628,6 +631,7 @@ void runStateMachine() {
         WAIT_POS = true;
         fineAdjustmentActive = false;
         fineAdjustmentCount = 0;  // Reset counter
+        lastFineAdjustmentTime = 0;  // Reset timestamp
         Serial.println(F("No active FORWARD targets, moving to wait position"));
       }
       
@@ -745,8 +749,10 @@ void runStateMachine() {
       // EARLY FINE ADJUSTMENT: If close to target and zombie still approaching, correct to exactly 0 error
       // This helps account for gear backlash when making large moves (e.g., lane 4 to lane 1)
       // GOAL: Get to exactly 0 error (encoder count = target position)
+      // Prevent rapid triggering to avoid overcompensation
       if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
+          (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
           abs(errorToOriginalTarget) <= 5 &&  // Close to target (slightly larger than TARGET_BAND)
           abs(errorToOriginalTarget) > TARGET_BAND &&  // But not quite at target yet
           ProxSensors[activeTargetIndex].direction == FORWARD &&
@@ -757,6 +763,7 @@ void runStateMachine() {
         fineAdjustmentTarget = activeTargetPosition;
         
         fineAdjustmentCount++;
+        lastFineAdjustmentTime = millis();
         Serial.print(F("🔧 Early fine adjust to EXACT target - correcting error="));
         Serial.print(errorToOriginalTarget);
         Serial.print(F(" → 0, zombie approaching at "));
@@ -799,9 +806,11 @@ void runStateMachine() {
             // FINE POSITIONING: If zombie still approaching and at/near target, immediately correct to exactly 0 error
             // This accounts for gear backlash/gaps - zombie may still be moving forward even when at encoder target
             // GOAL: Ensure encoder count is exactly at target (error = 0, within TARGET_BAND)
+            // Prevent rapid triggering to avoid overcompensation
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      !fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
+                     (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
                      abs(errorToOriginalTarget) <= TARGET_BAND + 3 &&  // At or very close to target (allow 3 counts tolerance)
                      !ProxSensors[activeTargetIndex].hitDetected) {  // Not yet hit
               
@@ -812,6 +821,7 @@ void runStateMachine() {
                 fineAdjustmentTarget = activeTargetPosition;
                 
                 fineAdjustmentCount++;
+                lastFineAdjustmentTime = millis();
                 Serial.print(F("🔧 Fine adjust to EXACT target - correcting error="));
                 Serial.print(errorToOriginalTarget);
                 Serial.print(F(" → 0, zombie at "));
@@ -827,17 +837,20 @@ void runStateMachine() {
             }
             
             // CONTINUOUS FINE ADJUSTMENT: If already fine-adjusted but still have error, correct to exactly 0
+            // Prevent rapid triggering to avoid oscillation
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
-                     abs(errorToCurrentTarget) > 0 &&  // Still have error (not at exactly 0)
+                     (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
+                     abs(errorToCurrentTarget) > 1 &&  // Still have error (not at exactly 0, allow 1 count tolerance)
                      !ProxSensors[activeTargetIndex].hitDetected &&  // Not yet hit
-                     (millis() - arrivalTime) >= 50) {  // Been at position for 50ms (faster response)
+                     (millis() - arrivalTime) >= 200) {  // Been at position for 200ms (slower to prevent oscillation)
               
               // CORRECT TO EXACTLY 0: Set target to original position to eliminate remaining error
               fineAdjustmentTarget = activeTargetPosition;
               
               fineAdjustmentCount++;
+              lastFineAdjustmentTime = millis();
               Serial.print(F("🔧 Fine adjust CONTINUOUS - correcting remaining error="));
               Serial.print(errorToCurrentTarget);
               Serial.print(F(" → 0, zombie at "));
@@ -863,6 +876,7 @@ void runStateMachine() {
         if (fineAdjustmentActive && abs(errorToCurrentTarget) > TARGET_BAND * 2) {
           fineAdjustmentActive = false;
           fineAdjustmentCount = 0;  // Reset counter
+          lastFineAdjustmentTime = 0;  // Reset timestamp
         }
       }
       break;
@@ -877,8 +891,9 @@ void runMotionControl() {
   
   // Apply rightward drift compensation: if moving right (toward more negative),
   // adjust target slightly left to compensate for momentum overshoot
+  // DISABLE during fine adjustment to prevent interference with precise positioning
   long adjustedDesiredPosition = desiredPosition;
-  if (currentPosition > desiredPosition) {
+  if (!fineAdjustmentActive && currentPosition > desiredPosition) {
     // Moving right (current is less negative than target)
     // Adjust target left by drift offset to compensate for overshoot
     adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
@@ -1106,15 +1121,15 @@ void runMotionControl() {
   //   velocityFF = 0.008 * desiredVelocity;
   // }
 
-  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add extra voltage to overcome backlash and get to exactly 0
+  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add moderate voltage to overcome backlash
+  // Reduced boost to prevent overcompensation, especially on leftward moves (lane 4 to lane 1)
   float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 10) {
-    // Apply aggressive boost to overcome gear backlash and ensure we reach exactly 0 error
-    // For small errors (within 5 counts), use higher boost per count to overcome backlash
-    // For larger errors (5-10 counts), use moderate boost
-    float boostMultiplier = (abs(error) <= 5) ? 3.5 : 2.5;  // More aggressive for small errors
+  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 5) {
+    // Apply moderate boost only for very small errors to prevent overcompensation
+    // Use conservative multiplier to avoid overshoot
+    float boostMultiplier = 1.0;  // Reduced from 3.5 to prevent overcompensation
     fineAdjustmentBoost = error * boostMultiplier;
-    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -6.0, 6.0);  // Increased limit for better correction
+    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);  // Reduced limit to prevent overshoot
   }
 
   // Calculate total voltage
@@ -1618,6 +1633,7 @@ void processCommand() {
           positionRetryCount = 0;
           fineAdjustmentActive = false;
           fineAdjustmentCount = 0;  // Reset counter
+          lastFineAdjustmentTime = 0;  // Reset timestamp
           
           // Reset target tracking
           activeTargetIndex = -1;
