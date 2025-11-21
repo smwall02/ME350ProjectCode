@@ -870,32 +870,46 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
-  // CRITICAL: If at left limit, encoder MUST be at 0 - ALWAYS force it
+  // CRITICAL: If at left limit, encoder MUST be at 0
+  // Only reset if we're actually at the limit AND encoder is not already at 0
   if (leftPressed()) {
-    // Always reset encoder to 0 when at left limit, regardless of current reading
-    stopMotor();
-    encoder.write(0);
-    delay(50);
-    // Verify and retry if needed
-    currentPosition = encoder.read();
+    // Check if encoder needs reset
     if (abs(currentPosition) > 1) {
-      for (int i = 0; i < 5; i++) {
-        encoder.write(0);
-        delay(100);
-        currentPosition = encoder.read();
-        if (abs(currentPosition) <= 1) {
-          break;
+      // Encoder not at 0 - reset it
+      stopMotor();
+      encoder.write(0);
+      delay(50);
+      // Verify and retry if needed
+      currentPosition = encoder.read();
+      if (abs(currentPosition) > 1) {
+        for (int i = 0; i < 5; i++) {
+          encoder.write(0);
+          delay(100);
+          currentPosition = encoder.read();
+          if (abs(currentPosition) <= 1) {
+            break;
+          }
         }
       }
+      // Force position to 0 if still not correct
+      if (abs(currentPosition) > 1) {
+        currentPosition = 0;
+      }
+      // Reset all tracking to match
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+      errorIntegral = 0;
+      lastError = 0;
+    } else {
+      // Encoder is already at 0 - just ensure tracking variables match
+      if (previousMotorPosition != 0) {
+        previousMotorPosition = 0;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+      }
+      currentPosition = 0;
     }
-    // Force position to 0 regardless of encoder reading
-    currentPosition = 0;
-    // Reset all tracking to match
-    previousMotorPosition = 0;
-    previousVelCompTime = micros();
-    motorVelocity = 0;
-    errorIntegral = 0;
-    lastError = 0;
   }
   
   // Apply rightward drift compensation: if moving right (toward more negative),
@@ -1024,8 +1038,11 @@ void runMotionControl() {
   }
   
   // Check against original target position for arrival (not adjusted one)
-  // Re-read position in case it was reset above
-  currentPosition = encoder.read();
+  // Re-read position in case it was reset above, but only if not at left limit
+  // (if at left limit, we already forced it to 0 above)
+  if (!leftPressed()) {
+    currentPosition = encoder.read();
+  }
   float originalError = desiredPosition - currentPosition;
   
   // CRITICAL: Prevent leftward movement when at left limit (backup check)
@@ -1544,12 +1561,37 @@ bool homeToLeftLimit() {
   float voltageIncrement = 0.2;  // Increase voltage by 0.2V every 200ms
   unsigned long lastVoltageIncrease = millis();
   const unsigned long VOLTAGE_RAMP_INTERVAL = 200;  // Increase voltage every 200ms
+  const unsigned long HOMING_TIMEOUT = 15000;  // 15 second timeout
+  const unsigned long DEBOUNCE_TIME = 100;  // Debounce time for limit switch
+  bool limitDetected = false;
+  unsigned long limitDetectTime = 0;
 
   setMotor(currentVoltage);
 
-  // Wait for limit switch with gradual voltage increase
-  while (!leftPressed() && (millis() - startTime) < 15000) {
+  // Wait for limit switch with gradual voltage increase and debouncing
+  while ((millis() - startTime) < HOMING_TIMEOUT) {
     delay(10);
+    
+    // Check for limit switch with debouncing
+    if (leftPressed()) {
+      if (!limitDetected) {
+        // First detection - start debounce timer
+        limitDetected = true;
+        limitDetectTime = millis();
+      } else {
+        // Already detected - check if debounce time has passed
+        if ((millis() - limitDetectTime) >= DEBOUNCE_TIME) {
+          // Limit switch confirmed - break out of loop
+          break;
+        }
+      }
+    } else {
+      // Limit switch not pressed - reset detection
+      if (limitDetected) {
+        limitDetected = false;
+        limitDetectTime = 0;
+      }
+    }
     
     // Gradually increase voltage if limit switch not reached
     if ((millis() - lastVoltageIncrease) >= VOLTAGE_RAMP_INTERVAL) {
@@ -1566,6 +1608,7 @@ bool homeToLeftLimit() {
   stopMotor();
   delay(200);
 
+  // Check if we successfully reached the limit switch
   if (leftPressed()) {
     Serial.println(F("Contact"));
 
@@ -1664,8 +1707,115 @@ bool homeToLeftLimit() {
     systemEnabled = wasSystemEnabled;
     return true;
   } else {
+    // Timeout - limit switch not reached
     stopMotor();
-    Serial.println(F("Timeout"));
+    delay(500);
+    
+    // Retry: check if we're close to the limit (maybe it bounced)
+    // Try a few more times with lower voltage
+    Serial.println(F("Timeout - retrying..."));
+    for (int retry = 0; retry < 3; retry++) {
+      // Try with lower voltage to avoid bouncing
+      setMotor(2.0);
+      delay(500);
+      
+      if (leftPressed()) {
+        // Found it on retry - proceed with normal homing sequence
+        stopMotor();
+        delay(200);
+        
+        // Hold gently at limit
+        long currentPos = encoder.read();
+        long lastPos = currentPos;
+        unsigned long holdStart = millis();
+        int stableTicks = 0;
+        float holdVoltage = max(FRICTION_RIGHT, 1.5);
+        
+        while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
+          setMotor(holdVoltage);
+          delay(10);
+          long pos = encoder.read();
+          if (abs(pos - lastPos) <= 1) {
+            stableTicks++;
+          } else {
+            stableTicks = 0;
+            lastPos = pos;
+          }
+        }
+        
+        stopMotor();
+        delay(500);
+        
+        // Reset encoder
+        for (int i = 0; i < 10; i++) {
+          encoder.write(0);
+          delay(50);
+          if (abs(encoder.read()) <= 1) {
+            break;
+          }
+        }
+        
+        long finalPos = encoder.read();
+        int attempts = 0;
+        while (abs(finalPos) > 1 && attempts < 5) {
+          encoder.write(0);
+          delay(100);
+          finalPos = encoder.read();
+          attempts++;
+        }
+        
+        stopMotor();
+        delay(300);
+        
+        previousMotorPosition = 0;
+        previousVelCompTime = micros();
+        motorVelocity = 0;
+        errorIntegral = 0;
+        lastError = 0;
+        lastStuckCheckPos = 0;
+        lastStuckCheckTime = 0;
+        stuckCounter = 0;
+        
+        delay(100);
+        finalPos = encoder.read();
+        delay(50);
+        long pos2 = encoder.read();
+        delay(50);
+        long pos3 = encoder.read();
+        
+        if (abs(pos2) < abs(finalPos)) finalPos = pos2;
+        if (abs(pos3) < abs(finalPos)) finalPos = pos3;
+        
+        if (abs(finalPos) > 1) {
+          stopMotor();
+          delay(300);
+          encoder.write(0);
+          delay(200);
+          finalPos = encoder.read();
+          previousMotorPosition = 0;
+          previousVelCompTime = micros();
+          motorVelocity = 0;
+        }
+        
+        Serial.print(F("Homed (retry):"));
+        Serial.print(finalPos);
+        if (abs(finalPos) <= 1) {
+          Serial.println(F(" OK"));
+        } else {
+          Serial.print(F(" WARN:"));
+          Serial.println(finalPos);
+        }
+        
+        systemEnabled = wasSystemEnabled;
+        return true;
+      }
+      
+      stopMotor();
+      delay(300);
+    }
+    
+    // All retries failed
+    Serial.println(F("Homing failed after retries"));
     systemEnabled = wasSystemEnabled;
     return false;
   }
