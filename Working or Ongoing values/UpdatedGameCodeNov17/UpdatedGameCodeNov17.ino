@@ -995,10 +995,13 @@ void runMotionControl() {
   float originalError = desiredPosition - currentPosition;
   long absOriginalError = abs(originalError);
   
+  static float lastAppliedVoltage = 0.0;
+  
   if (absOriginalError <= 2) {
     stopMotor();
     errorIntegral = 0;
     lastError = 0;
+    lastAppliedVoltage = 0.0;
     return;
   }
   
@@ -1012,6 +1015,14 @@ void runMotionControl() {
   }
   
   float error = adjustedDesiredPosition - currentPosition;
+  
+  if (abs(error) <= 2) {
+    stopMotor();
+    errorIntegral = 0;
+    lastError = 0;
+    lastAppliedVoltage = 0.0;
+    return;
+  }
   
   if (rangeFindingActive) {
     return;
@@ -1449,7 +1460,6 @@ void runMotionControl() {
     }
   }
 
-  static float lastAppliedVoltage = 0.0;
   static unsigned long lastVoltageResetTime = 0;
   const float MAX_VOLTAGE_RATE = 0.6;
   if (moveStartTime > lastVoltageResetTime + 100) {
@@ -1457,11 +1467,19 @@ void runMotionControl() {
     lastVoltageResetTime = moveStartTime;
   }
   
+  if (absOriginalError <= 2 || abs(error) <= 2) {
+    lastAppliedVoltage = 0.0;
+    stopMotor();
+    errorIntegral = 0;
+    lastError = 0;
+    return;
+  }
+  
   float maxChange = MAX_VOLTAGE_RATE;
   
   if (abs(lastAppliedVoltage) < 0.5 && abs(originalError) > 50) {
     maxChange = 1.2;
-  } else   if (absError < 5) {
+  } else if (absError < 5) {
     maxChange = 0.15;
   } else if (absError < 20) {
     maxChange = 0.25;
@@ -1481,6 +1499,14 @@ void runMotionControl() {
     totalVoltage = lastAppliedVoltage + (voltageChange > 0 ? maxChange : -maxChange);
   }
   lastAppliedVoltage = totalVoltage;
+
+  if (absOriginalError <= 2 || abs(error) <= 2) {
+    stopMotor();
+    errorIntegral = 0;
+    lastError = 0;
+    lastAppliedVoltage = 0.0;
+    return;
+  }
 
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
     setMotor(totalVoltage);
