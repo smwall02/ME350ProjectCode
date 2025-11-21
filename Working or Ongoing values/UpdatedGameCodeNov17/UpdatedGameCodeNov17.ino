@@ -885,10 +885,10 @@ void runStateMachine() {
       long errorToOriginalTarget = activeTargetPosition - currentPos;
       if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
+          abs(errorToOriginalTarget) > 3 &&
           (millis() - lastFineAdjustmentTime) >= (MIN_FINE_ADJUSTMENT_INTERVAL * 2) &&
           abs(motorVelocity) < 20 &&
           abs(errorToOriginalTarget) <= 6 &&
-          abs(errorToOriginalTarget) > TARGET_BAND &&
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           !ProxSensors[activeTargetIndex].hitDetected &&
           zombieDistances[activeTargetIndex] < 0.30) {
@@ -908,7 +908,7 @@ void runStateMachine() {
         arrivalTime = millis();
       }
       
-      if (abs(errorToCurrentTarget) <= TARGET_BAND) {
+      if (abs(errorToCurrentTarget) <= 2) {
         if (WAIT_POS) {
           if (hasForwardZombie) {
             Serial.println(F("Threat"));
@@ -932,13 +932,13 @@ void runStateMachine() {
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      !fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
+                     abs(errorToOriginalTarget) > 3 &&
                      (millis() - lastFineAdjustmentTime) >= (MIN_FINE_ADJUSTMENT_INTERVAL * 3) &&
                      abs(motorVelocity) < 15 &&
-                     abs(errorToOriginalTarget) > TARGET_BAND &&
                      abs(errorToOriginalTarget) <= TARGET_BAND + 3 &&
                      !ProxSensors[activeTargetIndex].hitDetected) {
               
-              if (abs(errorToOriginalTarget) > TARGET_BAND) {
+              if (abs(errorToOriginalTarget) > 3) {
                 fineAdjustmentTarget = activeTargetPosition;
                 fineAdjustmentCount++;
                 lastFineAdjustmentTime = millis();
@@ -955,9 +955,9 @@ void runStateMachine() {
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
+                     abs(errorToCurrentTarget) > 3 &&
                      (millis() - lastFineAdjustmentTime) >= (MIN_FINE_ADJUSTMENT_INTERVAL * 2) &&
                      abs(motorVelocity) < 15 &&
-                     abs(errorToCurrentTarget) > TARGET_BAND &&
                      !ProxSensors[activeTargetIndex].hitDetected &&
                      (millis() - arrivalTime) >= 200) {
               fineAdjustmentTarget = activeTargetPosition;
@@ -978,7 +978,7 @@ void runStateMachine() {
         }
       } else {
         arrivalTime = millis();
-        if (fineAdjustmentActive && abs(errorToCurrentTarget) > TARGET_BAND * 2) {
+        if (fineAdjustmentActive && abs(errorToCurrentTarget) > 3) {
           fineAdjustmentActive = false;
           fineAdjustmentCount = 0;
           lastFineAdjustmentTime = 0;
@@ -991,6 +991,16 @@ void runStateMachine() {
 // MOTION
 void runMotionControl() {
   long currentPosition = encoder.read();
+  
+  float originalError = desiredPosition - currentPosition;
+  long absOriginalError = abs(originalError);
+  
+  if (absOriginalError <= 2) {
+    stopMotor();
+    errorIntegral = 0;
+    lastError = 0;
+    return;
+  }
   
   long adjustedDesiredPosition = desiredPosition;
   if (!fineAdjustmentActive) {
@@ -1028,16 +1038,7 @@ void runMotionControl() {
     return;
   }
   
-  float originalError = desiredPosition - currentPosition;
-  long absOriginalError = abs(originalError);
-  bool atTarget = fineAdjustmentActive ? (absOriginalError <= 1) : (absOriginalError <= 2);
-  
-  if (absOriginalError <= 2 && abs(motorVelocity) < 8) {
-    stopMotor();
-    errorIntegral = 0;
-    lastError = 0;
-    return;
-  }
+  bool atTarget = false;
   
   if (atTarget) {
     if (abs(motorVelocity) > 8) {
@@ -1067,7 +1068,7 @@ void runMotionControl() {
 
   targetReached = false;
 
-  if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50 && abs(originalError) > 3) {
+  if (abs(originalError) > 3 && abs(originalError) < 50) {
     if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
       Serial.print(F("Stuck:"));
@@ -1200,16 +1201,11 @@ void runMotionControl() {
     KI_active = KI * 0.05;
     KD_active = KD * 1.3;
     errorIntegral += error * dt * 0.05;
-  } else if (absError > 2) {
+  } else {
     KP_active = KP * 0.02;
     KI_active = 0;
     KD_active = KD * 1.5;
     errorIntegral *= 0.3;
-  } else {
-    KP_active = 0;
-    KI_active = 0;
-    KD_active = 0;
-    errorIntegral = 0;
   }
   
   errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
@@ -1224,36 +1220,39 @@ void runMotionControl() {
   float errorDerivative = filteredDerivative;
   
   float velocityDerivative = -motorVelocity;
-  if (absError < 50) {
-    errorDerivative = 0.3 * errorDerivative + 0.7 * velocityDerivative;
-  } else if (absError < 200) {
-    errorDerivative = 0.6 * errorDerivative + 0.4 * velocityDerivative;
+  float pidVoltage = 0;
+  
+  if (absError > 2) {
+    if (absError < 50) {
+      errorDerivative = 0.3 * errorDerivative + 0.7 * velocityDerivative;
+    } else if (absError < 200) {
+      errorDerivative = 0.6 * errorDerivative + 0.4 * velocityDerivative;
+    }
+    
+    pidVoltage = (KP_active * error) +
+                 (KI_active * errorIntegral) +
+                 (KD_active * errorDerivative);
+    
+    float momentumCompensation = 1.0;
+    if (absError > 200) {
+      momentumCompensation = 1.0;
+    } else if (absError < 100 && abs(motorVelocity) > 50) {
+      float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);
+      momentumCompensation = 1.0 - (velocityFactor * 0.35);
+      momentumCompensation = max(momentumCompensation, 0.65);
+    } else if (absError < 50 && abs(motorVelocity) > 30) {
+      float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
+      momentumCompensation = 1.0 - (velocityFactor * 0.45);
+      momentumCompensation = max(momentumCompensation, 0.55);
+    } else if (absError < 20 && abs(motorVelocity) > 20) {
+      float velocityFactor = constrain(abs(motorVelocity) / 50.0, 0.0, 1.0);
+      momentumCompensation = 1.0 - (velocityFactor * 0.5);
+      momentumCompensation = max(momentumCompensation, 0.5);
+    }
+    pidVoltage *= momentumCompensation;
   }
   
-  float pidVoltage = (KP_active * error) +
-                     (KI_active * errorIntegral) +
-                     (KD_active * errorDerivative);
-  
-  float momentumCompensation = 1.0;
-  if (absError > 200) {
-    momentumCompensation = 1.0;
-  } else if (absError < 100 && abs(motorVelocity) > 50) {
-    float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.35);
-    momentumCompensation = max(momentumCompensation, 0.65);
-  } else if (absError < 50 && abs(motorVelocity) > 30) {
-    float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.45);
-    momentumCompensation = max(momentumCompensation, 0.55);
-  } else if (absError < 20 && abs(motorVelocity) > 20) {
-    float velocityFactor = constrain(abs(motorVelocity) / 50.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.5);
-    momentumCompensation = max(momentumCompensation, 0.5);
-  }
-  
-  pidVoltage *= momentumCompensation;
-  
-  if (absError < 30 && abs(motorVelocity) > 15) {
+  if (absError > 2 && absError < 30 && abs(motorVelocity) > 15) {
     float velocityDamping = 1.0 - (constrain(abs(motorVelocity) / 50.0, 0.0, 0.4));
     pidVoltage *= velocityDamping;
   }
@@ -1261,7 +1260,7 @@ void runMotionControl() {
   float frictionComp = 0;
   float velocityFF = 0;
   float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 5 && abs(motorVelocity) < 15) {
+  if (fineAdjustmentActive && abs(error) > 2 && abs(error) <= 5 && abs(motorVelocity) < 15) {
     float boostMultiplier = 0.8;
     fineAdjustmentBoost = error * boostMultiplier;
     fineAdjustmentBoost = constrain(fineAdjustmentBoost, -1.5, 1.5);
@@ -1274,7 +1273,7 @@ void runMotionControl() {
   bool tryingToMoveAwayFromLeft = atLeftLimit && originalError < 0;
   bool tryingToMoveAwayFromRight = atRightLimit && originalError > 0;
   
-  if ((tryingToMoveAwayFromLeft || tryingToMoveAwayFromRight) && abs(originalError) > TARGET_BAND) {
+  if ((tryingToMoveAwayFromLeft || tryingToMoveAwayFromRight) && abs(originalError) > 2) {
     float minVoltageToMove = 2.5;
     if (abs(totalVoltage) < minVoltageToMove) {
       totalVoltage = (originalError < 0) ? -minVoltageToMove : minVoltageToMove;
@@ -1300,21 +1299,11 @@ void runMotionControl() {
     voltageLimit = 2.0;
   } else if (absOriginalError > 3) {
     voltageLimit = 1.0;
-  } else if (absOriginalError > 2) {
-    voltageLimit = 0.3;
   } else {
-    voltageLimit = 0.0;
+    voltageLimit = 0.3;
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
-  
-  if (absOriginalError <= 2) {
-    totalVoltage = 0;
-    errorIntegral = 0;
-    lastError = 0;
-    stopMotor();
-    return;
-  }
   
   if (!atTarget && absOriginalError > 25 && abs(motorVelocity) < 5 && absOriginalError > 50 && abs(totalVoltage) < 2.0) {
     float startupVoltage = 2.0;
@@ -1399,7 +1388,7 @@ void runMotionControl() {
   }
 
   unsigned long currentTime = millis();
-  if (abs(originalError) > TARGET_BAND) {
+  if (abs(originalError) > 2) {
     if (currentTime - lastStuckCheckTime >= 200) {  // Increased from 150ms
       if (abs(currentPosition - lastStuckCheckPos) < 3 &&
           abs(originalError) > 10 &&
@@ -1446,7 +1435,7 @@ void runMotionControl() {
     voltageRamping = false;
   }
 
-  if (!atTarget && abs(originalError) > 3 && !voltageRamping) {
+  if (!atTarget && abs(originalError) > 2 && !voltageRamping) {
     bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
     float baseFrictionVoltage = inLeftHalf ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 2.0f);
@@ -1472,9 +1461,7 @@ void runMotionControl() {
   
   if (abs(lastAppliedVoltage) < 0.5 && abs(originalError) > 50) {
     maxChange = 1.2;
-  } else if (absError <= 2) {
-    maxChange = 0.0;
-  } else if (absError < 5) {
+  } else   if (absError < 5) {
     maxChange = 0.15;
   } else if (absError < 20) {
     maxChange = 0.25;
@@ -1489,16 +1476,11 @@ void runMotionControl() {
     maxChange *= 1.5;
   }
   
-  if (absOriginalError <= 2) {
-    lastAppliedVoltage = 0;
-    lastError = 0;
-  } else {
-    float voltageChange = totalVoltage - lastAppliedVoltage;
-    if (abs(voltageChange) > maxChange) {
-      totalVoltage = lastAppliedVoltage + (voltageChange > 0 ? maxChange : -maxChange);
-    }
-    lastAppliedVoltage = totalVoltage;
+  float voltageChange = totalVoltage - lastAppliedVoltage;
+  if (abs(voltageChange) > maxChange) {
+    totalVoltage = lastAppliedVoltage + (voltageChange > 0 ? maxChange : -maxChange);
   }
+  lastAppliedVoltage = totalVoltage;
 
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
     setMotor(totalVoltage);
