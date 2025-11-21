@@ -1362,7 +1362,8 @@ bool homeToLeftLimit() {
     long lastPos = encoder.read();
     unsigned long holdStart = millis();
     int stableTicks = 0;
-    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+    // Use gentle holding voltage - just enough to overcome friction and hold position
+    float holdVoltage = max(FRICTION_RIGHT, 1.5);  // Gentle holding voltage (1.5V minimum)
 
     while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
       // Only apply small holding voltage
@@ -1416,15 +1417,31 @@ bool homeToLeftLimit() {
     return true;
   }
 
-  // Approach limit switch
-  Serial.println(F("Moving to left limit..."));
+  // Approach limit switch with gradual voltage ramp-up
+  Serial.println(F("Moving to left limit (gradual approach)..."));
   unsigned long startTime = millis();
-  float driveVoltage = max(FRICTION_RIGHT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
-  setMotor(driveVoltage);
+  float initialVoltage = 2.0;  // Start with low voltage
+  float currentVoltage = initialVoltage;
+  float maxVoltage = 5.5;  // Maximum voltage to use
+  float voltageIncrement = 0.2;  // Increase voltage by 0.2V every 200ms
+  unsigned long lastVoltageIncrease = millis();
+  const unsigned long VOLTAGE_RAMP_INTERVAL = 200;  // Increase voltage every 200ms
 
-  // Wait for limit switch with timeout
+  setMotor(currentVoltage);
+
+  // Wait for limit switch with gradual voltage increase
   while (!leftPressed() && (millis() - startTime) < 15000) {
     delay(10);
+    
+    // Gradually increase voltage if limit switch not reached
+    if ((millis() - lastVoltageIncrease) >= VOLTAGE_RAMP_INTERVAL) {
+      if (currentVoltage < maxVoltage) {
+        currentVoltage += voltageIncrement;
+        currentVoltage = min(currentVoltage, maxVoltage);
+        setMotor(currentVoltage);
+        lastVoltageIncrease = millis();
+      }
+    }
   }
 
   // STOP motor immediately when limit is detected
@@ -1439,7 +1456,8 @@ bool homeToLeftLimit() {
     long lastPos = currentPos;
     unsigned long holdStart = millis();
     int stableTicks = 0;
-    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+    // Use gentle holding voltage - just enough to overcome friction and hold position
+    float holdVoltage = max(FRICTION_RIGHT, 1.5);  // Gentle holding voltage (1.5V minimum)
 
     while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
       setMotor(holdVoltage);
