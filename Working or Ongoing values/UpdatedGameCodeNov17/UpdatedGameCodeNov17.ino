@@ -169,9 +169,9 @@ bool adaptiveLearned = false;
 // ============================================
 // PID CONTROL PARAMETERS
 // ============================================
-float KP = 0.015;  // Reduced from 0.020 to be less aggressive
+float KP = 0.018;  // Slightly increased for faster response while maintaining stability
 float KI = 0.003;  // Reduced from 0.005 to prevent integral windup
-float KD = 0.020;  // Increased from 0.004 for much stronger damping to prevent overshoot
+float KD = 0.022;  // Slightly increased damping to compensate for higher KP
 
 float KP_active = KP;
 float KI_active = KI;
@@ -226,12 +226,12 @@ unsigned long lastPrintTime = 0;
 unsigned long moveStartTime = 0;
 bool targetReached = false;
 
-const float CALIBRATION_VOLTAGE = 4.0;
-const float HOMING_VOLTAGE = 4.0;
+const float CALIBRATION_VOLTAGE = 5.5;  // Increased for faster homing
+const float HOMING_VOLTAGE = 5.5;  // Increased for faster homing
 
 // Improved homing softness parameters
-const float CALIBRATE_EXTRA_VOLTAGE = 0.6;      // Added to overcome friction during homing
-const float CALIBRATE_MIN_VOLTAGE = 3.5;        // Minimum drive voltage during homing
+const float CALIBRATE_EXTRA_VOLTAGE = 0.8;      // Increased for faster homing
+const float CALIBRATE_MIN_VOLTAGE = 4.5;        // Increased minimum drive voltage during homing
 const unsigned long CALIBRATE_HOLD_TIME = 300;  // ms to hold on limit before zeroing
 const int CALIBRATE_STABLE_TICKS = 3;           // Stable readings required before zeroing
 const float VEL_STOP_THRESH = 2.0;              // counts/sec considered stopped
@@ -1055,21 +1055,21 @@ void runMotionControl() {
   // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF;
 
-  // Voltage capping based on error magnitude (increased for faster movement)
+  // Voltage capping based on error magnitude (increased significantly for faster movement)
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 4.5;  // Increased from 3.0 for faster long moves
+    voltageLimit = 6.5;  // Increased from 4.5 for much faster long moves
   } else if (absErr > 500) {
-    voltageLimit = 4.0;  // Increased from 2.7
+    voltageLimit = 6.0;  // Increased from 4.0
   } else if (absErr > 300) {
-    voltageLimit = 3.5;  // Increased from 2.5
+    voltageLimit = 5.5;  // Increased from 3.5
   } else if (absErr > 100) {
-    voltageLimit = 3.0;  // Increased from 2.2
+    voltageLimit = 5.0;  // Increased from 3.0
   } else if (absErr > 50) {
-    voltageLimit = 2.5;  // Increased from 2.0
+    voltageLimit = 4.5;  // Increased from 2.5
   } else {
-    voltageLimit = 2.2;  // Increased from 1.8 for final approach
+    voltageLimit = 3.5;  // Increased from 2.2 for final approach
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -1090,7 +1090,7 @@ void runMotionControl() {
 
         // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
         if (stuckCounter >= 2) {
-          float minVoltage = 2.5;  // Conservative to prevent overshoot
+          float minVoltage = 3.5;  // Increased to overcome friction faster
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (error < 0) ? -minVoltage : minVoltage;
           }
@@ -1527,14 +1527,20 @@ void processCommand() {
         delay(200);
         
         if (homeToLeftLimit()) {
-          // Ensure encoder is properly zeroed
+          // Ensure encoder is properly zeroed (multiple attempts for reliability)
           encoder.write(0);
           delay(50);
           if (encoder.read() != 0) {
             encoder.write(0);
             delay(50);
             encoder.write(0);
+            delay(50);
           }
+          
+          // Reset velocity tracking variables to match encoder reset
+          previousMotorPosition = 0;
+          previousVelCompTime = micros();
+          motorVelocity = 0;
           
           // Reset all state variables
           autoMode = true;
@@ -1567,9 +1573,21 @@ void processCommand() {
           
           targetHitTime = 0;
 
-          Serial.println(F("✓ HOMING COMPLETE - Encoder zeroed"));
-          Serial.print(F("Encoder position: "));
-          Serial.println(encoder.read());
+          // Verify encoder is zeroed
+          long finalEncoderPos = encoder.read();
+          if (abs(finalEncoderPos) <= 2) {
+            Serial.println(F("✓ HOMING COMPLETE - Encoder reset to zero"));
+            Serial.print(F("Encoder position: "));
+            Serial.println(finalEncoderPos);
+          } else {
+            Serial.print(F("⚠️  WARNING: Encoder not at zero, reading: "));
+            Serial.println(finalEncoderPos);
+            // Force reset one more time
+            encoder.write(0);
+            delay(50);
+            Serial.print(F("After forced reset: "));
+            Serial.println(encoder.read());
+          }
           Serial.println(F("Using permanent sensor ranges - starting target tracking...\n"));
         } else {
           Serial.println(F("✗ Homing failed\n"));
