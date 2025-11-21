@@ -139,6 +139,10 @@ bool fineAdjustmentActive = false;   // Flag for fine adjustment mode
 long fineAdjustmentTarget = 0;       // Fine-tuned target position
 const int FINE_ADJUSTMENT_AMOUNT = 2;  // 1-2 counts adjustment
 float previousZombieDistance = 1.0;  // Track previous distance to detect if getting closer
+int fineAdjustmentCount = 0;        // Track number of fine adjustments made
+const int MAX_FINE_ADJUSTMENTS = 3; // Maximum number of fine adjustments per target
+unsigned long lastFineAdjustmentTime = 0;  // Time of last fine adjustment
+const unsigned long FINE_ADJUSTMENT_INTERVAL = 300;  // Minimum time between adjustments (ms)
 
 // ============================================
 // FRICTION COMPENSATION (Improved)
@@ -605,7 +609,9 @@ void runStateMachine() {
         activeTargetPosition = targetPositions[activeTargetIndex];
         WAIT_POS = false;
         fineAdjustmentActive = false;  // Reset fine adjustment
+        fineAdjustmentCount = 0;       // Reset fine adjustment counter
         previousZombieDistance = zombieDistances[activeTargetIndex];  // Initialize distance tracking
+        lastFineAdjustmentTime = 0;    // Reset fine adjustment timer
         
         int percentToPhoto = (int)((1.0 - zombieDistances[activeTargetIndex]) * 100);
         
@@ -764,37 +770,59 @@ void runStateMachine() {
               Serial.println(F("✓ Target retreating, choosing next"));
               currentState = CHOOSE_ACTIVE_TARGET;
             }
-            // FINE POSITIONING: If zombie still approaching and at original target, make small adjustment
+            // ENHANCED FINE POSITIONING: If zombie still approaching and at target, make small adjustment
+            // This handles gear backlash and small positioning errors
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
-                     !fineAdjustmentActive &&
                      abs(errorToOriginalTarget) <= TARGET_BAND &&  // At original target position
-                     zombieDistances[activeTargetIndex] < 0.20 &&  // Close and still approaching
-                     zombieDistances[activeTargetIndex] < previousZombieDistance) {  // Getting closer
+                     zombieDistances[activeTargetIndex] < previousZombieDistance &&  // Getting closer
+                     fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&  // Haven't exceeded max adjustments
+                     (millis() - lastFineAdjustmentTime >= FINE_ADJUSTMENT_INTERVAL)) {  // Enough time since last adjustment
               
-              // Determine adjustment direction based on previous move
+              // Determine adjustment direction based on movement history
               // If moved RIGHT (previous position > target), likely overshot right, adjust LEFT
               // If moved LEFT (previous position < target), likely undershot, adjust RIGHT
               bool movedRight = (previousMoveStartPosition > activeTargetPosition);
               
-              if (movedRight) {
-                // Moved right, likely overshot, adjust left (toward less negative)
+              // Determine adjustment direction
+              bool adjustLeft;
+              if (fineAdjustmentCount == 0) {
+                // First adjustment: base on movement direction
+                // If moved right (to more negative), likely overshot right, so adjust left
+                // If moved left (to less negative), likely undershot, so adjust right
+                adjustLeft = movedRight;  // If moved right, adjust left to compensate
+              } else {
+                // Subsequent adjustments: alternate direction to find optimal position
+                // If last adjustment was left (positive offset) and zombie still approaching, try right
+                // If last adjustment was right (negative offset) and zombie still approaching, try left
+                long lastAdjustment = fineAdjustmentTarget - activeTargetPosition;
+                adjustLeft = (lastAdjustment <= 0);  // If last was right (negative or zero), try left
+              }
+              
+              if (adjustLeft) {
+                // Adjust left (toward less negative / toward home)
                 fineAdjustmentTarget = activeTargetPosition + FINE_ADJUSTMENT_AMOUNT;
                 Serial.print(F("🔧 Fine adjust LEFT (+"));
                 Serial.print(FINE_ADJUSTMENT_AMOUNT);
                 Serial.print(F(") - zombie at "));
                 Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
-                Serial.println(F("% getting closer"));
+                Serial.print(F("% still approaching (adj "));
+                Serial.print(fineAdjustmentCount + 1);
+                Serial.println(F(")"));
               } else {
-                // Moved left, likely undershot, adjust right (toward more negative)
+                // Adjust right (toward more negative / away from home)
                 fineAdjustmentTarget = activeTargetPosition - FINE_ADJUSTMENT_AMOUNT;
                 Serial.print(F("🔧 Fine adjust RIGHT (-"));
                 Serial.print(FINE_ADJUSTMENT_AMOUNT);
                 Serial.print(F(") - zombie at "));
                 Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
-                Serial.println(F("% getting closer"));
+                Serial.print(F("% still approaching (adj "));
+                Serial.print(fineAdjustmentCount + 1);
+                Serial.println(F(")"));
               }
               
               fineAdjustmentActive = true;
+              fineAdjustmentCount++;
+              lastFineAdjustmentTime = millis();
               desiredPosition = fineAdjustmentTarget;
               arrivalTime = millis();  // Reset arrival time for fine adjustment
             }
@@ -811,6 +839,7 @@ void runStateMachine() {
         // Reset fine adjustment if we've moved away from target significantly
         if (fineAdjustmentActive && abs(errorToCurrentTarget) > TARGET_BAND * 2) {
           fineAdjustmentActive = false;
+          fineAdjustmentCount = 0;  // Reset counter when moving away
         }
       }
       break;
