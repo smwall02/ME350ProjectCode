@@ -460,6 +460,15 @@ void updateAllSensors() {
 // ============================================
 void updateVelocity() {
   long currentPos = encoder.read();
+  
+  // Safety: If at left limit, ensure previous position is also 0
+  if (leftPressed() && abs(currentPos) <= 1) {
+    previousMotorPosition = 0;
+    previousVelCompTime = micros();
+    motorVelocity = 0;
+    return;
+  }
+  
   long deltaPos = currentPos - previousMotorPosition;
   long deltaTime = micros() - previousVelCompTime;
   
@@ -535,25 +544,32 @@ void runStateMachine() {
         long currentPos = encoder.read();
         if (abs(currentPos) > 1) {
           // Encoder not zeroed - reset it aggressively
-          for (int i = 0; i < 5; i++) {
+          stopMotor();
+          delay(200);
+          for (int i = 0; i < 10; i++) {
             encoder.write(0);
-            delay(50);
+            delay(100);
             currentPos = encoder.read();
             if (abs(currentPos) <= 1) {
               break;
             }
           }
-          // Reset velocity tracking
+          // Reset ALL tracking variables
           previousMotorPosition = 0;
           previousVelCompTime = micros();
           motorVelocity = 0;
           errorIntegral = 0;
           lastError = 0;
+          lastStuckCheckPos = 0;
+          lastStuckCheckTime = 0;
+          stuckCounter = 0;
         }
         desiredPosition = LOWER_BOUND;
         // Stop motor - we're already at the limit
         stopMotor();
         errorIntegral = 0;
+        // Force position to be 0
+        currentPos = 0;
         
         // Transition to next state since we're already homed
         if (!dynamicCalibrationActive && sensorCalibrated) {
@@ -583,6 +599,27 @@ void runStateMachine() {
       break;
     
     case CHOOSE_ACTIVE_TARGET:
+      // CRITICAL: If at left limit, verify encoder is at 0
+      if (leftPressed()) {
+        long checkPos = encoder.read();
+        if (abs(checkPos) > 1) {
+          // Force reset
+          stopMotor();
+          delay(200);
+          for (int i = 0; i < 5; i++) {
+            encoder.write(0);
+            delay(100);
+            checkPos = encoder.read();
+            if (abs(checkPos) <= 1) {
+              break;
+            }
+          }
+          previousMotorPosition = 0;
+          previousVelCompTime = micros();
+          motorVelocity = 0;
+        }
+      }
+      
       activeTargetIndex = -1;
       closestZombieDist = 2.0;
 
@@ -783,6 +820,29 @@ void runStateMachine() {
 // ============================================
 void runMotionControl() {
   long currentPosition = encoder.read();
+  
+  // CRITICAL: If at left limit, encoder MUST be at 0
+  if (leftPressed()) {
+    if (abs(currentPosition) > 1) {
+      // Encoder is not zero - force reset immediately
+      stopMotor();
+      for (int i = 0; i < 10; i++) {
+        encoder.write(0);
+        delay(50);
+        currentPosition = encoder.read();
+        if (abs(currentPosition) <= 1) {
+          break;
+        }
+      }
+      // Reset all tracking
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+      errorIntegral = 0;
+      lastError = 0;
+    }
+    currentPosition = 0;  // Force position to 0 if at limit
+  }
   
   // Apply rightward drift compensation: if moving right (toward more negative),
   // adjust target slightly left to compensate for momentum overshoot
@@ -1380,14 +1440,33 @@ bool homeToLeftLimit() {
     motorVelocity = 0;
     errorIntegral = 0;
     lastError = 0;
+    lastStuckCheckPos = 0;
+    lastStuckCheckTime = 0;
+    stuckCounter = 0;
     
-    // Force one final encoder read to ensure it's zero
+    // Force one final encoder read with multiple readings for stability
+    delay(100);
     finalPos = encoder.read();
+    delay(50);
+    long pos2 = encoder.read();
+    delay(50);
+    long pos3 = encoder.read();
+    
+    // Use the value closest to 0
+    if (abs(pos2) < abs(finalPos)) finalPos = pos2;
+    if (abs(pos3) < abs(finalPos)) finalPos = pos3;
+    
     if (abs(finalPos) > 1) {
-      // Last resort - force zero
+      // Last resort - force zero one more time
+      stopMotor();
+      delay(300);
       encoder.write(0);
-      delay(100);
+      delay(200);
       finalPos = encoder.read();
+      // Reset all tracking again
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
     }
     
     Serial.print(F("Homed:"));
@@ -1490,14 +1569,33 @@ bool homeToLeftLimit() {
     motorVelocity = 0;
     errorIntegral = 0;
     lastError = 0;
+    lastStuckCheckPos = 0;
+    lastStuckCheckTime = 0;
+    stuckCounter = 0;
     
-    // Force one final encoder read to ensure it's zero
+    // Force one final encoder read with multiple readings for stability
+    delay(100);
     finalPos = encoder.read();
+    delay(50);
+    long pos2 = encoder.read();
+    delay(50);
+    long pos3 = encoder.read();
+    
+    // Use the value closest to 0
+    if (abs(pos2) < abs(finalPos)) finalPos = pos2;
+    if (abs(pos3) < abs(finalPos)) finalPos = pos3;
+    
     if (abs(finalPos) > 1) {
-      // Last resort - force zero
+      // Last resort - force zero one more time
+      stopMotor();
+      delay(300);
       encoder.write(0);
-      delay(100);
+      delay(200);
       finalPos = encoder.read();
+      // Reset all tracking again
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
     }
     
     Serial.print(F("Homed:"));
@@ -1857,30 +1955,55 @@ void processCommand() {
         delay(200);
         
         if (homeToLeftLimit()) {
-          // Force encoder to zero one more time after homing
-          for (int i = 0; i < 5; i++) {
+          // CRITICAL: Aggressively reset encoder to zero with verification
+          stopMotor();
+          delay(300);
+          
+          // Multiple reset attempts with verification
+          long checkPos = 999;
+          for (int attempt = 0; attempt < 20; attempt++) {
             encoder.write(0);
-            delay(50);
-            if (abs(encoder.read()) <= 1) {
+            delay(100);
+            checkPos = encoder.read();
+            if (abs(checkPos) <= 1) {
               break;
             }
           }
           
-          // Verify encoder is at zero
-          long checkPos = encoder.read();
+          // If still not zero, try one more aggressive reset
           if (abs(checkPos) > 1) {
-            // Force reset
+            stopMotor();
+            delay(200);
+            for (int i = 0; i < 10; i++) {
+              encoder.write(0);
+              delay(150);
+              checkPos = encoder.read();
+              if (abs(checkPos) <= 1) {
+                break;
+              }
+            }
+          }
+          
+          // Final verification - if still not zero, report error but continue
+          checkPos = encoder.read();
+          if (abs(checkPos) > 1) {
+            Serial.print(F("ERROR: Encoder not zero after reset: "));
+            Serial.println(checkPos);
+            // Force one last time
             encoder.write(0);
-            delay(100);
+            delay(200);
             checkPos = encoder.read();
           }
           
-          // Reset velocity tracking variables to match encoder reset
+          // CRITICAL: Reset ALL position tracking variables to match encoder
           previousMotorPosition = 0;
           previousVelCompTime = micros();
           motorVelocity = 0;
           errorIntegral = 0;
           lastError = 0;
+          lastStuckCheckPos = 0;
+          lastStuckCheckTime = 0;
+          stuckCounter = 0;
           
           // Reset all state variables
           autoMode = true;
@@ -1913,25 +2036,31 @@ void processCommand() {
           
           targetHitTime = 0;
 
+          // Final verification - read encoder one more time
           long finalEncoderPos = encoder.read();
+          
+          // If encoder is still not zero, this is a critical error
           if (abs(finalEncoderPos) > 1) {
-            // Force one more reset
-            for (int i = 0; i < 3; i++) {
-              encoder.write(0);
-              delay(100);
-              finalEncoderPos = encoder.read();
-              if (abs(finalEncoderPos) <= 1) {
-                break;
-              }
-            }
+            Serial.print(F("CRITICAL: Encoder reset failed, reading: "));
+            Serial.println(finalEncoderPos);
+            // Last resort - try resetting one more time
+            stopMotor();
+            delay(500);
+            encoder.write(0);
+            delay(200);
+            finalEncoderPos = encoder.read();
+            // Force all tracking to match
+            previousMotorPosition = 0;
+            previousVelCompTime = micros();
+            motorVelocity = 0;
           }
           
           Serial.print(F("Ready (enc:"));
           Serial.print(finalEncoderPos);
           if (abs(finalEncoderPos) <= 1) {
-            Serial.println(F(")"));
+            Serial.println(F(" OK)"));
           } else {
-            Serial.print(F(" WARN:"));
+            Serial.print(F(" FAIL:"));
             Serial.println(finalEncoderPos);
           }
         } else {
