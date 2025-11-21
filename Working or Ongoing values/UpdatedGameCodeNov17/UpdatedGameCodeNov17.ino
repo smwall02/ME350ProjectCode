@@ -182,11 +182,12 @@ const int TARGET_BAND = 2;  // Position tolerance: +/- 2 counts
 const float MAX_INTEGRAL = 1200.0;
 const unsigned long CONTROL_PERIOD = 10;
 
-// Rightward drift compensation (accounts for momentum when moving right)
+// Momentum compensation (accounts for overshoot in both directions)
 // When moving right (toward more negative positions), the system overshoots by 1-3 counts
-// due to momentum. This offset adjusts the effective target slightly left during control,
-// while arrival detection still uses the original target position.
-const int RIGHTWARD_DRIFT_OFFSET = 2;  // Compensate for 2-count overshoot to the right
+// When moving left (toward less negative positions), the system overshoots to positive positions
+// These offsets adjust the effective target during control to compensate for momentum
+const int RIGHTWARD_DRIFT_OFFSET = 2;  // Compensate for 2-count overshoot when moving right
+const int LEFTWARD_DRIFT_OFFSET = 2;   // Compensate for overshoot when moving left (to positive positions)
 
 // ============================================
 // MOTION CONTROL STATE
@@ -749,10 +750,11 @@ void runStateMachine() {
       // EARLY FINE ADJUSTMENT: If close to target and zombie still approaching, correct to exactly 0 error
       // This helps account for gear backlash when making large moves (e.g., lane 4 to lane 1)
       // GOAL: Get to exactly 0 error (encoder count = target position)
-      // Prevent rapid triggering to avoid overcompensation
+      // Only trigger when motor velocity is low to avoid interfering with active movement
       if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
           (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
+          abs(motorVelocity) < 20 &&  // Only when moving slowly (near target)
           abs(errorToOriginalTarget) <= 5 &&  // Close to target (slightly larger than TARGET_BAND)
           abs(errorToOriginalTarget) > TARGET_BAND &&  // But not quite at target yet
           ProxSensors[activeTargetIndex].direction == FORWARD &&
@@ -806,11 +808,12 @@ void runStateMachine() {
             // FINE POSITIONING: If zombie still approaching and at/near target, immediately correct to exactly 0 error
             // This accounts for gear backlash/gaps - zombie may still be moving forward even when at encoder target
             // GOAL: Ensure encoder count is exactly at target (error = 0, within TARGET_BAND)
-            // Prevent rapid triggering to avoid overcompensation
+            // Only trigger when motor velocity is low to avoid interfering with active movement
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      !fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
+                     abs(motorVelocity) < 20 &&  // Only when moving slowly (near target)
                      abs(errorToOriginalTarget) <= TARGET_BAND + 3 &&  // At or very close to target (allow 3 counts tolerance)
                      !ProxSensors[activeTargetIndex].hitDetected) {  // Not yet hit
               
@@ -837,14 +840,15 @@ void runStateMachine() {
             }
             
             // CONTINUOUS FINE ADJUSTMENT: If already fine-adjusted but still have error, correct to exactly 0
-            // Prevent rapid triggering to avoid oscillation
+            // Only trigger when motor velocity is low to avoid interfering with active movement
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
+                     abs(motorVelocity) < 15 &&  // Only when moving very slowly
                      abs(errorToCurrentTarget) > 1 &&  // Still have error (not at exactly 0, allow 1 count tolerance)
                      !ProxSensors[activeTargetIndex].hitDetected &&  // Not yet hit
-                     (millis() - arrivalTime) >= 200) {  // Been at position for 200ms (slower to prevent oscillation)
+                     (millis() - arrivalTime) >= 300) {  // Been at position for 300ms (slower to prevent oscillation)
               
               // CORRECT TO EXACTLY 0: Set target to original position to eliminate remaining error
               fineAdjustmentTarget = activeTargetPosition;
@@ -889,14 +893,19 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
-  // Apply rightward drift compensation: if moving right (toward more negative),
-  // adjust target slightly left to compensate for momentum overshoot
+  // Apply momentum compensation: adjust target to compensate for overshoot in both directions
   // DISABLE during fine adjustment to prevent interference with precise positioning
   long adjustedDesiredPosition = desiredPosition;
-  if (!fineAdjustmentActive && currentPosition > desiredPosition) {
-    // Moving right (current is less negative than target)
-    // Adjust target left by drift offset to compensate for overshoot
-    adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+  if (!fineAdjustmentActive) {
+    if (currentPosition > desiredPosition) {
+      // Moving right (current is less negative than target, toward more negative)
+      // Adjust target left by drift offset to compensate for rightward overshoot
+      adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
+    } else if (currentPosition < desiredPosition) {
+      // Moving left (current is more negative than target, toward less negative/positive)
+      // Adjust target right by drift offset to compensate for leftward overshoot
+      adjustedDesiredPosition = desiredPosition - LEFTWARD_DRIFT_OFFSET;
+    }
   }
   
   float error = adjustedDesiredPosition - currentPosition;
@@ -1072,19 +1081,21 @@ void runMotionControl() {
   
   float dt = CONTROL_PERIOD / 1000.0;
   
+  // Adaptive PID gains - slightly increased to compensate for lower voltage limits
+  // Still maintains good control while working within 5V max
   if (abs(error) > 300) {
-    KP_active = KP * 1.8;
+    KP_active = KP * 2.0;  // Slightly increased from 1.8 for better response at lower voltage
     KI_active = 0;
-    KD_active = KD * 0.5;
+    KD_active = KD * 0.6;  // Slightly increased from 0.5 for better damping
     errorIntegral = 0;
   } else if (abs(error) > 50) {
-    KP_active = KP * 1.3;
-    KI_active = KI * 0.5;
-    KD_active = KD;
+    KP_active = KP * 1.5;  // Increased from 1.3
+    KI_active = KI * 0.6;  // Increased from 0.5
+    KD_active = KD * 1.1;  // Slightly increased for better control
   } else {
-    KP_active = KP;
-    KI_active = KI;
-    KD_active = KD;
+    KP_active = KP * 1.1;  // Slightly increased for better responsiveness
+    KI_active = KI * 1.1;  // Slightly increased
+    KD_active = KD * 1.1;  // Slightly increased for better damping
     
     errorIntegral += error * dt;
     errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
@@ -1095,6 +1106,24 @@ void runMotionControl() {
   float pidVoltage = (KP_active * error) +
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
+  
+  // VELOCITY-BASED MOMENTUM COMPENSATION: Reduce voltage when approaching target to prevent overshoot
+  // When moving fast toward target, reduce voltage to allow deceleration
+  float momentumCompensation = 1.0;  // Multiplier for voltage reduction
+  if (abs(error) < 100 && abs(motorVelocity) > 50) {
+    // Close to target and moving fast - reduce voltage to prevent overshoot
+    // Scale reduction based on velocity (faster = more reduction)
+    float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);  // Normalize to 0-1
+    momentumCompensation = 1.0 - (velocityFactor * 0.4);  // Reduce by up to 40% when moving fast
+    momentumCompensation = max(momentumCompensation, 0.6);  // Don't reduce below 60%
+  } else if (abs(error) < 50 && abs(motorVelocity) > 30) {
+    // Very close to target and still moving - more aggressive reduction
+    float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
+    momentumCompensation = 1.0 - (velocityFactor * 0.5);  // Reduce by up to 50%
+    momentumCompensation = max(momentumCompensation, 0.5);  // Don't reduce below 50%
+  }
+  
+  pidVoltage *= momentumCompensation;
 
   // FRICTION COMPENSATION DISABLED - was causing overshoot
   float frictionComp = 0;
@@ -1121,35 +1150,35 @@ void runMotionControl() {
   //   velocityFF = 0.008 * desiredVelocity;
   // }
 
-  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add moderate voltage to overcome backlash
-  // Reduced boost to prevent overcompensation, especially on leftward moves (lane 4 to lane 1)
+  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add small voltage to overcome backlash
+  // Very conservative boost to prevent overcompensation, especially on leftward moves (lane 4 to lane 1)
   float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 5) {
-    // Apply moderate boost only for very small errors to prevent overcompensation
-    // Use conservative multiplier to avoid overshoot
-    float boostMultiplier = 1.0;  // Reduced from 3.5 to prevent overcompensation
+  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 3 && abs(motorVelocity) < 10) {
+    // Apply very small boost only for tiny errors when nearly stopped
+    // Use minimal multiplier to avoid overshoot
+    float boostMultiplier = 0.5;  // Very conservative - just enough to overcome static friction
     fineAdjustmentBoost = error * boostMultiplier;
-    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);  // Reduced limit to prevent overshoot
+    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -1.0, 1.0);  // Very small limit
   }
 
   // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
-  // Voltage capping based on error magnitude (increased for faster movement)
-  float voltageLimit = MAX_VOLTAGE;
+  // Voltage capping based on error magnitude - reduced to ~5V max for slower, more controlled motion
+  float voltageLimit = 5.0;  // Maximum voltage cap
   long absErr = abs(error);
   if (absErr > 800) {
-    voltageLimit = 4.5;  // Increased from 3.0 for faster long moves
+    voltageLimit = 5.0;  // Reduced from 4.5 for slower, controlled movement
   } else if (absErr > 500) {
-    voltageLimit = 4.0;  // Increased from 2.7
+    voltageLimit = 4.5;  // Reduced from 4.0
   } else if (absErr > 300) {
-    voltageLimit = 3.5;  // Increased from 2.5
+    voltageLimit = 4.0;  // Reduced from 3.5
   } else if (absErr > 100) {
-    voltageLimit = 3.0;  // Increased from 2.2
+    voltageLimit = 3.5;  // Reduced from 3.0
   } else if (absErr > 50) {
-    voltageLimit = 2.5;  // Increased from 2.0
+    voltageLimit = 3.0;  // Reduced from 2.5
   } else {
-    voltageLimit = 2.2;  // Increased from 1.8 for final approach
+    voltageLimit = 2.5;  // Reduced from 2.2 for final approach
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -1169,8 +1198,9 @@ void runMotionControl() {
         stuckCounter++;
 
         // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
+        // Reduced voltage for lower overall operation voltage
         if (stuckCounter >= 2) {
-          float minVoltage = 2.5;  // Conservative to prevent overshoot
+          float minVoltage = 2.0;  // Reduced from 2.5 for lower voltage operation
           if (abs(totalVoltage) < minVoltage) {
             totalVoltage = (error < 0) ? -minVoltage : minVoltage;
           }
