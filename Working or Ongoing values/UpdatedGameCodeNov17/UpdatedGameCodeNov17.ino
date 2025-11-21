@@ -577,29 +577,50 @@ void runStateMachine() {
       // If at left limit switch, ensure encoder is at 0 and don't try to move
       if (leftPressed()) {
         long currentPos = encoder.read();
-        if (abs(currentPos) > 5) {
+        if (abs(currentPos) > 2) {
           // Encoder not zeroed - reset it
           encoder.write(0);
           delay(50);
+          // Reset velocity tracking
+          previousMotorPosition = 0;
+          previousVelCompTime = micros();
+          motorVelocity = 0;
         }
         desiredPosition = LOWER_BOUND;
-        // Don't try to move - we're already at the limit
+        // Stop motor - we're already at the limit
+        stopMotor();
+        errorIntegral = 0;
+        
+        // Transition to next state since we're already homed
+        if (!dynamicCalibrationActive && sensorCalibrated) {
+          Serial.println(F("State: CALIBRATE → CHOOSE_ACTIVE_TARGET (tracking enabled)\n"));
+          currentState = CHOOSE_ACTIVE_TARGET;
+          systemEnabled = true;
+        }
+        else if (!dynamicCalibrationActive && !sensorCalibrated) {
+          // Skip range finding - use fixed bounds, go directly to sensor calibration
+          Serial.println(F("State: CALIBRATE → Sensor Calibration (using fixed bounds)\n"));
+          rangeFindingComplete = true;  // Mark as complete since we're using fixed values
+          startDynamicCalibration();
+          desiredPosition = LOWER_BOUND;
+          systemEnabled = true;
+        }
       } else {
         desiredPosition = LOWER_BOUND;
-      }
-
-      if (!dynamicCalibrationActive && sensorCalibrated) {
-        Serial.println(F("State: CALIBRATE → CHOOSE_ACTIVE_TARGET (tracking enabled)\n"));
-        currentState = CHOOSE_ACTIVE_TARGET;
-        systemEnabled = true;
-      }
-      else if (!dynamicCalibrationActive && !sensorCalibrated) {
-        // Skip range finding - use fixed bounds, go directly to sensor calibration
-        Serial.println(F("State: CALIBRATE → Sensor Calibration (using fixed bounds)\n"));
-        rangeFindingComplete = true;  // Mark as complete since we're using fixed values
-        startDynamicCalibration();
-        desiredPosition = LOWER_BOUND;
-        systemEnabled = true;
+        
+        if (!dynamicCalibrationActive && sensorCalibrated) {
+          Serial.println(F("State: CALIBRATE → CHOOSE_ACTIVE_TARGET (tracking enabled)\n"));
+          currentState = CHOOSE_ACTIVE_TARGET;
+          systemEnabled = true;
+        }
+        else if (!dynamicCalibrationActive && !sensorCalibrated) {
+          // Skip range finding - use fixed bounds, go directly to sensor calibration
+          Serial.println(F("State: CALIBRATE → Sensor Calibration (using fixed bounds)\n"));
+          rangeFindingComplete = true;  // Mark as complete since we're using fixed values
+          startDynamicCalibration();
+          desiredPosition = LOWER_BOUND;
+          systemEnabled = true;
+        }
       }
       break;
     
@@ -844,16 +865,28 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
-  // Safety: Prevent movement into left limit switch (except during calibration/homing)
-  if (leftPressed() && currentState != CALIBRATE && !dynamicCalibrationActive) {
-    // At left limit - stop motor and ensure encoder is at 0
-    if (currentPosition > 5) {
-      // Encoder drifted - reset it
+  // CRITICAL SAFETY: If at left limit, stop immediately and reset encoder
+  if (leftPressed()) {
+    // Stop motor immediately
+    stopMotor();
+    
+    // Reset encoder if it's not at zero
+    if (abs(currentPosition) > 2) {
       encoder.write(0);
       delay(50);
+      // Reset velocity tracking to match
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
     }
-    stopMotor();
-    return;
+    
+    // Clear error integral to prevent windup
+    errorIntegral = 0;
+    
+    // Only allow movement if we're in CALIBRATE state (homing)
+    if (currentState != CALIBRATE && !dynamicCalibrationActive) {
+      return;  // Exit immediately - don't try to move
+    }
   }
   
   // Apply rightward drift compensation: if moving right (toward more negative),
@@ -892,6 +925,23 @@ void runMotionControl() {
   
   // Check against original target position for arrival (not adjusted one)
   float originalError = desiredPosition - currentPosition;
+  
+  // CRITICAL: Prevent leftward movement when at left limit
+  if (leftPressed() && originalError > 0) {
+    // At left limit and trying to move left - stop immediately
+    stopMotor();
+    errorIntegral = 0;
+    // Ensure encoder is at 0
+    if (abs(currentPosition) > 2) {
+      encoder.write(0);
+      delay(50);
+      previousMotorPosition = 0;
+      previousVelCompTime = micros();
+      motorVelocity = 0;
+    }
+    return;
+  }
+  
   if (abs(originalError) <= TARGET_BAND) {
     stopMotor();
     errorIntegral = 0;
@@ -905,17 +955,6 @@ void runMotionControl() {
       Serial.print(F(" in "));
       Serial.print(settleTime / 1000.0, 2);
       Serial.println(F("s"));
-    }
-    return;
-  }
-  
-  // Additional safety: If at left limit and trying to move left (positive error), stop
-  if (leftPressed() && originalError > 0) {
-    stopMotor();
-    errorIntegral = 0;
-    // Ensure encoder is at 0 if we're at the limit
-    if (abs(currentPosition) > 5) {
-      encoder.write(0);
     }
     return;
   }
@@ -1306,10 +1345,18 @@ bool homeToLeftLimit() {
 
   // Stop motor first to ensure clean state
   stopMotor();
-  delay(100);
+  delay(200);
+  
+  // Disable motion control temporarily during homing
+  bool wasSystemEnabled = systemEnabled;
+  systemEnabled = false;
 
   if (leftPressed()) {
-    Serial.println(F("At limit, stabilizing..."));
+    Serial.println(F("Already at limit, stabilizing..."));
+    
+    // Stop motor immediately
+    stopMotor();
+    delay(200);
 
     // Hold gently at limit to ensure stable position
     long lastPos = encoder.read();
@@ -1318,6 +1365,7 @@ bool homeToLeftLimit() {
     float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
 
     while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
+      // Only apply small holding voltage
       setMotor(holdVoltage);
       delay(10);
       long pos = encoder.read();
@@ -1329,53 +1377,62 @@ bool homeToLeftLimit() {
       }
     }
 
+    // STOP motor completely
     stopMotor();
-    delay(200);  // Longer delay to ensure motor stops
+    delay(300);
 
-    // Multiple zeroing attempts to ensure encoder is properly reset
-    encoder.write(0);
-    delay(100);
-    if (encoder.read() != 0) {
+    // Reset encoder multiple times
+    for (int i = 0; i < 5; i++) {
       encoder.write(0);
-      delay(100);
+      delay(50);
     }
-    encoder.write(0);
-    delay(100);
     
-    // Verify encoder is actually zeroed
+    // Verify encoder is zeroed
     long finalPos = encoder.read();
     if (abs(finalPos) > 2) {
       Serial.print(F("⚠️  Warning: Encoder not zeroed, reading: "));
       Serial.println(finalPos);
-      encoder.write(0);  // Try one more time
-      delay(100);
+      // Force reset
+      for (int i = 0; i < 3; i++) {
+        encoder.write(0);
+        delay(50);
+      }
     }
 
-    // Final stop and verify
+    // Final stop
     stopMotor();
-    delay(100);
+    delay(200);
     
-    Serial.print(F("Homed (encoder: "));
+    // Reset velocity tracking
+    previousMotorPosition = 0;
+    previousVelCompTime = micros();
+    motorVelocity = 0;
+    
+    Serial.print(F("✓ Homed (encoder: "));
     Serial.print(encoder.read());
     Serial.println(F(")"));
+    
+    systemEnabled = wasSystemEnabled;
     return true;
   }
 
   // Approach limit switch
+  Serial.println(F("Moving to left limit..."));
   unsigned long startTime = millis();
   float driveVoltage = max(FRICTION_RIGHT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
   setMotor(driveVoltage);
 
+  // Wait for limit switch with timeout
   while (!leftPressed() && (millis() - startTime) < 15000) {
     delay(10);
-    // Safety: stop if limit switch is pressed
-    if (leftPressed()) {
-      break;
-    }
   }
 
+  // STOP motor immediately when limit is detected
+  stopMotor();
+  delay(200);
+
   if (leftPressed()) {
-    Serial.println(F("Contact..."));
+    Serial.println(F("✓ Contact detected"));
 
     // Hold gently at limit to remove bounce
     long currentPos = encoder.read();
@@ -1396,39 +1453,47 @@ bool homeToLeftLimit() {
       }
     }
 
+    // STOP motor completely
     stopMotor();
-    delay(200);  // Longer delay to ensure motor stops
+    delay(300);
 
-    // Multiple zeroing attempts to ensure encoder is properly reset
-    encoder.write(0);
-    delay(100);
-    if (encoder.read() != 0) {
+    // Reset encoder multiple times with delays
+    for (int i = 0; i < 5; i++) {
       encoder.write(0);
       delay(100);
     }
-    encoder.write(0);
-    delay(100);
     
     // Verify encoder is actually zeroed
     long finalPos = encoder.read();
     if (abs(finalPos) > 2) {
       Serial.print(F("⚠️  Warning: Encoder not zeroed, reading: "));
       Serial.println(finalPos);
-      encoder.write(0);  // Try one more time
-      delay(100);
+      // Force reset again
+      for (int i = 0; i < 3; i++) {
+        encoder.write(0);
+        delay(100);
+      }
     }
 
     // Final stop and verify
     stopMotor();
-    delay(100);
+    delay(200);
     
-    Serial.print(F("Homed (encoder: "));
+    // Reset velocity tracking
+    previousMotorPosition = 0;
+    previousVelCompTime = micros();
+    motorVelocity = 0;
+    
+    Serial.print(F("✓ Homed (encoder: "));
     Serial.print(encoder.read());
     Serial.println(F(")"));
+    
+    systemEnabled = wasSystemEnabled;
     return true;
   } else {
     stopMotor();
-    Serial.println(F("Timeout"));
+    Serial.println(F("✗ Timeout - limit switch not reached"));
+    systemEnabled = wasSystemEnabled;
     return false;
   }
 }
