@@ -206,8 +206,11 @@ int stuckCounter = 0;
 
 // Retry logic for positioning accuracy
 int positionRetryCount = 0;
-const int MAX_POSITION_RETRIES = 1;
+const int MAX_POSITION_RETRIES = 2;  // Increased retries
 const int RETRY_ERROR_THRESHOLD = 3;  // Retry if stuck at error > 3
+const float RETRY_VOLTAGE_BOOST = 2.0;  // Extra voltage boost when retrying
+unsigned long retryStartTime = 0;  // Track when retry started
+bool inRetryMode = false;  // Flag for retry mode
 
 const int MIN_VEL_COMP_COUNT = 2;
 const long MIN_VEL_COMP_TIME = 10000;
@@ -638,6 +641,7 @@ void runStateMachine() {
       targetReached = false;
       stuckCounter = 0;
       positionRetryCount = 0;
+      inRetryMode = false;  // Reset retry mode for new target
       currentState = MOVE_TO_TARGET;
       break;
     
@@ -883,23 +887,30 @@ void runMotionControl() {
 
   targetReached = false;
 
-  // Retry logic: if stuck outside target band for too long, retry once
+  // Retry logic: if stuck outside target band for too long, retry with higher voltage
   // Use original error for retry detection (not adjusted)
-  if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
+  // Expanded threshold to handle larger errors (up to 100 counts)
+  if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 100) {
     // Check if we've been stuck at this error for 500ms
     if (millis() - moveStartTime > 500 && positionRetryCount < MAX_POSITION_RETRIES) {
-      positionRetryCount++;
-      Serial.print(F("⚠️  Stuck at error = "));
-      Serial.print(abs(originalError));
-      Serial.println(F(", retrying..."));
+      if (!inRetryMode) {
+        positionRetryCount++;
+        Serial.print(F("⚠️  Stuck at error = "));
+        Serial.print(abs(originalError));
+        Serial.print(F(", retrying with voltage boost (attempt "));
+        Serial.print(positionRetryCount);
+        Serial.println(F(")..."));
 
-      // Reset for retry
-      errorIntegral = 0;
-      lastError = 0;
-      moveStartTime = millis();
-      stuckCounter = 0;
-      delay(100);
-      return;
+        // Enter retry mode with voltage boost
+        inRetryMode = true;
+        retryStartTime = millis();
+        
+        // Reset for retry
+        errorIntegral = 0;
+        lastError = 0;
+        moveStartTime = millis();
+        stuckCounter = 0;
+      }
     }
   }
   
@@ -1054,6 +1065,18 @@ void runMotionControl() {
 
   // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF;
+  
+  // Apply voltage boost during retry mode (for first 300ms of retry)
+  if (inRetryMode) {
+    if (millis() - retryStartTime < 300) {
+      // Apply aggressive voltage boost in direction of error
+      float boostVoltage = (originalError < 0) ? -RETRY_VOLTAGE_BOOST : RETRY_VOLTAGE_BOOST;
+      totalVoltage += boostVoltage;
+    } else {
+      // Retry boost period over, continue with normal control
+      inRetryMode = false;
+    }
+  }
 
   // Voltage capping based on error magnitude (increased significantly for faster movement)
   float voltageLimit = MAX_VOLTAGE;
@@ -1072,6 +1095,11 @@ void runMotionControl() {
     voltageLimit = 3.5;  // Increased from 2.2 for final approach
   }
 
+  // Allow higher voltage limit during retry mode (20% boost)
+  if (inRetryMode) {
+    voltageLimit *= 1.2;
+  }
+  
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
 
   // Anti-windup on zero crossing
@@ -1507,6 +1535,193 @@ void manualCalibration() {
 }
 
 // ============================================
+// PID TUNING MODE
+// ============================================
+void pidTuningMode() {
+  Serial.println(F("\n=== PID TUNING MODE ==="));
+  Serial.println(F("Adjust PID values interactively"));
+  Serial.println(F("\nCurrent values:"));
+  Serial.print(F("  KP = "));
+  Serial.println(KP, 6);
+  Serial.print(F("  KI = "));
+  Serial.println(KI, 6);
+  Serial.print(F("  KD = "));
+  Serial.println(KD, 6);
+  Serial.println(F("\nCommands:"));
+  Serial.println(F("  P = Adjust KP (Proportional)"));
+  Serial.println(F("  I = Adjust KI (Integral)"));
+  Serial.println(F("  D = Adjust KD (Derivative)"));
+  Serial.println(F("  + = Increase current value by 10%"));
+  Serial.println(F("  - = Decrease current value by 10%"));
+  Serial.println(F("  * = Increase current value by 1%"));
+  Serial.println(F("  / = Decrease current value by 1%"));
+  Serial.println(F("  R = Reset to defaults"));
+  Serial.println(F("  S = Save to EEPROM"));
+  Serial.println(F("  Q = Quit (values kept in memory)\n"));
+  
+  bool wasEnabled = systemEnabled;
+  bool wasAuto = autoMode;
+  systemEnabled = false;
+  autoMode = false;
+  stopMotor();
+  
+  char currentParam = 'P';  // Default to KP
+  
+  while (true) {
+    if (Serial.available()) {
+      char cmd = Serial.read();
+      while (Serial.available()) Serial.read();
+      
+      cmd = toupper(cmd);
+      
+      switch (cmd) {
+        case 'P':
+          currentParam = 'P';
+          Serial.print(F("\n→ Adjusting KP (current: "));
+          Serial.print(KP, 6);
+          Serial.println(F(")"));
+          break;
+          
+        case 'I':
+          currentParam = 'I';
+          Serial.print(F("\n→ Adjusting KI (current: "));
+          Serial.print(KI, 6);
+          Serial.println(F(")"));
+          break;
+          
+        case 'D':
+          currentParam = 'D';
+          Serial.print(F("\n→ Adjusting KD (current: "));
+          Serial.print(KD, 6);
+          Serial.println(F(")"));
+          break;
+          
+        case '+':
+          if (currentParam == 'P') {
+            KP *= 1.1;
+            Serial.print(F("KP = "));
+            Serial.println(KP, 6);
+          } else if (currentParam == 'I') {
+            KI *= 1.1;
+            Serial.print(F("KI = "));
+            Serial.println(KI, 6);
+          } else if (currentParam == 'D') {
+            KD *= 1.1;
+            Serial.print(F("KD = "));
+            Serial.println(KD, 6);
+          }
+          // Update active values
+          KP_active = KP;
+          KI_active = KI;
+          KD_active = KD;
+          break;
+          
+        case '-':
+          if (currentParam == 'P') {
+            KP *= 0.9;
+            Serial.print(F("KP = "));
+            Serial.println(KP, 6);
+          } else if (currentParam == 'I') {
+            KI *= 0.9;
+            Serial.print(F("KI = "));
+            Serial.println(KI, 6);
+          } else if (currentParam == 'D') {
+            KD *= 0.9;
+            Serial.print(F("KD = "));
+            Serial.println(KD, 6);
+          }
+          // Update active values
+          KP_active = KP;
+          KI_active = KI;
+          KD_active = KD;
+          break;
+          
+        case '*':
+          if (currentParam == 'P') {
+            KP *= 1.01;
+            Serial.print(F("KP = "));
+            Serial.println(KP, 6);
+          } else if (currentParam == 'I') {
+            KI *= 1.01;
+            Serial.print(F("KI = "));
+            Serial.println(KI, 6);
+          } else if (currentParam == 'D') {
+            KD *= 1.01;
+            Serial.print(F("KD = "));
+            Serial.println(KD, 6);
+          }
+          // Update active values
+          KP_active = KP;
+          KI_active = KI;
+          KD_active = KD;
+          break;
+          
+        case '/':
+          if (currentParam == 'P') {
+            KP *= 0.99;
+            Serial.print(F("KP = "));
+            Serial.println(KP, 6);
+          } else if (currentParam == 'I') {
+            KI *= 0.99;
+            Serial.print(F("KI = "));
+            Serial.println(KI, 6);
+          } else if (currentParam == 'D') {
+            KD *= 0.99;
+            Serial.print(F("KD = "));
+            Serial.println(KD, 6);
+          }
+          // Update active values
+          KP_active = KP;
+          KI_active = KI;
+          KD_active = KD;
+          break;
+          
+        case 'R':
+          KP = 0.018;
+          KI = 0.003;
+          KD = 0.022;
+          KP_active = KP;
+          KI_active = KI;
+          KD_active = KD;
+          Serial.println(F("\n✓ Reset to defaults:"));
+          Serial.print(F("  KP = "));
+          Serial.println(KP, 6);
+          Serial.print(F("  KI = "));
+          Serial.println(KI, 6);
+          Serial.print(F("  KD = "));
+          Serial.println(KD, 6);
+          break;
+          
+        case 'S':
+          savePIDToEEPROM();
+          Serial.println(F("✓ PID values saved to EEPROM"));
+          break;
+          
+        case 'Q':
+          Serial.println(F("\n✓ Exiting PID tuning mode"));
+          Serial.println(F("Final values:"));
+          Serial.print(F("  KP = "));
+          Serial.println(KP, 6);
+          Serial.print(F("  KI = "));
+          Serial.println(KI, 6);
+          Serial.print(F("  KD = "));
+          Serial.println(KD, 6);
+          Serial.println();
+          
+          systemEnabled = wasEnabled;
+          autoMode = wasAuto;
+          return;
+          
+        default:
+          break;
+      }
+    }
+    
+    delay(50);
+  }
+}
+
+// ============================================
 // COMMAND PROCESSING
 // ============================================
 void processCommand() {
@@ -1641,6 +1856,10 @@ void processCommand() {
       continuousMonitor();
       break;
     
+    case 'T':
+      pidTuningMode();
+      break;
+    
     case 'R':
       adaptiveFrictionVoltage = 0;
       adaptiveLearning = false;
@@ -1678,6 +1897,7 @@ void setTargetLane(int lane) {
   targetReached = false;
   stuckCounter = 0;  // Reset stuck detection for new movement
   positionRetryCount = 0;  // Reset retry counter for new movement
+  inRetryMode = false;  // Reset retry mode for new movement
   
   long currentPos = encoder.read();
   long error = desiredPosition - currentPos;
@@ -1705,7 +1925,7 @@ void printHelp() {
   Serial.println(F("\nCOMMANDS:"));
   Serial.println(F("C-Calibrate Z-Home G-Auto S-Stop"));
   Serial.println(F("1-4:Lanes P-Status D-Sensors M-Monitor"));
-  Serial.println(F("R-Reset L-Load W-Save H-Help"));
+  Serial.println(F("T-PIDTune R-Reset L-Load W-Save H-Help"));
 }
 
 void printCompactStatus() {
