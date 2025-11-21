@@ -334,7 +334,7 @@ void loop() {
 
       if (dynamicCalibrationActive) {
         printCalibrationProgress();
-      } else {
+      } else if (currentState != FIND_RANGE) {
         printCompactStatus();
       }
     }
@@ -584,6 +584,21 @@ void runStateMachine() {
         // Skip range finding - use fixed bounds, go directly to sensor calibration
         Serial.println(F("State: CALIBRATE → Sensor Calibration (using fixed bounds)\n"));
         rangeFindingComplete = true;  // Mark as complete since we're using fixed values
+        startDynamicCalibration();
+        desiredPosition = LOWER_BOUND;
+        systemEnabled = true;
+      }
+      break;
+    
+    case FIND_RANGE:
+      // Range finding is skipped - using fixed bounds (0 to -1424)
+      // If we somehow enter this state, mark range finding as complete and transition
+      rangeFindingComplete = true;
+      if (sensorCalibrated) {
+        currentState = CHOOSE_ACTIVE_TARGET;
+        systemEnabled = true;
+      } else {
+        // Start sensor calibration
         startDynamicCalibration();
         desiredPosition = LOWER_BOUND;
         systemEnabled = true;
