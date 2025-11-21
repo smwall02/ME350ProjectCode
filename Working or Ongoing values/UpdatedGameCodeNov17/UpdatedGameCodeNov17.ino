@@ -203,6 +203,8 @@ long previousVelCompTime = 0;
 long lastStuckCheckPos = 0;
 unsigned long lastStuckCheckTime = 0;
 int stuckCounter = 0;
+unsigned long stuckStartTime = 0;  // Track when stuck condition started
+bool voltageRamping = false;  // Flag for voltage ramp-up mode
 
 // Retry logic for positioning accuracy
 int positionRetryCount = 0;
@@ -976,6 +978,8 @@ void runMotionControl() {
       lastError = 0;
       moveStartTime = millis();
       stuckCounter = 0;
+      stuckStartTime = 0;  // Reset stuck tracking
+      voltageRamping = false;  // Reset voltage ramping
       delay(100);
       return;
     }
@@ -1185,7 +1189,7 @@ void runMotionControl() {
     errorIntegral *= 0.5;
   }
 
-  // Stuck detection: if outside target band but not moving, apply minimum voltage
+  // Stuck detection with voltage ramping: if outside target band but not moving, ramp up voltage
   // Use original error for stuck detection (not adjusted)
   unsigned long currentTime = millis();
   if (abs(originalError) > TARGET_BAND) {
@@ -1193,23 +1197,79 @@ void runMotionControl() {
     if (currentTime - lastStuckCheckTime >= 200) {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
         stuckCounter++;
+        
+        // Start tracking stuck time when first detected
+        if (stuckCounter == 1) {
+          stuckStartTime = currentTime;
+          voltageRamping = false;
+        }
 
-        // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
-        // Increased voltage for faster error correction
+        // If stuck for 2+ consecutive checks, start voltage ramping
         if (stuckCounter >= 2) {
-          float minVoltage = 2.5;  // Increased for faster correction
-          if (abs(totalVoltage) < minVoltage) {
-            totalVoltage = (error < 0) ? -minVoltage : minVoltage;
+          voltageRamping = true;
+          
+          // Calculate minimum voltage based on friction for this direction
+          bool movingRight = (error < 0);
+          float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
+          
+          // Ensure minimum is at least 2.0V to overcome friction
+          float minFrictionVoltage = max(baseFrictionVoltage, 2.0f);
+          
+          // Calculate how long we've been stuck
+          unsigned long stuckDuration = currentTime - stuckStartTime;
+          
+          // Ramp up voltage progressively: start at friction voltage, increase over time
+          float rampVoltage = minFrictionVoltage;
+          
+          // Ramp schedule:
+          // 0-400ms: friction voltage
+          // 400-800ms: friction + 0.5V
+          // 800-1200ms: friction + 1.0V
+          // 1200ms+: friction + 1.5V (up to voltage limit)
+          if (stuckDuration > 1200) {
+            rampVoltage = minFrictionVoltage + 1.5f;
+          } else if (stuckDuration > 800) {
+            rampVoltage = minFrictionVoltage + 1.0f;
+          } else if (stuckDuration > 400) {
+            rampVoltage = minFrictionVoltage + 0.5f;
+          }
+          
+          // Cap at voltage limit for current error range
+          rampVoltage = min(rampVoltage, voltageLimit);
+          
+          // Apply ramped voltage if current voltage is less
+          if (abs(totalVoltage) < rampVoltage) {
+            totalVoltage = (error < 0) ? -rampVoltage : rampVoltage;
           }
         }
       } else {
-        stuckCounter = 0;  // Reset if moving
+        // Moving again - reset stuck tracking
+        stuckCounter = 0;
+        stuckStartTime = 0;
+        voltageRamping = false;
       }
       lastStuckCheckPos = currentPosition;
       lastStuckCheckTime = currentTime;
     }
   } else {
-    stuckCounter = 0;  // Reset when within target band
+    // Within target band - reset stuck tracking
+    stuckCounter = 0;
+    stuckStartTime = 0;
+    voltageRamping = false;
+  }
+
+  // Ensure minimum voltage for error correction (at least friction voltage)
+  // This helps overcome static friction when correcting errors
+  if (abs(originalError) > TARGET_BAND && !voltageRamping) {
+    bool movingRight = (error < 0);
+    float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
+    float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);  // At least 1.5V to overcome friction
+    
+    // If calculated voltage is less than friction voltage, boost to friction voltage
+    // This ensures we can overcome static friction during error correction
+    if (abs(totalVoltage) < minFrictionVoltage) {
+      totalVoltage = (error < 0) ? -minFrictionVoltage : minFrictionVoltage;
+    }
   }
 
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
@@ -1661,6 +1721,8 @@ void processCommand() {
           fineAdjustmentActive = false;
           fineAdjustmentCount = 0;  // Reset counter
           lastFineAdjustmentTime = 0;  // Reset timestamp
+          stuckStartTime = 0;  // Reset stuck tracking
+          voltageRamping = false;  // Reset voltage ramping
           
           // Reset target tracking
           activeTargetIndex = -1;
@@ -1769,6 +1831,8 @@ void setTargetLane(int lane) {
   targetReached = false;
   stuckCounter = 0;  // Reset stuck detection for new movement
   positionRetryCount = 0;  // Reset retry counter for new movement
+  stuckStartTime = 0;  // Reset stuck tracking
+  voltageRamping = false;  // Reset voltage ramping
   
   long currentPos = encoder.read();
   long error = desiredPosition - currentPos;
