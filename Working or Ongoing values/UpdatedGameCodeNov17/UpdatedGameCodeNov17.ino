@@ -807,6 +807,8 @@ void runStateMachine() {
       targetReached = false;
       stuckCounter = 0;
       positionRetryCount = 0;
+      // Reset voltage rate limiter for new movement
+      // (will be reset in runMotionControl via static variable initialization)
       currentState = MOVE_TO_TARGET;
       break;
     
@@ -1193,46 +1195,47 @@ void runMotionControl() {
   float dt = CONTROL_PERIOD / 1000.0;
   
   // Adaptive PID gains with smoother transitions for more fluid movement
+  // Reduced overall gains to prevent jerky movements
   long absError = abs(error);
   if (absError > 1000) {
-    KP_active = KP * 3.5;
+    KP_active = KP * 2.8;  // Reduced from 3.5
     KI_active = 0;
-    KD_active = KD * 0.8;
+    KD_active = KD * 0.6;  // Reduced from 0.8
     errorIntegral = 0;
   } else if (absError > 500) {
-    KP_active = KP * 3.0;
+    KP_active = KP * 2.4;  // Reduced from 3.0
     KI_active = 0;
-    KD_active = KD * 0.75;
+    KD_active = KD * 0.6;  // Reduced from 0.75
     errorIntegral = 0;
   } else if (absError > 300) {
-    KP_active = KP * 2.5;
+    KP_active = KP * 2.0;  // Reduced from 2.5
     KI_active = 0;
-    KD_active = KD * 0.7;
+    KD_active = KD * 0.6;  // Reduced from 0.7
     errorIntegral = 0;
   } else if (absError > 100) {
-    KP_active = KP * 2.0;
-    KI_active = KI * 0.6;
-    KD_active = KD * 1.1;
+    KP_active = KP * 1.6;  // Reduced from 2.0
+    KI_active = KI * 0.5;  // Reduced from 0.6
+    KD_active = KD * 0.9;  // Reduced from 1.1
     // Reduce integral buildup when far from target
     errorIntegral *= 0.95;
   } else if (absError > 50) {
-    KP_active = KP * 1.5;
-    KI_active = KI * 0.8;
-    KD_active = KD * 1.2;
+    KP_active = KP * 1.2;  // Reduced from 1.5
+    KI_active = KI * 0.6;  // Reduced from 0.8
+    KD_active = KD * 1.0;  // Reduced from 1.2
     // Moderate integral buildup
-    errorIntegral += error * dt * 0.8;
+    errorIntegral += error * dt * 0.7;  // Reduced from 0.8
   } else if (absError > 10) {
     // Near target - reduce gains for smoother approach
-    KP_active = KP * 1.0;
-    KI_active = KI * 0.6;
-    KD_active = KD * 1.5;  // Higher derivative for damping
-    errorIntegral += error * dt * 0.5;
+    KP_active = KP * 0.8;  // Reduced from 1.0
+    KI_active = KI * 0.4;  // Reduced from 0.6
+    KD_active = KD * 1.2;  // Reduced from 1.5
+    errorIntegral += error * dt * 0.4;  // Reduced from 0.5
   } else {
     // Very close to target - minimal gains to prevent oscillation
-    KP_active = KP * 0.6;
-    KI_active = KI * 0.3;
-    KD_active = KD * 1.8;  // High derivative for stability
-    errorIntegral += error * dt * 0.3;
+    KP_active = KP * 0.4;  // Reduced from 0.6
+    KI_active = KI * 0.2;  // Reduced from 0.3
+    KD_active = KD * 1.4;  // Reduced from 1.8
+    errorIntegral += error * dt * 0.2;  // Reduced from 0.3
   }
   
   // Constrain integral to prevent windup
@@ -1243,36 +1246,54 @@ void runMotionControl() {
     errorIntegral *= 0.3;  // More aggressive decay on overshoot
   }
   
-  float errorDerivative = (error - lastError) / dt;
+  // Calculate derivative with low-pass filtering to reduce noise sensitivity
+  static float filteredDerivative = 0.0;
+  float rawDerivative = (error - lastError) / dt;
+  // Low-pass filter the derivative (alpha = 0.7 means 70% old, 30% new)
+  filteredDerivative = 0.7 * filteredDerivative + 0.3 * rawDerivative;
+  float errorDerivative = filteredDerivative;
+  
+  // Use velocity-based derivative instead of error derivative for smoother control
+  // This is less sensitive to encoder noise
+  float velocityDerivative = -motorVelocity;  // Negative because we want to oppose velocity
+  // Blend between error derivative and velocity derivative based on proximity to target
+  if (absError < 50) {
+    // Near target: use more velocity-based derivative (smoother)
+    errorDerivative = 0.3 * errorDerivative + 0.7 * velocityDerivative;
+  } else if (absError < 200) {
+    // Medium distance: blend both
+    errorDerivative = 0.6 * errorDerivative + 0.4 * velocityDerivative;
+  }
+  // Far from target: use mostly error derivative (faster response)
   
   float pidVoltage = (KP_active * error) +
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
   
-  // Enhanced momentum compensation for smoother deceleration
+  // Smoother momentum compensation for more fluid deceleration
   float momentumCompensation = 1.0;
   if (absError > 200) {
     momentumCompensation = 1.0;
   } else if (absError < 100 && abs(motorVelocity) > 50) {
     float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.5);  // More aggressive reduction
-    momentumCompensation = max(momentumCompensation, 0.5);
+    momentumCompensation = 1.0 - (velocityFactor * 0.35);  // Reduced from 0.5
+    momentumCompensation = max(momentumCompensation, 0.65);  // Less aggressive
   } else if (absError < 50 && abs(motorVelocity) > 30) {
     float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.6);  // More aggressive reduction
-    momentumCompensation = max(momentumCompensation, 0.4);
+    momentumCompensation = 1.0 - (velocityFactor * 0.45);  // Reduced from 0.6
+    momentumCompensation = max(momentumCompensation, 0.55);  // Less aggressive
   } else if (absError < 20 && abs(motorVelocity) > 20) {
-    // Very close - aggressive velocity damping
+    // Very close - moderate velocity damping
     float velocityFactor = constrain(abs(motorVelocity) / 50.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.7);
-    momentumCompensation = max(momentumCompensation, 0.3);
+    momentumCompensation = 1.0 - (velocityFactor * 0.5);  // Reduced from 0.7
+    momentumCompensation = max(momentumCompensation, 0.5);  // Less aggressive
   }
   
   pidVoltage *= momentumCompensation;
   
-  // Additional velocity-based damping when approaching target
+  // Additional velocity-based damping when approaching target (smoother)
   if (absError < 30 && abs(motorVelocity) > 15) {
-    float velocityDamping = 1.0 - (constrain(abs(motorVelocity) / 40.0, 0.0, 0.6));
+    float velocityDamping = 1.0 - (constrain(abs(motorVelocity) / 50.0, 0.0, 0.4));  // Reduced from 0.6
     pidVoltage *= velocityDamping;
   }
 
@@ -1289,25 +1310,26 @@ void runMotionControl() {
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
   // Progressive voltage limiting for smoother deceleration
+  // Further reduced limits to prevent jerky movements
   float voltageLimit = 9.0;
   if (absError > 1000) {
-    voltageLimit = 9.0;
+    voltageLimit = 8.5;  // Reduced from 9.0
   } else if (absError > 800) {
-    voltageLimit = 8.5;
+    voltageLimit = 8.0;  // Reduced from 8.5
   } else if (absError > 500) {
-    voltageLimit = 8.0;
+    voltageLimit = 7.0;  // Reduced from 8.0
   } else if (absError > 300) {
-    voltageLimit = 7.5;
+    voltageLimit = 6.0;  // Reduced from 7.5
   } else if (absError > 100) {
-    voltageLimit = 6.5;
+    voltageLimit = 5.0;  // Reduced from 6.5
   } else if (absError > 50) {
-    voltageLimit = 5.5;
+    voltageLimit = 4.0;  // Reduced from 5.5
   } else if (absError > 20) {
-    voltageLimit = 4.0;  // Reduced for smoother approach
+    voltageLimit = 3.0;  // Reduced from 4.0
   } else if (absError > 10) {
-    voltageLimit = 3.0;  // Further reduced near target
+    voltageLimit = 2.0;  // Reduced from 3.0
   } else {
-    voltageLimit = 2.0;  // Very low near target to prevent oscillation
+    voltageLimit = 1.5;  // Reduced from 2.0
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
@@ -1459,10 +1481,47 @@ void runMotionControl() {
     }
   }
 
+  // Voltage rate limiting to prevent jerky movements
+  static float lastAppliedVoltage = 0.0;
+  static unsigned long lastVoltageResetTime = 0;
+  const float MAX_VOLTAGE_RATE = 0.6;  // Maximum voltage change per control cycle (reduced from 0.8)
+  
+  // Reset voltage limiter if this is a new movement (moveStartTime changed significantly)
+  if (moveStartTime > lastVoltageResetTime + 100) {
+    lastAppliedVoltage = 0.0;  // Reset to allow smooth start
+    lastVoltageResetTime = moveStartTime;
+  }
+  
+  // Calculate maximum allowed change
+  float maxChange = MAX_VOLTAGE_RATE;
+  // Reduce rate limit when close to target for smoother approach
+  if (absError < 30) {
+    maxChange = 0.3;  // Slower changes near target (reduced from 0.4)
+  } else if (absError < 100) {
+    maxChange = 0.45;  // Medium rate limit (reduced from 0.6)
+  }
+  
+  // Allow faster change when reversing direction (error sign changed)
+  bool directionChanged = ((error > 0 && lastError < 0) || (error < 0 && lastError > 0));
+  if (directionChanged && absError > 20) {
+    maxChange *= 1.5;  // Allow 50% faster when reversing direction
+  }
+  
+  // Limit the rate of voltage change
+  float voltageChange = totalVoltage - lastAppliedVoltage;
+  if (abs(voltageChange) > maxChange) {
+    totalVoltage = lastAppliedVoltage + (voltageChange > 0 ? maxChange : -maxChange);
+  }
+  
+  // Update last applied voltage
+  lastAppliedVoltage = totalVoltage;
+
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
     setMotor(totalVoltage);
   } else {
     stopMotor();
+    // Reset voltage limiter when stopped to allow smooth restart
+    lastAppliedVoltage = 0.0;
   }
 
   lastError = error;
