@@ -1309,6 +1309,22 @@ void runMotionControl() {
 
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
+  // Special case: If at a limit switch and trying to move away, ensure we can move
+  bool atLeftLimit = leftPressed() && currentPosition <= 5;
+  bool atRightLimit = rightPressed() && currentPosition >= (UPPER_BOUND - 5);
+  bool tryingToMoveAwayFromLeft = atLeftLimit && originalError < 0;  // Want to move right (negative)
+  bool tryingToMoveAwayFromRight = atRightLimit && originalError > 0;  // Want to move left (positive)
+  
+  if ((tryingToMoveAwayFromLeft || tryingToMoveAwayFromRight) && abs(originalError) > TARGET_BAND) {
+    // Force minimum voltage to move away from limit
+    float minVoltageToMove = 2.5;  // Minimum voltage to overcome limit switch pressure
+    if (abs(totalVoltage) < minVoltageToMove) {
+      totalVoltage = (originalError < 0) ? -minVoltageToMove : minVoltageToMove;
+    }
+    // Reset voltage rate limiter to allow immediate movement away from limit
+    // (This will be handled by the rate limiter code checking moveStartTime)
+  }
+
   // Progressive voltage limiting for smoother deceleration
   // Further reduced limits to prevent jerky movements
   float voltageLimit = 9.0;
@@ -1552,14 +1568,20 @@ void setMotor(float voltage) {
 
   voltage = constrain(voltage, -10.0, 10.0);
   int pwm = abs(voltage) * 25.5;
+  // Only block movement TOWARD a pressed limit switch
+  // Allow movement AWAY from a pressed limit switch
   if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
+    // Block positive voltage (moving left) when left limit is pressed
     voltage = 0;
     pwm = 0;
   }
   if (digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
+    // Block negative voltage (moving right) when right limit is pressed
     voltage = 0;
     pwm = 0;
   }
+  // Note: Negative voltage when left limit is pressed is OK (moving away from left limit)
+  // Note: Positive voltage when right limit is pressed is OK (moving away from right limit)
   if (voltage > 0) {
     digitalWrite(MOTOR_IN2, HIGH);
     digitalWrite(MOTOR_IN3, LOW);
