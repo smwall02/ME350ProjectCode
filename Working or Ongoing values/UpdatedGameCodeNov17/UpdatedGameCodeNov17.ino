@@ -404,6 +404,11 @@ void updateVelocity() {
 
 // RANGE FINDING
 void findRange() {
+  // Don't restart if range finding is already complete
+  if (rangeFindingComplete) {
+    return;
+  }
+  
   if (!rangeFindingActive) {
     rangeFindingActive = true;
     rangeFindingStartTime = millis();
@@ -694,6 +699,16 @@ void runStateMachine() {
           startDynamicCalibration();
           desiredPosition = LOWER_BOUND;
         } else {
+          // Ensure encoder is at 0 after range finding
+          long currentPos = encoder.read();
+          if (currentPos > 10 || currentPos < -10) {
+            // Encoder drifted, reset it
+            encoder.write(0);
+            delay(50);
+            if (encoder.read() != 0) {
+              encoder.write(0);
+            }
+          }
           currentState = CHOOSE_ACTIVE_TARGET;
         }
       }
@@ -1330,13 +1345,19 @@ void stopMotor() {
 }
 
 // LIMIT SWITCHES
+static unsigned long lastLeftLimitReset = 0;
+static unsigned long lastRightLimitReset = 0;
+const unsigned long LIMIT_RESET_DEBOUNCE = 500;  // Don't reset more than once per 500ms
+
 void checkLimitSwitches() {
+  unsigned long currentTime = millis();
+  
   // Only reset encoder at left limit if we're trying to move toward it (positive error/voltage)
   // or if we're in calibration/range finding states
   if (digitalRead(LIMIT_LEFT) == HIGH) {
     if (currentState == CALIBRATE || currentState == FIND_RANGE || dynamicCalibrationActive) {
-      // During calibration, allow reset
-      if (abs(motorVelocity) < 10) {
+      // During calibration, allow reset but with debounce
+      if (abs(motorVelocity) < 10 && (currentTime - lastLeftLimitReset) > LIMIT_RESET_DEBOUNCE) {
         delay(50);
         encoder.write(0);
         delay(30);
@@ -1348,14 +1369,19 @@ void checkLimitSwitches() {
           encoder.write(0);
         }
         errorIntegral = 0;
+        lastLeftLimitReset = currentTime;
         Serial.println(F("Recal at left"));
       }
     } else if (currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) {
       // During normal operation, only reset if we're trying to move toward the limit
       long currentPos = encoder.read();
       long error = desiredPosition - currentPos;
-      // Only reset if error is positive (trying to move left/positive direction) and velocity is low
-      if (error > 0 && abs(motorVelocity) < 10) {
+      // Only reset if error is positive (trying to move left/positive direction) 
+      // AND we're actually at or very close to the limit (position <= 5)
+      // AND velocity is low
+      // AND debounce time has passed
+      if (error > 0 && currentPos <= 5 && abs(motorVelocity) < 10 && 
+          (currentTime - lastLeftLimitReset) > LIMIT_RESET_DEBOUNCE) {
         delay(50);
         encoder.write(0);
         delay(30);
@@ -1367,6 +1393,7 @@ void checkLimitSwitches() {
           encoder.write(0);
         }
         errorIntegral = 0;
+        lastLeftLimitReset = currentTime;
         Serial.println(F("Recal at left"));
       }
     }
@@ -1375,8 +1402,8 @@ void checkLimitSwitches() {
   // Right limit: only stop/reset if we're trying to move toward it (negative error/voltage)
   if (digitalRead(LIMIT_RIGHT) == HIGH) {
     if (currentState == CALIBRATE || currentState == FIND_RANGE || dynamicCalibrationActive) {
-      // During calibration, allow update
-      if (abs(motorVelocity) < 10) {
+      // During calibration, allow update but with debounce
+      if (abs(motorVelocity) < 10 && (currentTime - lastRightLimitReset) > LIMIT_RESET_DEBOUNCE) {
         stopMotor();
         long currentPos = encoder.read();
         if (abs(currentPos - UPPER_BOUND) > 10) {
@@ -1386,14 +1413,19 @@ void checkLimitSwitches() {
           Serial.println(UPPER_BOUND);
         }
         errorIntegral = 0;
+        lastRightLimitReset = currentTime;
         Serial.println(F("Right limit hit"));
       }
     } else if (currentState == MOVE_TO_TARGET || currentState == CHOOSE_ACTIVE_TARGET) {
       // During normal operation, only stop if we're trying to move toward the limit
       long currentPos = encoder.read();
       long error = desiredPosition - currentPos;
-      // Only stop if error is negative (trying to move right/negative direction) and velocity is low
-      if (error < 0 && abs(motorVelocity) < 10) {
+      // Only stop if error is negative (trying to move right/negative direction) 
+      // AND we're actually at or very close to the limit (position >= UPPER_BOUND - 5)
+      // AND velocity is low
+      // AND debounce time has passed
+      if (error < 0 && currentPos >= (UPPER_BOUND - 5) && abs(motorVelocity) < 10 &&
+          (currentTime - lastRightLimitReset) > LIMIT_RESET_DEBOUNCE) {
         stopMotor();
         if (abs(currentPos - UPPER_BOUND) > 10) {
           UPPER_BOUND = currentPos;
@@ -1402,6 +1434,7 @@ void checkLimitSwitches() {
           Serial.println(UPPER_BOUND);
         }
         errorIntegral = 0;
+        lastRightLimitReset = currentTime;
         Serial.println(F("Right limit hit"));
       }
     }
