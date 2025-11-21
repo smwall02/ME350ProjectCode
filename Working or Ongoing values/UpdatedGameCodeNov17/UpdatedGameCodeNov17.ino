@@ -140,9 +140,9 @@ long fineAdjustmentTarget = 0;       // Fine-tuned target position
 const int FINE_ADJUSTMENT_AMOUNT = 2;  // 1-2 counts adjustment
 float previousZombieDistance = 1.0;  // Track previous distance to detect if getting closer
 int fineAdjustmentCount = 0;  // Counter to prevent infinite oscillation
-const int MAX_FINE_ADJUSTMENTS = 3;  // Maximum number of fine adjustments per target
+const int MAX_FINE_ADJUSTMENTS = 5;  // Maximum number of fine adjustments per target (increased for faster correction)
 unsigned long lastFineAdjustmentTime = 0;  // Timestamp of last fine adjustment to prevent rapid triggering
-const unsigned long MIN_FINE_ADJUSTMENT_INTERVAL = 200;  // Minimum time between fine adjustments (ms)
+const unsigned long MIN_FINE_ADJUSTMENT_INTERVAL = 50;  // Minimum time between fine adjustments (ms) - reduced for faster correction
 
 // ============================================
 // FRICTION COMPENSATION (Improved)
@@ -203,6 +203,8 @@ long previousVelCompTime = 0;
 long lastStuckCheckPos = 0;
 unsigned long lastStuckCheckTime = 0;
 int stuckCounter = 0;
+unsigned long stuckStartTime = 0;  // Track when stuck condition started
+bool voltageRamping = false;  // Flag for voltage ramp-up mode
 
 // Retry logic for positioning accuracy
 int positionRetryCount = 0;
@@ -215,7 +217,7 @@ const long MIN_VEL_COMP_TIME = 10000;
 unsigned long lastControlTime = 0;
 unsigned long lastSensorTime = 0;
 unsigned long arrivalTime = 0;
-const int targetActivateTime = 200;  // Time at position before choosing next target
+const int targetActivateTime = 100;  // Time at position before choosing next target (reduced for faster response)
 
 // ============================================
 // SYSTEM STATE
@@ -704,6 +706,17 @@ void runStateMachine() {
           targetHitTime = 0;  // Reset if not consistently backward
         }
         
+        // IMPROVED: Switch immediately when zombie velocity changes (stops approaching or starts retreating)
+        // This responds faster to velocity changes as requested
+        // Note: prevDirection already declared above, reusing it here
+        if (prevDirection == FORWARD && 
+            (targetDirection == BACKWARD || targetDirection == STOPPED)) {
+          // Zombie was approaching but now retreating or stopped - switch immediately
+          Serial.println(F("✓ Target velocity changed (stopped approaching), choosing next"));
+          currentState = CHOOSE_ACTIVE_TARGET;
+          break;
+        }
+        
         // IMPROVED: Switch if zombie retreated far away (no longer a threat)
         // distance > 0.80 means percentage < 20% (far from photo sensor)
         if (targetDirection == BACKWARD &&
@@ -754,8 +767,8 @@ void runStateMachine() {
       if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
           (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-          abs(motorVelocity) < 20 &&  // Only when moving slowly (near target)
-          abs(errorToOriginalTarget) <= 5 &&  // Close to target (slightly larger than TARGET_BAND)
+          abs(motorVelocity) < 30 &&  // Increased threshold to trigger earlier
+          abs(errorToOriginalTarget) <= 8 &&  // Increased range to trigger earlier
           abs(errorToOriginalTarget) > TARGET_BAND &&  // But not quite at target yet
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           !ProxSensors[activeTargetIndex].hitDetected &&
@@ -813,8 +826,8 @@ void runStateMachine() {
                      !fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-                     abs(motorVelocity) < 20 &&  // Only when moving slowly (near target)
-                     abs(errorToOriginalTarget) <= TARGET_BAND + 3 &&  // At or very close to target (allow 3 counts tolerance)
+                     abs(motorVelocity) < 30 &&  // Increased threshold to trigger earlier
+                     abs(errorToOriginalTarget) <= TARGET_BAND + 5 &&  // Increased tolerance to trigger earlier
                      !ProxSensors[activeTargetIndex].hitDetected) {  // Not yet hit
               
               // CORRECT TO EXACTLY 0 ERROR: Set target to original position to eliminate any error
@@ -845,10 +858,10 @@ void runStateMachine() {
                      fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-                     abs(motorVelocity) < 15 &&  // Only when moving very slowly
+                     abs(motorVelocity) < 25 &&  // Increased threshold to trigger earlier
                      abs(errorToCurrentTarget) > 1 &&  // Still have error (not at exactly 0, allow 1 count tolerance)
                      !ProxSensors[activeTargetIndex].hitDetected &&  // Not yet hit
-                     (millis() - arrivalTime) >= 300) {  // Been at position for 300ms (slower to prevent oscillation)
+                     (millis() - arrivalTime) >= 100) {  // Reduced delay for faster continuous correction
               
               // CORRECT TO EXACTLY 0: Set target to original position to eliminate remaining error
               fineAdjustmentTarget = activeTargetPosition;
@@ -963,9 +976,10 @@ void runMotionControl() {
 
   // Retry logic: if stuck outside target band for too long, retry once
   // Use original error for retry detection (not adjusted)
+  // Reduced threshold and delay for faster error correction
   if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
-    // Check if we've been stuck at this error for 500ms
-    if (millis() - moveStartTime > 500 && positionRetryCount < MAX_POSITION_RETRIES) {
+    // Check if we've been stuck at this error for 300ms (reduced from 500ms for faster response)
+    if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
       Serial.print(F("⚠️  Stuck at error = "));
       Serial.print(abs(originalError));
@@ -976,6 +990,8 @@ void runMotionControl() {
       lastError = 0;
       moveStartTime = millis();
       stuckCounter = 0;
+      stuckStartTime = 0;  // Reset stuck tracking
+      voltageRamping = false;  // Reset voltage ramping
       delay(100);
       return;
     }
@@ -1081,21 +1097,38 @@ void runMotionControl() {
   
   float dt = CONTROL_PERIOD / 1000.0;
   
-  // Adaptive PID gains - slightly increased to compensate for lower voltage limits
-  // Still maintains good control while working within 5V max
-  if (abs(error) > 300) {
-    KP_active = KP * 2.0;  // Slightly increased from 1.8 for better response at lower voltage
+  // ============================================
+  // PID CONTROL CALCULATION (Primary control method)
+  // ============================================
+  // NOTE: PID values (KP, KI, KD) are ALWAYS used as the base for motor control
+  // The following sections may add boosts or minimums, but PID is always the foundation
+  // Adaptive friction learning (above) temporarily bypasses PID only during initial learning phase
+  
+  // Adaptive PID gains - increased for faster error correction
+  // Higher gains for very large errors (lane-to-lane moves) to move faster
+  if (abs(error) > 1000) {
+    KP_active = KP * 3.5;  // Very aggressive for large lane-to-lane moves
     KI_active = 0;
-    KD_active = KD * 0.6;  // Slightly increased from 0.5 for better damping
+    KD_active = KD * 0.8;  // Moderate damping for large moves
+    errorIntegral = 0;
+  } else if (abs(error) > 500) {
+    KP_active = KP * 3.0;  // Aggressive for large moves
+    KI_active = 0;
+    KD_active = KD * 0.75;  // Moderate damping
+    errorIntegral = 0;
+  } else if (abs(error) > 300) {
+    KP_active = KP * 2.5;  // Increased for faster large error correction
+    KI_active = 0;
+    KD_active = KD * 0.7;  // Increased damping
     errorIntegral = 0;
   } else if (abs(error) > 50) {
-    KP_active = KP * 1.5;  // Increased from 1.3
-    KI_active = KI * 0.6;  // Increased from 0.5
-    KD_active = KD * 1.1;  // Slightly increased for better control
+    KP_active = KP * 2.0;  // Increased for faster medium error correction
+    KI_active = KI * 0.8;  // Increased integral for faster correction
+    KD_active = KD * 1.2;  // Increased for better control
   } else {
-    KP_active = KP * 1.1;  // Slightly increased for better responsiveness
-    KI_active = KI * 1.1;  // Slightly increased
-    KD_active = KD * 1.1;  // Slightly increased for better damping
+    KP_active = KP * 1.5;  // Increased for faster small error correction
+    KI_active = KI * 1.3;  // Increased integral for faster fine positioning
+    KD_active = KD * 1.2;  // Increased for better damping
     
     errorIntegral += error * dt;
     errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
@@ -1109,8 +1142,12 @@ void runMotionControl() {
   
   // VELOCITY-BASED MOMENTUM COMPENSATION: Reduce voltage when approaching target to prevent overshoot
   // When moving fast toward target, reduce voltage to allow deceleration
+  // DISABLED for large errors to allow faster movement between targets
   float momentumCompensation = 1.0;  // Multiplier for voltage reduction
-  if (abs(error) < 100 && abs(motorVelocity) > 50) {
+  if (abs(error) > 200) {
+    // Large errors - no momentum compensation to allow maximum speed
+    momentumCompensation = 1.0;
+  } else if (abs(error) < 100 && abs(motorVelocity) > 50) {
     // Close to target and moving fast - reduce voltage to prevent overshoot
     // Scale reduction based on velocity (faster = more reduction)
     float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);  // Normalize to 0-1
@@ -1150,69 +1187,167 @@ void runMotionControl() {
   //   velocityFF = 0.008 * desiredVelocity;
   // }
 
-  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add small voltage to overcome backlash
-  // Very conservative boost to prevent overcompensation, especially on leftward moves (lane 4 to lane 1)
+  // FINE ADJUSTMENT VOLTAGE BOOST: When fine adjustment is active, add voltage to overcome backlash faster
   float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 3 && abs(motorVelocity) < 10) {
-    // Apply very small boost only for tiny errors when nearly stopped
-    // Use minimal multiplier to avoid overshoot
-    float boostMultiplier = 0.5;  // Very conservative - just enough to overcome static friction
+  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 5 && abs(motorVelocity) < 15) {
+    // Apply boost for small errors to overcome backlash and static friction faster
+    float boostMultiplier = 1.2;  // Increased for faster correction
     fineAdjustmentBoost = error * boostMultiplier;
-    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -1.0, 1.0);  // Very small limit
+    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);  // Increased limit for faster correction
   }
 
-  // Calculate total voltage
+  // Calculate total voltage - PID is the base, with optional boosts added
+  // totalVoltage = PID (primary) + friction compensation + velocity feedforward + fine adjustment boost
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
-  // Voltage capping based on error magnitude - reduced to ~5V max for slower, more controlled motion
-  float voltageLimit = 5.0;  // Maximum voltage cap
+  // Voltage capping based on error magnitude - increased for faster error correction
+  // Higher limits for very large errors (lane-to-lane moves) to prevent slow movement
+  float voltageLimit = 7.5;  // Maximum voltage cap (increased for faster large moves)
   long absErr = abs(error);
-  if (absErr > 800) {
-    voltageLimit = 5.0;  // Reduced from 4.5 for slower, controlled movement
+  if (absErr > 1000) {
+    voltageLimit = 7.5;  // Very large moves (lane 4 to lane 1) - maximum speed
+  } else if (absErr > 800) {
+    voltageLimit = 7.0;  // Large moves - high speed
   } else if (absErr > 500) {
-    voltageLimit = 4.5;  // Reduced from 4.0
+    voltageLimit = 6.5;  // Medium-large moves
   } else if (absErr > 300) {
-    voltageLimit = 4.0;  // Reduced from 3.5
+    voltageLimit = 6.0;  // Medium moves
   } else if (absErr > 100) {
-    voltageLimit = 3.5;  // Reduced from 3.0
+    voltageLimit = 5.0;  // Small-medium moves
   } else if (absErr > 50) {
-    voltageLimit = 3.0;  // Reduced from 2.5
+    voltageLimit = 4.5;  // Small moves
   } else {
-    voltageLimit = 2.5;  // Reduced from 2.2 for final approach
+    voltageLimit = 3.5;  // Fine positioning
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
+
+  // IMPROVED: Limit switch protection - slow down before hitting limits to prevent slamming
+  // This prevents the system from slamming into end stops when making large moves (lane 4 to lane 1)
+  // Applied AFTER voltage calculation to properly limit speed near limits
+  if (currentState == MOVE_TO_TARGET && autoMode) {
+    // Slow down when approaching left limit (moving left, error > 0 means moving toward positive)
+    // Reduce voltage significantly when within 100 counts of left limit
+    if (error > 0 && currentPosition > -100) {
+      // Approaching left limit - reduce voltage to prevent slamming
+      float proximityFactor = (currentPosition + 100) / 100.0;  // 0 at -100, 1 at 0
+      proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+      float limitProtection = 0.3 + (proximityFactor * 0.4);  // Reduce to 30-70% of normal voltage
+      totalVoltage *= limitProtection;
+      if (currentPosition > 0) {
+        // Already past limit - stop immediately
+        stopMotor();
+        return;
+      }
+    }
+    
+    // Slow down when approaching right limit (moving right, error < 0 means moving toward more negative)
+    // Reduce voltage when within 100 counts of right limit
+    if (error < 0 && currentPosition < (UPPER_BOUND + 100)) {
+      // Approaching right limit - reduce voltage to prevent slamming
+      float distanceFromLimit = currentPosition - UPPER_BOUND;  // Negative value, becomes less negative as we approach
+      float proximityFactor = (distanceFromLimit + 100) / 100.0;  // 0 at limit, 1 at 100 counts away
+      proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+      float limitProtection = 0.3 + (proximityFactor * 0.4);  // Reduce to 30-70% of normal voltage
+      totalVoltage *= limitProtection;
+    }
+  }
 
   // Anti-windup on zero crossing
   if ((error != 0) && (error * lastError < 0)) {
     errorIntegral *= 0.5;
   }
 
-  // Stuck detection: if outside target band but not moving, apply minimum voltage
+  // Stuck detection with voltage ramping: if outside target band but not moving, ramp up voltage
   // Use original error for stuck detection (not adjusted)
   unsigned long currentTime = millis();
   if (abs(originalError) > TARGET_BAND) {
-    // Check if stuck (position hasn't changed in 300ms)
-    if (currentTime - lastStuckCheckTime >= 300) {
+    // Check if stuck (position hasn't changed in 150ms) - reduced for faster detection
+    if (currentTime - lastStuckCheckTime >= 150) {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
         stuckCounter++;
+        
+        // Start tracking stuck time when first detected
+        if (stuckCounter == 1) {
+          stuckStartTime = currentTime;
+          voltageRamping = false;
+        }
 
-        // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
-        // Reduced voltage for lower overall operation voltage
+        // If stuck for 2+ consecutive checks, start voltage ramping
         if (stuckCounter >= 2) {
-          float minVoltage = 2.0;  // Reduced from 2.5 for lower voltage operation
-          if (abs(totalVoltage) < minVoltage) {
-            totalVoltage = (error < 0) ? -minVoltage : minVoltage;
+          voltageRamping = true;
+          
+          // Calculate minimum voltage based on friction for this direction
+          bool movingRight = (error < 0);
+          float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
+          
+          // Ensure minimum is at least 2.0V to overcome friction
+          float minFrictionVoltage = max(baseFrictionVoltage, 2.0f);
+          
+          // Calculate how long we've been stuck
+          unsigned long stuckDuration = currentTime - stuckStartTime;
+          
+          // Ramp up voltage progressively: start at friction voltage, increase over time
+          float rampVoltage = minFrictionVoltage;
+          
+          // Ramp schedule:
+          // 0-400ms: friction voltage
+          // 400-800ms: friction + 0.5V
+          // 800-1200ms: friction + 1.0V
+          // 1200ms+: friction + 1.5V (up to voltage limit)
+          if (stuckDuration > 1200) {
+            rampVoltage = minFrictionVoltage + 1.5f;
+          } else if (stuckDuration > 800) {
+            rampVoltage = minFrictionVoltage + 1.0f;
+          } else if (stuckDuration > 400) {
+            rampVoltage = minFrictionVoltage + 0.5f;
+          }
+          
+          // Cap at voltage limit for current error range
+          rampVoltage = min(rampVoltage, voltageLimit);
+          
+          // Apply ramped voltage only if PID voltage is insufficient
+          // Use maximum of PID voltage and ramp voltage to ensure PID is respected when sufficient
+          // This ensures PID control is primary, with ramping as backup when stuck
+          if (abs(totalVoltage) < rampVoltage) {
+            // Preserve PID direction and use max of PID and ramp voltage
+            float pidMagnitude = abs(totalVoltage);
+            float finalVoltage = max(pidMagnitude, rampVoltage);
+            totalVoltage = (error < 0) ? -finalVoltage : finalVoltage;
           }
         }
       } else {
-        stuckCounter = 0;  // Reset if moving
+        // Moving again - reset stuck tracking
+        stuckCounter = 0;
+        stuckStartTime = 0;
+        voltageRamping = false;
       }
       lastStuckCheckPos = currentPosition;
       lastStuckCheckTime = currentTime;
     }
   } else {
-    stuckCounter = 0;  // Reset when within target band
+    // Within target band - reset stuck tracking
+    stuckCounter = 0;
+    stuckStartTime = 0;
+    voltageRamping = false;
+  }
+
+  // Ensure minimum voltage for error correction (at least friction voltage)
+  // This helps overcome static friction when correcting errors
+  // IMPORTANT: This preserves PID voltage when it's already sufficient, only boosts when too low
+  if (abs(originalError) > TARGET_BAND && !voltageRamping) {
+    bool movingRight = (error < 0);
+    float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
+    float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);  // At least 1.5V to overcome friction
+    
+    // If PID voltage is less than friction voltage, boost to friction voltage
+    // Preserve PID direction and use max to ensure PID is respected when sufficient
+    if (abs(totalVoltage) < minFrictionVoltage) {
+      // Use max to preserve PID magnitude when it's already above minimum
+      float pidMagnitude = abs(totalVoltage);
+      float finalVoltage = max(pidMagnitude, minFrictionVoltage);
+      totalVoltage = (error < 0) ? -finalVoltage : finalVoltage;
+    }
   }
 
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
@@ -1664,6 +1799,8 @@ void processCommand() {
           fineAdjustmentActive = false;
           fineAdjustmentCount = 0;  // Reset counter
           lastFineAdjustmentTime = 0;  // Reset timestamp
+          stuckStartTime = 0;  // Reset stuck tracking
+          voltageRamping = false;  // Reset voltage ramping
           
           // Reset target tracking
           activeTargetIndex = -1;
@@ -1772,6 +1909,8 @@ void setTargetLane(int lane) {
   targetReached = false;
   stuckCounter = 0;  // Reset stuck detection for new movement
   positionRetryCount = 0;  // Reset retry counter for new movement
+  stuckStartTime = 0;  // Reset stuck tracking
+  voltageRamping = false;  // Reset voltage ramping
   
   long currentPos = encoder.read();
   long error = desiredPosition - currentPos;
