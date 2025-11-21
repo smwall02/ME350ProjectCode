@@ -1032,13 +1032,15 @@ void runMotionControl() {
   bool atTarget = fineAdjustmentActive ? (abs(originalError) <= 1) : (abs(originalError) <= TARGET_BAND);
   
   if (atTarget) {
-    if (abs(motorVelocity) > 10) {
-      float dampingVoltage = -constrain(motorVelocity * 0.02, -1.5, 1.5);
+    if (abs(motorVelocity) > 8) {
+      float dampingVoltage = -constrain(motorVelocity * 0.025, -1.5, 1.5);
       setMotor(dampingVoltage);
-      errorIntegral *= 0.9;  // Decay integral
+      errorIntegral *= 0.85;
+      lastError = 0;
     } else {
       stopMotor();
       errorIntegral = 0;
+      lastError = 0;
     }
     adaptiveLearning = false;
 
@@ -1181,15 +1183,15 @@ void runMotionControl() {
     KD_active = KD * 1.0;
     errorIntegral += error * dt * 0.7;
   } else if (absError > 10) {
-    KP_active = KP * 0.6;
-    KI_active = KI * 0.3;
+    KP_active = KP * 0.5;
+    KI_active = KI * 0.2;
     KD_active = KD * 1.0;
-    errorIntegral += error * dt * 0.3;
+    errorIntegral += error * dt * 0.2;
   } else {
-    KP_active = KP * 0.2;
-    KI_active = KI * 0.1;
-    KD_active = KD * 1.2;
-    errorIntegral += error * dt * 0.1;
+    KP_active = KP * 0.15;
+    KI_active = KI * 0.05;
+    KD_active = KD * 1.3;
+    errorIntegral += error * dt * 0.05;
   }
   
   errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
@@ -1286,18 +1288,20 @@ void runMotionControl() {
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
   
   if (absOriginalError <= TARGET_BAND) {
-    if (abs(motorVelocity) < 10) {
+    if (abs(motorVelocity) < 8) {
       totalVoltage = 0;
-      errorIntegral *= 0.8;
+      errorIntegral *= 0.7;
+      lastError = 0;
     } else {
-      totalVoltage = -constrain(motorVelocity * 0.015, -1.0, 1.0);
+      totalVoltage = -constrain(motorVelocity * 0.02, -1.2, 1.2);
     }
-  } else if (absOriginalError <= (TARGET_BAND + 2) && abs(motorVelocity) < 5) {
+  } else if (absOriginalError <= (TARGET_BAND + 1) && abs(motorVelocity) < 5) {
     totalVoltage = 0;
-    errorIntegral *= 0.9;
+    errorIntegral *= 0.8;
+    lastError = 0;
   }
   
-  if (!atTarget && absOriginalError > 10 && abs(motorVelocity) < 5 && absOriginalError > 50 && abs(totalVoltage) < 2.0) {
+  if (!atTarget && absOriginalError > 15 && abs(motorVelocity) < 5 && absOriginalError > 50 && abs(totalVoltage) < 2.0) {
     float startupVoltage = 2.0;
     if (absOriginalError > 200) {
       startupVoltage = 2.5;
@@ -1427,7 +1431,7 @@ void runMotionControl() {
     voltageRamping = false;
   }
 
-  if (!atTarget && abs(originalError) > TARGET_BAND && !voltageRamping) {
+  if (!atTarget && abs(originalError) > TARGET_BAND + 1 && !voltageRamping) {
     bool inLeftHalf = (currentPosition > RANGE_MIDPOINT);
     float baseFrictionVoltage = inLeftHalf ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 2.0f);
@@ -1453,8 +1457,10 @@ void runMotionControl() {
   
   if (abs(lastAppliedVoltage) < 0.5 && abs(originalError) > 50) {
     maxChange = 1.2;
-  } else if (absError < 30) {
-    maxChange = 0.3;
+  } else   if (absError < 20) {
+    maxChange = 0.25;
+  } else if (absError < 50) {
+    maxChange = 0.35;
   } else if (absError < 100) {
     maxChange = 0.45;
   }
@@ -1464,8 +1470,9 @@ void runMotionControl() {
     maxChange *= 1.5;
   }
   
-  if (absOriginalError <= TARGET_BAND && abs(motorVelocity) < 10 && totalVoltage == 0) {
+  if (absOriginalError <= TARGET_BAND && abs(motorVelocity) < 8 && totalVoltage == 0) {
     lastAppliedVoltage = 0;
+    lastError = 0;
   } else {
     float voltageChange = totalVoltage - lastAppliedVoltage;
     if (abs(voltageChange) > maxChange) {
