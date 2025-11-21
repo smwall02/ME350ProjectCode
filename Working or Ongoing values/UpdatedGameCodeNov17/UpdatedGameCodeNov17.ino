@@ -1435,6 +1435,7 @@ void stopMotor() {
 // LIMIT SWITCH SAFETY
 // ============================================
 void checkLimitSwitches() {
+  // Left limit switch - recalibrate encoder when hit (home position)
   if (digitalRead(LIMIT_LEFT) == HIGH && 
       currentState != CALIBRATE && 
       currentState != FIND_RANGE &&
@@ -1458,7 +1459,29 @@ void checkLimitSwitches() {
     Serial.println(F("⚠️  Recalibrated at left limit"));
   }
 
-  // Right limit is valid range boundary, not an e-stop
+  // Right limit switch - safety stop and update UPPER_BOUND if needed
+  if (digitalRead(LIMIT_RIGHT) == HIGH && 
+      currentState != CALIBRATE && 
+      currentState != FIND_RANGE &&
+      !dynamicCalibrationActive &&
+      abs(motorVelocity) < 10) {
+    
+    // Stop motor immediately for safety
+    stopMotor();
+    
+    // Update UPPER_BOUND if current position is significantly different
+    long currentPos = encoder.read();
+    if (abs(currentPos - UPPER_BOUND) > 10) {
+      UPPER_BOUND = currentPos;
+      // Recalculate midpoint for position-based friction
+      RANGE_MIDPOINT = (LOWER_BOUND + UPPER_BOUND) / 2;
+      Serial.print(F("⚠️  Right limit detected, updated UPPER_BOUND to: "));
+      Serial.println(UPPER_BOUND);
+    }
+    
+    errorIntegral = 0;
+    Serial.println(F("⚠️  Right limit switch activated - stopped for safety"));
+  }
 }
 
 bool leftPressed() {
