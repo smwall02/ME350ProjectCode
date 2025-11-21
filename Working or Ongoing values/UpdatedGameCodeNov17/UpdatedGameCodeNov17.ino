@@ -1612,10 +1612,11 @@ void checkLimitSwitches() {
   unsigned long currentTime = millis();
   
   // Only reset encoder at left limit if we're trying to move toward it (positive error/voltage)
-  // or if we're in calibration/range finding states
+  // or if we're in calibration/range finding states (and in auto mode or explicitly calibrating)
   if (digitalRead(LIMIT_LEFT) == HIGH) {
-    if (currentState == CALIBRATE || currentState == FIND_RANGE || dynamicCalibrationActive) {
-      // During calibration, allow reset but with debounce
+    if ((currentState == CALIBRATE || currentState == FIND_RANGE || dynamicCalibrationActive) && 
+        (autoMode || rangeFindingActive)) {
+      // During calibration/range finding in auto mode, allow reset but with debounce
       if (abs(motorVelocity) < 10 && (currentTime - lastLeftLimitReset) > LIMIT_RESET_DEBOUNCE) {
         delay(50);
         encoder.write(0);
@@ -1663,8 +1664,9 @@ void checkLimitSwitches() {
 
   // Right limit: only stop/reset if we're trying to move toward it (negative error/voltage)
   if (digitalRead(LIMIT_RIGHT) == HIGH) {
-    if (currentState == CALIBRATE || currentState == FIND_RANGE || dynamicCalibrationActive) {
-      // During calibration, allow update but with debounce
+    if ((currentState == CALIBRATE || currentState == FIND_RANGE || dynamicCalibrationActive) && 
+        (autoMode || rangeFindingActive)) {
+      // During calibration/range finding in auto mode, allow update but with debounce
       if (abs(motorVelocity) < 10 && (currentTime - lastRightLimitReset) > LIMIT_RESET_DEBOUNCE) {
         stopMotor();
         long currentPos = encoder.read();
