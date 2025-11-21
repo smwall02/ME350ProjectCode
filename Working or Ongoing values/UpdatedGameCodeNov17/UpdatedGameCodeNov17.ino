@@ -739,11 +739,37 @@ void runStateMachine() {
       activeTargetIndex = -1;
       closestZombieDist = 2.0;
       previousMoveStartPosition = encoder.read();
-      for (int i = 0; i < 4; i++) {
+      
+      // Prioritize lanes 2 and 3 (indices 1 and 2) since they have shorter travel distances
+      // First check lanes 2 and 3
+      for (int i = 1; i <= 2; i++) {
         if (ProxSensors[i].direction == FORWARD &&
             zombieDistances[i] < closestZombieDist) {
           closestZombieDist = zombieDistances[i];
           activeTargetIndex = i;
+        }
+      }
+      
+      // Only check lanes 1 and 4 if no forward zombies in lanes 2 and 3
+      // OR if a zombie in lane 1 or 4 is significantly closer (within 0.15 distance)
+      if (activeTargetIndex == -1) {
+        // No targets in priority lanes, check all lanes
+        for (int i = 0; i < 4; i++) {
+          if (ProxSensors[i].direction == FORWARD &&
+              zombieDistances[i] < closestZombieDist) {
+            closestZombieDist = zombieDistances[i];
+            activeTargetIndex = i;
+          }
+        }
+      } else {
+        // We have a target in priority lanes, but check if lanes 1 or 4 have much closer zombies
+        for (int i = 0; i < 4; i += 3) {  // Check lanes 1 (i=0) and 4 (i=3)
+          if (ProxSensors[i].direction == FORWARD &&
+              zombieDistances[i] < (closestZombieDist - 0.15)) {
+            // This zombie is significantly closer, switch to it
+            closestZombieDist = zombieDistances[i];
+            activeTargetIndex = i;
+          }
         }
       }
       
@@ -844,14 +870,29 @@ void runStateMachine() {
           break;
         }
 
+        // Check for closer zombies, but respect lane priorities
+        bool currentIsPriority = (activeTargetIndex == 1 || activeTargetIndex == 2);
         for (int i = 0; i < 4; i++) {
           if (i != activeTargetIndex &&
-              ProxSensors[i].direction == FORWARD &&
-              zombieDistances[i] < zombieDistances[activeTargetIndex] - 0.20) {
-            Serial.print(F("Closer: L"));
-            Serial.println(i + 1);
-            currentState = CHOOSE_ACTIVE_TARGET;
-            break;
+              ProxSensors[i].direction == FORWARD) {
+            bool candidateIsPriority = (i == 1 || i == 2);
+            float distanceThreshold = 0.20;
+            
+            // Adjust threshold based on priority:
+            // - If switching from priority to non-priority, require larger difference (0.30)
+            // - If switching from non-priority to priority, allow smaller difference (0.15)
+            if (currentIsPriority && !candidateIsPriority) {
+              distanceThreshold = 0.30;  // Harder to switch away from priority lanes
+            } else if (!currentIsPriority && candidateIsPriority) {
+              distanceThreshold = 0.15;  // Easier to switch to priority lanes
+            }
+            
+            if (zombieDistances[i] < zombieDistances[activeTargetIndex] - distanceThreshold) {
+              Serial.print(F("Closer: L"));
+              Serial.println(i + 1);
+              currentState = CHOOSE_ACTIVE_TARGET;
+              break;
+            }
           }
         }
       }
@@ -1221,23 +1262,77 @@ void runMotionControl() {
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
 
   if (currentState == MOVE_TO_TARGET && autoMode) {
-    if (error > 0 && currentPosition > -100) {
-      float proximityFactor = (currentPosition + 100) / 100.0;
-      proximityFactor = constrain(proximityFactor, 0.0, 1.0);
-      float limitProtection = 0.3 + (proximityFactor * 0.4);
-      totalVoltage *= limitProtection;
+    // Enhanced limit protection for lanes 1 and 4 to prevent slamming into endstops
+    bool movingToLane1 = (activeTargetIndex == 0 && desiredPosition == TARGET_1_POSITION);
+    bool movingToLane4 = (activeTargetIndex == 3 && desiredPosition == TARGET_4_POSITION);
+    
+    // Left limit protection (for lane 1)
+    if (error > 0) {
+      // Moving toward left limit (positive direction)
+      if (movingToLane1) {
+        // Extra protection for lane 1 - start reducing voltage earlier and more aggressively
+        if (currentPosition > -150) {
+          float distanceFromLimit = currentPosition + 150;  // Distance from -150 to 0
+          float proximityFactor = distanceFromLimit / 150.0;
+          proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+          // More aggressive reduction: 0.2 to 0.6 (instead of 0.3 to 0.7)
+          float limitProtection = 0.2 + (proximityFactor * 0.4);
+          totalVoltage *= limitProtection;
+        }
+        if (currentPosition > -50) {
+          // Very close to limit, reduce voltage even more
+          float distanceFromLimit = currentPosition + 50;
+          float proximityFactor = distanceFromLimit / 50.0;
+          proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+          float limitProtection = 0.15 + (proximityFactor * 0.25);
+          totalVoltage *= limitProtection;
+        }
+      } else {
+        // Standard protection for other lanes
+        if (currentPosition > -100) {
+          float proximityFactor = (currentPosition + 100) / 100.0;
+          proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+          float limitProtection = 0.3 + (proximityFactor * 0.4);
+          totalVoltage *= limitProtection;
+        }
+      }
       if (currentPosition > 0) {
         stopMotor();
         return;
       }
     }
     
-    if (error < 0 && currentPosition < (UPPER_BOUND + 100)) {
-      float distanceFromLimit = currentPosition - UPPER_BOUND;
-      float proximityFactor = (distanceFromLimit + 100) / 100.0;
-      proximityFactor = constrain(proximityFactor, 0.0, 1.0);
-      float limitProtection = 0.3 + (proximityFactor * 0.4);
-      totalVoltage *= limitProtection;
+    // Right limit protection (for lane 4)
+    if (error < 0) {
+      // Moving toward right limit (negative direction)
+      if (movingToLane4) {
+        // Extra protection for lane 4 - start reducing voltage earlier and more aggressively
+        if (currentPosition < (UPPER_BOUND + 150)) {
+          float distanceFromLimit = currentPosition - (UPPER_BOUND + 150);
+          float proximityFactor = (distanceFromLimit + 150) / 150.0;
+          proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+          // More aggressive reduction: 0.2 to 0.6 (instead of 0.3 to 0.7)
+          float limitProtection = 0.2 + (proximityFactor * 0.4);
+          totalVoltage *= limitProtection;
+        }
+        if (currentPosition < (UPPER_BOUND + 50)) {
+          // Very close to limit, reduce voltage even more
+          float distanceFromLimit = currentPosition - (UPPER_BOUND + 50);
+          float proximityFactor = (distanceFromLimit + 50) / 50.0;
+          proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+          float limitProtection = 0.15 + (proximityFactor * 0.25);
+          totalVoltage *= limitProtection;
+        }
+      } else {
+        // Standard protection for other lanes
+        if (currentPosition < (UPPER_BOUND + 100)) {
+          float distanceFromLimit = currentPosition - UPPER_BOUND;
+          float proximityFactor = (distanceFromLimit + 100) / 100.0;
+          proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+          float limitProtection = 0.3 + (proximityFactor * 0.4);
+          totalVoltage *= limitProtection;
+        }
+      }
     }
   }
 
