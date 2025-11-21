@@ -139,6 +139,8 @@ bool fineAdjustmentActive = false;   // Flag for fine adjustment mode
 long fineAdjustmentTarget = 0;       // Fine-tuned target position
 const int FINE_ADJUSTMENT_AMOUNT = 2;  // 1-2 counts adjustment
 float previousZombieDistance = 1.0;  // Track previous distance to detect if getting closer
+int fineAdjustmentCount = 0;  // Counter to prevent infinite oscillation
+const int MAX_FINE_ADJUSTMENTS = 3;  // Maximum number of fine adjustments per target
 
 // ============================================
 // FRICTION COMPENSATION (Improved)
@@ -605,6 +607,7 @@ void runStateMachine() {
         activeTargetPosition = targetPositions[activeTargetIndex];
         WAIT_POS = false;
         fineAdjustmentActive = false;  // Reset fine adjustment
+        fineAdjustmentCount = 0;  // Reset fine adjustment counter
         previousZombieDistance = zombieDistances[activeTargetIndex];  // Initialize distance tracking
         
         int percentToPhoto = (int)((1.0 - zombieDistances[activeTargetIndex]) * 100);
@@ -624,6 +627,7 @@ void runStateMachine() {
         activeTargetPosition = WAIT_POSITION;
         WAIT_POS = true;
         fineAdjustmentActive = false;
+        fineAdjustmentCount = 0;  // Reset counter
         Serial.println(F("No active FORWARD targets, moving to wait position"));
       }
       
@@ -738,6 +742,35 @@ void runStateMachine() {
       // Also check against original target for fine adjustment logic
       long errorToOriginalTarget = activeTargetPosition - currentPos;
       
+      // EARLY FINE ADJUSTMENT: If close to target (within 5 counts) and zombie still approaching, make adjustment
+      // This helps account for gear backlash when making large moves (e.g., lane 4 to lane 1)
+      if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
+          fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
+          abs(errorToOriginalTarget) <= 5 &&  // Close to target (slightly larger than TARGET_BAND)
+          abs(errorToOriginalTarget) > TARGET_BAND &&  // But not quite at target yet
+          ProxSensors[activeTargetIndex].direction == FORWARD &&
+          !ProxSensors[activeTargetIndex].hitDetected &&
+          zombieDistances[activeTargetIndex] < 0.30) {  // Zombie is close (within 30% of photo)
+        
+        // Determine adjustment based on error direction
+        int adjustmentDirection = (errorToOriginalTarget > 0) ? +FINE_ADJUSTMENT_AMOUNT : -FINE_ADJUSTMENT_AMOUNT;
+        fineAdjustmentTarget = activeTargetPosition + adjustmentDirection;
+        
+        fineAdjustmentCount++;
+        Serial.print(F("🔧 Early fine adjust "));
+        Serial.print((adjustmentDirection > 0) ? F("LEFT (+") : F("RIGHT (-"));
+        Serial.print(abs(adjustmentDirection));
+        Serial.print(F(") - close to target, zombie approaching at "));
+        Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
+        Serial.print(F("% ("));
+        Serial.print(fineAdjustmentCount);
+        Serial.println(F("/3)"));
+        
+        fineAdjustmentActive = true;
+        desiredPosition = fineAdjustmentTarget;
+        arrivalTime = millis();
+      }
+      
       if (abs(errorToCurrentTarget) <= TARGET_BAND) {
         if (WAIT_POS) {
           // At wait position - only reconsider if there's a new forward target
@@ -765,38 +798,90 @@ void runStateMachine() {
               currentState = CHOOSE_ACTIVE_TARGET;
             }
             // FINE POSITIONING: If zombie still approaching and at original target, make small adjustment
+            // This accounts for gear backlash/gaps - zombie may still be moving forward even when at encoder target
             else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
                      !fineAdjustmentActive &&
+                     fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      abs(errorToOriginalTarget) <= TARGET_BAND &&  // At original target position
-                     zombieDistances[activeTargetIndex] < 0.20 &&  // Close and still approaching
-                     zombieDistances[activeTargetIndex] < previousZombieDistance) {  // Getting closer
+                     !ProxSensors[activeTargetIndex].hitDetected) {  // Not yet hit
               
-              // Determine adjustment direction based on previous move
-              // If moved RIGHT (previous position > target), likely overshot right, adjust LEFT
-              // If moved LEFT (previous position < target), likely undershot, adjust RIGHT
-              bool movedRight = (previousMoveStartPosition > activeTargetPosition);
-              
-              if (movedRight) {
-                // Moved right, likely overshot, adjust left (toward less negative)
-                fineAdjustmentTarget = activeTargetPosition + FINE_ADJUSTMENT_AMOUNT;
-                Serial.print(F("🔧 Fine adjust LEFT (+"));
-                Serial.print(FINE_ADJUSTMENT_AMOUNT);
-                Serial.print(F(") - zombie at "));
+              // Check if we've been at target for a short time (allows PID to settle)
+              unsigned long timeAtTarget = millis() - arrivalTime;
+              if (timeAtTarget >= 100) {  // Wait 100ms after arrival before fine adjustment
+                
+                // Determine adjustment direction based on previous move direction
+                // If moved RIGHT (previous position > target), likely overshot right, adjust LEFT
+                // If moved LEFT (previous position < target), likely undershot, adjust RIGHT
+                bool movedRight = (previousMoveStartPosition > activeTargetPosition);
+                
+                // Also check current position relative to target to determine if we need adjustment
+                // If slightly to the right of target (more negative), might need to go left
+                // If slightly to the left of target (less negative), might need to go right
+                bool currentlyRightOfTarget = (currentPos < activeTargetPosition);
+                
+                // Use movement direction as primary indicator, position as secondary
+                int adjustmentDirection = 0;
+                if (movedRight) {
+                  // Moved right to get here, likely overshot, adjust left (toward less negative)
+                  adjustmentDirection = +FINE_ADJUSTMENT_AMOUNT;
+                } else {
+                  // Moved left to get here, likely undershot, adjust right (toward more negative)
+                  adjustmentDirection = -FINE_ADJUSTMENT_AMOUNT;
+                }
+                
+                // If we're already slightly off target, adjust toward target first
+                if (abs(errorToOriginalTarget) > 1) {
+                  // Small error - adjust to correct it
+                  adjustmentDirection = (errorToOriginalTarget > 0) ? +FINE_ADJUSTMENT_AMOUNT : -FINE_ADJUSTMENT_AMOUNT;
+                }
+                
+                fineAdjustmentTarget = activeTargetPosition + adjustmentDirection;
+                
+                fineAdjustmentCount++;
+                Serial.print(F("🔧 Fine adjust "));
+                Serial.print((adjustmentDirection > 0) ? F("LEFT (+") : F("RIGHT (-"));
+                Serial.print(abs(adjustmentDirection));
+                Serial.print(F(") - zombie still approaching at "));
                 Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
-                Serial.println(F("% getting closer"));
-              } else {
-                // Moved left, likely undershot, adjust right (toward more negative)
-                fineAdjustmentTarget = activeTargetPosition - FINE_ADJUSTMENT_AMOUNT;
-                Serial.print(F("🔧 Fine adjust RIGHT (-"));
-                Serial.print(FINE_ADJUSTMENT_AMOUNT);
-                Serial.print(F(") - zombie at "));
-                Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
-                Serial.println(F("% getting closer"));
+                Serial.print(F("% (pos: "));
+                Serial.print(currentPos);
+                Serial.print(F("→"));
+                Serial.print(fineAdjustmentTarget);
+                Serial.print(F(", "));
+                Serial.print(fineAdjustmentCount);
+                Serial.println(F("/3)"));
+                
+                fineAdjustmentActive = true;
+                desiredPosition = fineAdjustmentTarget;
+                arrivalTime = millis();  // Reset arrival time for fine adjustment
               }
+            }
+            
+            // ADDITIONAL FINE ADJUSTMENT: If already fine-adjusted but zombie still approaching, try opposite direction
+            else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
+                     fineAdjustmentActive &&
+                     fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
+                     abs(errorToCurrentTarget) <= TARGET_BAND &&  // At fine-adjusted position
+                     !ProxSensors[activeTargetIndex].hitDetected &&  // Not yet hit
+                     (millis() - arrivalTime) >= 200) {  // Been at fine-adjusted position for 200ms
               
-              fineAdjustmentActive = true;
+              // Try opposite direction adjustment
+              long currentAdjustment = fineAdjustmentTarget - activeTargetPosition;
+              long oppositeAdjustment = -currentAdjustment;
+              fineAdjustmentTarget = activeTargetPosition + oppositeAdjustment;
+              
+              fineAdjustmentCount++;
+              Serial.print(F("🔧 Fine adjust REVERSE "));
+              Serial.print((oppositeAdjustment > 0) ? F("LEFT (+") : F("RIGHT (-"));
+              Serial.print(abs(oppositeAdjustment));
+              Serial.print(F(") - trying opposite direction, zombie at "));
+              Serial.print((int)(zombieDistances[activeTargetIndex] * 100));
+              Serial.print(F("% ("));
+              Serial.print(fineAdjustmentCount);
+              Serial.println(F("/3)"));
+              
               desiredPosition = fineAdjustmentTarget;
-              arrivalTime = millis();  // Reset arrival time for fine adjustment
+              arrivalTime = millis();  // Reset arrival time
             }
             
             // Update previous zombie distance for next iteration
@@ -811,6 +896,7 @@ void runStateMachine() {
         // Reset fine adjustment if we've moved away from target significantly
         if (fineAdjustmentActive && abs(errorToCurrentTarget) > TARGET_BAND * 2) {
           fineAdjustmentActive = false;
+          fineAdjustmentCount = 0;  // Reset counter
         }
       }
       break;
@@ -1547,6 +1633,7 @@ void processCommand() {
           stuckCounter = 0;
           positionRetryCount = 0;
           fineAdjustmentActive = false;
+          fineAdjustmentCount = 0;  // Reset counter
           
           // Reset target tracking
           activeTargetIndex = -1;
