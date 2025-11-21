@@ -1116,11 +1116,27 @@ void runMotionControl() {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
         stuckCounter++;
 
-        // If stuck for 2+ consecutive checks, apply friction-overcoming voltage
+        // If stuck for 2+ consecutive checks, apply aggressive friction-overcoming voltage
         if (stuckCounter >= 2) {
-          float minVoltage = 3.5;  // Increased to overcome friction faster
+          // Scale minimum voltage based on error magnitude
+          float minVoltage;
+          long absError = abs(originalError);
+          if (absError > 50) {
+            minVoltage = 5.5;  // Large error - use high voltage
+          } else if (absError > 20) {
+            minVoltage = 4.5;  // Medium error - use medium-high voltage
+          } else {
+            minVoltage = 3.5;  // Small error - use moderate voltage
+          }
+          
+          // Apply minimum voltage in direction of error
           if (abs(totalVoltage) < minVoltage) {
-            totalVoltage = (error < 0) ? -minVoltage : minVoltage;
+            totalVoltage = (originalError < 0) ? -minVoltage : minVoltage;
+            Serial.print(F("🔧 Stuck - applying "));
+            Serial.print(minVoltage, 1);
+            Serial.print(F("V boost (error="));
+            Serial.print(absError);
+            Serial.println(F(")"));
           }
         }
       } else {
@@ -1537,6 +1553,47 @@ void manualCalibration() {
 // ============================================
 // PID TUNING MODE
 // ============================================
+float readFloatFromSerial() {
+  String inputString = "";
+  unsigned long timeout = millis() + 30000;  // 30 second timeout
+  
+  Serial.println(F("Enter value (or 'C' to cancel):"));
+  
+  while (millis() < timeout) {
+    if (Serial.available()) {
+      char c = Serial.read();
+      
+      if (c == '\n' || c == '\r') {
+        if (inputString.length() > 0) {
+          break;
+        }
+      } else if (c == 'C' || c == 'c') {
+        Serial.println(F("Cancelled"));
+        return -999.0;  // Special value to indicate cancellation
+      } else if ((c >= '0' && c <= '9') || c == '.' || c == '-') {
+        inputString += c;
+        Serial.print(c);  // Echo the character
+      } else if (c == 8 || c == 127) {  // Backspace
+        if (inputString.length() > 0) {
+          inputString.remove(inputString.length() - 1);
+          Serial.print(F("\b \b"));  // Erase character
+        }
+      }
+    }
+    delay(10);
+  }
+  
+  Serial.println();  // New line after input
+  
+  if (inputString.length() == 0) {
+    Serial.println(F("No input received"));
+    return -999.0;
+  }
+  
+  float value = inputString.toFloat();
+  return value;
+}
+
 void pidTuningMode() {
   Serial.println(F("\n=== PID TUNING MODE ==="));
   Serial.println(F("Adjust PID values interactively"));
@@ -1548,9 +1605,10 @@ void pidTuningMode() {
   Serial.print(F("  KD = "));
   Serial.println(KD, 6);
   Serial.println(F("\nCommands:"));
-  Serial.println(F("  P = Adjust KP (Proportional)"));
-  Serial.println(F("  I = Adjust KI (Integral)"));
-  Serial.println(F("  D = Adjust KD (Derivative)"));
+  Serial.println(F("  P = Select KP (Proportional)"));
+  Serial.println(F("  I = Select KI (Integral)"));
+  Serial.println(F("  D = Select KD (Derivative)"));
+  Serial.println(F("  E = Enter value directly (type number)"));
   Serial.println(F("  + = Increase current value by 10%"));
   Serial.println(F("  - = Decrease current value by 10%"));
   Serial.println(F("  * = Increase current value by 1%"));
@@ -1577,23 +1635,71 @@ void pidTuningMode() {
       switch (cmd) {
         case 'P':
           currentParam = 'P';
-          Serial.print(F("\n→ Adjusting KP (current: "));
+          Serial.print(F("\n→ Selected KP (current: "));
           Serial.print(KP, 6);
           Serial.println(F(")"));
           break;
           
         case 'I':
           currentParam = 'I';
-          Serial.print(F("\n→ Adjusting KI (current: "));
+          Serial.print(F("\n→ Selected KI (current: "));
           Serial.print(KI, 6);
           Serial.println(F(")"));
           break;
           
         case 'D':
           currentParam = 'D';
-          Serial.print(F("\n→ Adjusting KD (current: "));
+          Serial.print(F("\n→ Selected KD (current: "));
           Serial.print(KD, 6);
           Serial.println(F(")"));
+          break;
+          
+        case 'E':
+          {
+            Serial.print(F("\nEnter new value for "));
+            if (currentParam == 'P') {
+              Serial.print(F("KP"));
+            } else if (currentParam == 'I') {
+              Serial.print(F("KI"));
+            } else {
+              Serial.print(F("KD"));
+            }
+            Serial.print(F(" (current: "));
+            if (currentParam == 'P') {
+              Serial.print(KP, 6);
+            } else if (currentParam == 'I') {
+              Serial.print(KI, 6);
+            } else {
+              Serial.print(KD, 6);
+            }
+            Serial.print(F("): "));
+            
+            float newValue = readFloatFromSerial();
+            
+            if (newValue != -999.0) {  // Not cancelled
+              if (newValue >= 0 && newValue <= 10.0) {  // Reasonable range check (0 to 10)
+                if (currentParam == 'P') {
+                  KP = newValue;
+                  Serial.print(F("✓ KP = "));
+                  Serial.println(KP, 6);
+                } else if (currentParam == 'I') {
+                  KI = newValue;
+                  Serial.print(F("✓ KI = "));
+                  Serial.println(KI, 6);
+                } else if (currentParam == 'D') {
+                  KD = newValue;
+                  Serial.print(F("✓ KD = "));
+                  Serial.println(KD, 6);
+                }
+                // Update active values immediately
+                KP_active = KP;
+                KI_active = KI;
+                KD_active = KD;
+              } else {
+                Serial.println(F("⚠️  Value out of range (0.0 to 10.0). Please enter a value in this range."));
+              }
+            }
+          }
           break;
           
         case '+':
