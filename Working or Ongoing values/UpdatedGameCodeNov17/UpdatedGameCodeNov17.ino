@@ -487,6 +487,9 @@ void findRange() {
           // Ensure minimum friction of 1.55V and minimum drive voltage of 3.0V
           float frictionForRight = max(FRICTION_LEFT, 1.55);  // Minimum 1.55V if friction not characterized
           rangeFindingDriveVoltage = -max(frictionForRight + CALIBRATE_EXTRA_VOLTAGE, 3.0);  // At least 3.0V for right limit
+          Serial.print(F("Moving right at "));
+          Serial.print(-rangeFindingDriveVoltage, 2);
+          Serial.println(F("V"));
           setMotor(rangeFindingDriveVoltage);
         }
       } else {
@@ -516,12 +519,14 @@ void findRange() {
           rangeFindingLastMoveTime = currentTime;
           rangeFindingLastPosition = currentPos;
         } else if (currentTime - rangeFindingLastMoveTime > 2000) {
-          Serial.println(F("Stuck, increasing voltage"));
+          Serial.print(F("Stuck, increasing voltage to "));
           rangeFindingDriveVoltage = max(rangeFindingDriveVoltage - 0.8, -9.0);
           // Ensure minimum of 3.0V magnitude when moving to right limit
           if (rangeFindingDriveVoltage > -3.0) {
             rangeFindingDriveVoltage = -3.0;
           }
+          Serial.print(-rangeFindingDriveVoltage, 2);
+          Serial.println(F("V"));
           setMotor(rangeFindingDriveVoltage);
           rangeFindingLastMoveTime = currentTime;
         }
@@ -947,6 +952,11 @@ void runMotionControl() {
   }
   
   float error = adjustedDesiredPosition - currentPosition;
+  
+  // Don't run motion control during range finding - range finding has its own motor control
+  if (rangeFindingActive) {
+    return;
+  }
   
   if (currentState == MOVE_TO_TARGET && autoMode) {
     if (currentPosition > 50) {
