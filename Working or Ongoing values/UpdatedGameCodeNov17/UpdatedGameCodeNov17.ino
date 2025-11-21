@@ -419,7 +419,7 @@ void findRange() {
       rangeFindingStableTicks = 0;
       
       // When holding at left limit, use FRICTION_RIGHT (voltage to move left/positive)
-      float frictionForHold = max(FRICTION_RIGHT, 2.0);
+      float frictionForHold = max(FRICTION_RIGHT, 1.55);
       float holdVoltage = max(frictionForHold, CALIBRATE_MIN_VOLTAGE - 0.5);
       setMotor(holdVoltage);
       return;
@@ -429,7 +429,7 @@ void findRange() {
     rangeFindingState = RANGE_MOVE_TO_LEFT;
     // When moving LEFT (positive direction), use FRICTION_RIGHT
     // Ensure minimum voltage is sufficient even if friction is low
-    float frictionForLeft = max(FRICTION_RIGHT, 2.0);  // Minimum 2.0V if friction not characterized
+    float frictionForLeft = max(FRICTION_RIGHT, 1.55);  // Minimum 1.55V if friction not characterized
     rangeFindingDriveVoltage = max(frictionForLeft + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
     setMotor(rangeFindingDriveVoltage);
     rangeFindingLastPosition = currentPos;
@@ -449,7 +449,7 @@ void findRange() {
         rangeFindingStableTicks = 0;
         
         // When holding at left limit, use FRICTION_RIGHT (voltage to move left/positive)
-        float frictionForHold = max(FRICTION_RIGHT, 2.0);
+        float frictionForHold = max(FRICTION_RIGHT, 1.55);
         float holdVoltage = max(frictionForHold, CALIBRATE_MIN_VOLTAGE - 0.5);
         setMotor(holdVoltage);
         Serial.println(F("Left limit reached"));
@@ -484,9 +484,9 @@ void findRange() {
           rangeFindingLastPosition = 0;
           rangeFindingLastMoveTime = currentTime;
           // When moving RIGHT (negative direction) from left limit, use FRICTION_LEFT
-          // Ensure minimum voltage is sufficient even if friction is low
-          float frictionForRight = max(FRICTION_LEFT, 2.0);  // Minimum 2.0V if friction not characterized
-          rangeFindingDriveVoltage = -max(frictionForRight + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+          // Ensure minimum friction of 1.55V and minimum drive voltage of 3.0V
+          float frictionForRight = max(FRICTION_LEFT, 1.55);  // Minimum 1.55V if friction not characterized
+          rangeFindingDriveVoltage = -max(frictionForRight + CALIBRATE_EXTRA_VOLTAGE, 3.0);  // At least 3.0V for right limit
           setMotor(rangeFindingDriveVoltage);
         }
       } else {
@@ -507,7 +507,7 @@ void findRange() {
         rangeFindingStableTicks = 0;
         
         // When holding at right limit, use FRICTION_LEFT (voltage to move right/negative)
-        float frictionForHold = max(FRICTION_LEFT, 2.0);
+        float frictionForHold = max(FRICTION_LEFT, 1.55);
         float holdVoltageRight = -max(frictionForHold, CALIBRATE_MIN_VOLTAGE - 0.5);
         setMotor(holdVoltageRight);
         Serial.println(F("Right limit reached"));
@@ -518,6 +518,10 @@ void findRange() {
         } else if (currentTime - rangeFindingLastMoveTime > 2000) {
           Serial.println(F("Stuck, increasing voltage"));
           rangeFindingDriveVoltage = max(rangeFindingDriveVoltage - 0.8, -9.0);
+          // Ensure minimum of 3.0V magnitude when moving to right limit
+          if (rangeFindingDriveVoltage > -3.0) {
+            rangeFindingDriveVoltage = -3.0;
+          }
           setMotor(rangeFindingDriveVoltage);
           rangeFindingLastMoveTime = currentTime;
         }
