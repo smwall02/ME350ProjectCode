@@ -439,11 +439,14 @@ void findRange() {
         if (abs(currentPos - rangeFindingLastPosition) > 2) {
           rangeFindingLastMoveTime = currentTime;
           rangeFindingLastPosition = currentPos;
+          setMotor(rangeFindingDriveVoltage);
         } else if (currentTime - rangeFindingLastMoveTime > 3000) {
           Serial.println(F("Stuck, increasing voltage"));
           rangeFindingDriveVoltage = min(rangeFindingDriveVoltage + 0.5, 9.0);
           setMotor(rangeFindingDriveVoltage);
           rangeFindingLastMoveTime = currentTime;
+        } else {
+          setMotor(rangeFindingDriveVoltage);
         }
         if (currentTime - rangeFindingStartTime > 15000) {
           Serial.println(F("Timeout: left limit"));
@@ -456,8 +459,8 @@ void findRange() {
       
     case RANGE_HOLD_LEFT:
       if (currentTime - rangeFindingHoldStart >= CALIBRATE_HOLD_TIME && rangeFindingStableTicks >= CALIBRATE_STABLE_TICKS) {
-        stopMotor();
         if (currentTime - rangeFindingHoldStart >= CALIBRATE_HOLD_TIME + 200) {
+          stopMotor();
           encoder.write(0);
           LOWER_BOUND = 0;
           Serial.println(F("Left limit found"));
@@ -465,9 +468,12 @@ void findRange() {
           rangeFindingStartTime = currentTime;
           rangeFindingLastPosition = 0;
           rangeFindingLastMoveTime = currentTime;
-          bool inLeftHalf = (encoder.read() > RANGE_MIDPOINT);
+          long posAfterZero = encoder.read();
+          bool inLeftHalf = (posAfterZero > RANGE_MIDPOINT);
           float frictionForPosition = inLeftHalf ? FRICTION_LEFT : FRICTION_RIGHT;
           rangeFindingDriveVoltage = -max(frictionForPosition + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+          Serial.print(F("Moving right, voltage: "));
+          Serial.println(rangeFindingDriveVoltage, 2);
           setMotor(rangeFindingDriveVoltage);
         }
       } else {
@@ -496,11 +502,14 @@ void findRange() {
         if (abs(currentPos - rangeFindingLastPosition) > 2) {
           rangeFindingLastMoveTime = currentTime;
           rangeFindingLastPosition = currentPos;
+          setMotor(rangeFindingDriveVoltage);
         } else if (currentTime - rangeFindingLastMoveTime > 3000) {
           Serial.println(F("Stuck, increasing voltage"));
           rangeFindingDriveVoltage = max(rangeFindingDriveVoltage - 0.5, -9.0);
           setMotor(rangeFindingDriveVoltage);
           rangeFindingLastMoveTime = currentTime;
+        } else {
+          setMotor(rangeFindingDriveVoltage);
         }
         if (currentTime - rangeFindingStartTime > 15000) {
           Serial.println(F("Timeout: right limit"));
