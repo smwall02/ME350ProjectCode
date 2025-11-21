@@ -152,8 +152,8 @@ float previousZombieDistance = 1.0;  // Track previous distance to detect if get
 // NOTE: These values will be loaded from EEPROM if available
 // FRICTION_LEFT: voltage needed when moving TO MORE NEGATIVE positions (away from home)
 // FRICTION_RIGHT: voltage needed when moving TO LESS NEGATIVE positions (toward home)
-float FRICTION_LEFT = 0.25;  // Reduced from 2.2 to prevent overshoot to right
-float FRICTION_RIGHT = 0.25; // For moving toward less negative (left/toward home)
+float FRICTION_LEFT = 2.5;  // Increased for static friction overcoming
+float FRICTION_RIGHT = 2.5; // For moving toward less negative (left/toward home)
 
 // Adaptive friction boost (increases if target not reached)
 float adaptiveFrictionLeft = FRICTION_LEFT;
@@ -179,8 +179,9 @@ float KI_active = KI;
 float KD_active = KD;
 
 const float MAX_VOLTAGE = 10.0;
-const float MIN_CONTROL_VOLTAGE = 0.8;
+const float MIN_CONTROL_VOLTAGE = 2.0;  // Increased to overcome static friction
 const int TARGET_BAND = 2;  // Position tolerance: +/- 2 counts
+const float BREAKAWAY_VOLTAGE_BOOST = 1.5;  // Extra voltage when starting from rest
 const float MAX_INTEGRAL = 1200.0;
 const unsigned long CONTROL_PERIOD = 10;
 
@@ -1106,7 +1107,7 @@ void runMotionControl() {
   // Start learning when error is significant but not too large (better for accuracy)
   if (abs(error) > 100 && abs(error) < 800 && !adaptiveLearning && !adaptiveLearned) {
     adaptiveLearning = true;
-    adaptiveFrictionVoltage = 1.5;  // Start lower for faster learning
+    adaptiveFrictionVoltage = 2.5;  // Start higher to overcome static friction
     lastAdaptivePosition = currentPosition;
     adaptiveStartTime = millis();
     
@@ -1142,42 +1143,42 @@ void runMotionControl() {
     }
     
     // No movement yet - increase voltage and try again
-    // Use faster increments: 0.3V every 150ms (was 0.5V every 200ms)
-    if (elapsed >= 150) {
-      adaptiveFrictionVoltage += 0.3;
+    // Use faster increments: 0.5V every 100ms for quicker response
+    if (elapsed >= 100) {
+      adaptiveFrictionVoltage += 0.5;
       adaptiveStartTime = millis();
       lastAdaptivePosition = currentPosition;  // Reset position check
       
-      if (adaptiveFrictionVoltage > 4.5) {
-        adaptiveFrictionVoltage = 2.5;
+      if (adaptiveFrictionVoltage > 5.0) {
+        adaptiveFrictionVoltage = 3.0;
         adaptiveLearning = false;
         adaptiveLearned = true;
         
-        // Store conservative value
+        // Store learned value
         bool movingRight = (error < 0);
         if (movingRight) {
-          adaptiveFrictionLeft = 2.5;
-          FRICTION_LEFT = 2.5;
+          adaptiveFrictionLeft = 3.0;
+          FRICTION_LEFT = 3.0;
         } else {
-          adaptiveFrictionRight = 2.5;
-          FRICTION_RIGHT = 2.5;
+          adaptiveFrictionRight = 3.0;
+          FRICTION_RIGHT = 3.0;
         }
       }
     }
     
-    if (elapsed > 2000) {
+    if (elapsed > 1500) {
       adaptiveLearning = false;
       adaptiveLearned = true;
-      adaptiveFrictionVoltage = 2.0;  // Use conservative default
+      adaptiveFrictionVoltage = 2.5;  // Use default value
       
       // Store default value
       bool movingRight = (error < 0);
       if (movingRight) {
-        adaptiveFrictionLeft = 2.0;
-        FRICTION_LEFT = 2.0;
+        adaptiveFrictionLeft = 2.5;
+        FRICTION_LEFT = 2.5;
       } else {
-        adaptiveFrictionRight = 2.0;
-        FRICTION_RIGHT = 2.0;
+        adaptiveFrictionRight = 2.5;
+        FRICTION_RIGHT = 2.5;
       }
     }
     
@@ -1213,22 +1214,29 @@ void runMotionControl() {
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
 
-  // FRICTION COMPENSATION DISABLED - was causing overshoot
+  // FRICTION COMPENSATION - re-enabled with improved scaling
   float frictionComp = 0;
-  // Disabled until proper tuning can be done
-  // if (abs(error) > TARGET_BAND) {
-  //   bool movingTowardMoreNegative = (error < 0);
-  //   float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
-  //   float frictionScale = 1.0;
-  //   float absError = abs(error);
-  //   if (absError < 3) frictionScale = 0.05;
-  //   else if (absError < 10) frictionScale = 0.15;
-  //   else if (absError < 30) frictionScale = 0.4;
-  //   else if (absError < 100) frictionScale = 0.7;
-  //   if (abs(motorVelocity) > 5) frictionScale *= 0.5;
-  //   if (error < 0) frictionComp = -baseFriction * frictionScale;
-  //   else frictionComp = baseFriction * frictionScale;
-  // }
+  if (abs(error) > TARGET_BAND) {
+    bool movingTowardMoreNegative = (error < 0);
+    float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
+    float frictionScale = 1.0;
+    float absError = abs(error);
+    
+    // Scale friction based on error magnitude - more aggressive for larger errors
+    if (absError < 3) frictionScale = 0.1;
+    else if (absError < 10) frictionScale = 0.3;
+    else if (absError < 30) frictionScale = 0.6;
+    else if (absError < 100) frictionScale = 0.8;
+    else frictionScale = 1.0;  // Full friction for large errors
+    
+    // Reduce friction when already moving (dynamic friction is less than static)
+    if (abs(motorVelocity) > 10) frictionScale *= 0.4;
+    else if (abs(motorVelocity) > 5) frictionScale *= 0.6;
+    
+    // Apply friction compensation
+    if (error < 0) frictionComp = -baseFriction * frictionScale;
+    else frictionComp = baseFriction * frictionScale;
+  }
 
   // Velocity feedforward - DISABLED to prevent overshoot
   float velocityFF = 0;
@@ -1240,6 +1248,13 @@ void runMotionControl() {
 
   // Calculate total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF;
+  
+  // BREAKAWAY VOLTAGE BOOST: Add extra voltage when starting from rest to overcome static friction
+  // If motor is not moving (or moving very slowly) and error is significant, add breakaway boost
+  if (abs(motorVelocity) < 3.0 && abs(originalError) > 5) {
+    float breakawayBoost = (originalError < 0) ? -BREAKAWAY_VOLTAGE_BOOST : BREAKAWAY_VOLTAGE_BOOST;
+    totalVoltage += breakawayBoost;
+  }
   
   // Apply voltage boost during retry mode (for first 300ms of retry)
   if (inRetryMode) {
@@ -1254,6 +1269,7 @@ void runMotionControl() {
   }
 
   // Voltage capping based on error magnitude (increased significantly for faster movement)
+  // Also ensures minimum voltage to overcome static friction
   float voltageLimit = MAX_VOLTAGE;
   long absErr = abs(error);
   if (absErr > 800) {
@@ -1266,8 +1282,10 @@ void runMotionControl() {
     voltageLimit = 5.0;  // Increased from 3.0
   } else if (absErr > 50) {
     voltageLimit = 4.5;  // Increased from 2.5
+  } else if (absErr > 10) {
+    voltageLimit = 4.0;  // Increased for medium errors
   } else {
-    voltageLimit = 3.5;  // Increased from 2.2 for final approach
+    voltageLimit = 3.5;  // Minimum for small errors - enough to overcome static friction
   }
 
   // Allow higher voltage limit during retry mode (20% boost)
@@ -1293,15 +1311,15 @@ void runMotionControl() {
 
         // If stuck for 2+ consecutive checks, apply aggressive friction-overcoming voltage
         if (stuckCounter >= 2) {
-          // Scale minimum voltage based on error magnitude
+          // Scale minimum voltage based on error magnitude - increased for static friction
           float minVoltage;
           long absError = abs(originalError);
           if (absError > 50) {
-            minVoltage = 5.5;  // Large error - use high voltage
+            minVoltage = 6.0;  // Large error - use high voltage
           } else if (absError > 20) {
-            minVoltage = 4.5;  // Medium error - use medium-high voltage
+            minVoltage = 5.0;  // Medium error - use medium-high voltage
           } else {
-            minVoltage = 3.5;  // Small error - use moderate voltage
+            minVoltage = 4.0;  // Small error - use higher voltage to overcome static friction
           }
           
           // Apply minimum voltage in direction of error
@@ -1319,8 +1337,18 @@ void runMotionControl() {
     stuckCounter = 0;  // Reset when within target band
   }
 
+  // Apply motor voltage - ensure we apply at least friction compensation if error is significant
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
     setMotor(totalVoltage);
+  } else if (abs(originalError) > TARGET_BAND) {
+    // If error is significant but voltage is low, apply at least friction compensation
+    // This helps overcome static friction for small movements
+    float minFrictionVoltage = (originalError < 0) ? -adaptiveFrictionLeft : adaptiveFrictionRight;
+    if (abs(minFrictionVoltage) > 0.5) {
+      setMotor(minFrictionVoltage);
+    } else {
+      stopMotor();
+    }
   } else {
     stopMotor();
   }
