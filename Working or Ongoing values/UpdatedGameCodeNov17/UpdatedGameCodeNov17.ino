@@ -66,23 +66,13 @@ long targetPositions[4] = {
 };
 
 // ============================================
-// DYNAMIC SENSOR CALIBRATION
+// HARDCODED SENSOR RANGES (No calibration needed)
 // ============================================
-int ProxRange[4][2] = {
-  {800, 100},
-  {800, 100},
-  {800, 100},
-  {800, 100}
-};
-
-bool sensorCalibrated = false;
-bool dynamicCalibrationActive = false;
-bool rangeFindingComplete = false;
-unsigned long calibrationStartTime = 0;
-const unsigned long DYNAMIC_CALIBRATION_TIME = 5000;  // 5 seconds
-
-int dynamicMin[4];
-int dynamicMax[4];
+// Sensor ranges: [MAX (far), MIN (close)]
+// These convert raw ADC readings (0-1023) to distance percentage (0-100)
+// 0% = zombie very close, 100% = zombie far away
+const int PROX_RANGE_MAX[4] = {800, 800, 800, 800};  // Far reading (zombie far)
+const int PROX_RANGE_MIN[4] = {100, 100, 100, 100};  // Close reading (zombie close)
 
 // PROXIMITY SENSORS
 struct ProximitySensor {
@@ -309,10 +299,6 @@ void loop() {
   if (currentTime - lastSensorTime >= 20) {
     lastSensorTime = currentTime;
     updateAllSensors();
-    
-    if (dynamicCalibrationActive) {
-      updateDynamicCalibration();
-    }
   }
   
   if (currentTime - lastControlTime >= CONTROL_PERIOD) {
@@ -320,7 +306,7 @@ void loop() {
     
     updateVelocity();
     
-    if (autoMode && !dynamicCalibrationActive) {
+    if (autoMode) {
       runStateMachine();
     }
     
@@ -330,25 +316,20 @@ void loop() {
     
     if (autoMode && (currentTime - lastPrintTime >= 200)) {
       lastPrintTime = currentTime;
-
-      if (dynamicCalibrationActive) {
-        printCalibrationProgress();
-      } else {
-        printCompactStatus();
-      }
+      printCompactStatus();
     }
     
     // Drift mitigation - check more frequently during auto mode
     bool isMoving = (currentState == MOVE_TO_TARGET && abs(motorVelocity) > 5);
     unsigned long driftInterval = isMoving ? DRIFT_CHECK_DURING_MOVE : DRIFT_CHECK_INTERVAL;
     
-    if (autoMode && !dynamicCalibrationActive && (currentTime - lastDriftCheckTime >= driftInterval)) {
+    if (autoMode && (currentTime - lastDriftCheckTime >= driftInterval)) {
       mitigateDrift();
       lastDriftCheckTime = currentTime;
     }
     
     // Continuous position validation - runs very frequently
-    if (autoMode && !dynamicCalibrationActive && (currentTime - lastPositionValidationTime >= POSITION_VALIDATION_INTERVAL)) {
+    if (autoMode && (currentTime - lastPositionValidationTime >= POSITION_VALIDATION_INTERVAL)) {
       validatePosition();
       lastPositionValidationTime = currentTime;
     }
@@ -436,13 +417,15 @@ void updateAllSensors() {
       }
     }
 
-    // Update distances
-    if (sensorCalibrated) {
-      zombieDistances[i] = (ProxSensors[i].currVal - ProxRange[i][1]) /
-                           (float)(ProxRange[i][0] - ProxRange[i][1]);
+    // Update distances - always use hardcoded ranges
+    // Convert to 0.0-1.0 where 0.0 = close, 1.0 = far
+    float rawVal = ProxSensors[i].currVal;
+    float range = PROX_RANGE_MAX[i] - PROX_RANGE_MIN[i];
+    if (range > 0) {
+      zombieDistances[i] = (rawVal - PROX_RANGE_MIN[i]) / range;
       zombieDistances[i] = constrain(zombieDistances[i], 0.0, 1.0);
     } else {
-      zombieDistances[i] = 1.0;
+      zombieDistances[i] = 1.0;  // Default to far if range invalid
     }
   }
 }
@@ -461,63 +444,7 @@ void updateVelocity() {
 }
 
 
-// ============================================
-// DYNAMIC SENSOR CALIBRATION
-// ============================================
-void startDynamicCalibration() {
-  
-  dynamicCalibrationActive = true;
-  calibrationStartTime = millis();
-  
-  for (int i = 0; i < 4; i++) {
-    dynamicMin[i] = 1023;
-    dynamicMax[i] = 0;
-  }
-}
-
-void updateDynamicCalibration() {
-  if (!dynamicCalibrationActive) return;
-  
-  for (int i = 0; i < 4; i++) {
-    int reading = analogRead(ProxSensors[i].pin);
-    
-    if (reading < dynamicMin[i]) {
-      dynamicMin[i] = reading;
-    }
-    if (reading > dynamicMax[i]) {
-      dynamicMax[i] = reading;
-    }
-  }
-  
-  if (millis() - calibrationStartTime >= DYNAMIC_CALIBRATION_TIME) {
-    finalizeDynamicCalibration();
-  }
-}
-
-void finalizeDynamicCalibration() {
-  dynamicCalibrationActive = false;
-  
-  bool allValid = true;
-  for (int i = 0; i < 4; i++) {
-    int range = dynamicMax[i] - dynamicMin[i];
-    if (range < 50) allValid = false;
-    ProxRange[i][0] = dynamicMax[i];
-    ProxRange[i][1] = dynamicMin[i];
-  }
-  sensorCalibrated = true;
-  if (homeToLeftLimit()) {
-    findRangeAndSetBounds();
-  }
-}
-
-void printCalibrationProgress() {
-  Serial.print((DYNAMIC_CALIBRATION_TIME - (millis() - calibrationStartTime)) / 1000);
-  for (int i = 0; i < 4; i++) {
-    Serial.print(F(" "));
-    Serial.print(dynamicMax[i] - dynamicMin[i]);
-  }
-  Serial.println();
-}
+// Calibration functions removed - using hardcoded sensor ranges
 
 void findRangeAndSetBounds() {
   // CRITICAL: Lane positions are NEVER modified during range finding
@@ -560,17 +487,9 @@ void runStateMachine() {
     
     case CALIBRATE:
       desiredPosition = LOWER_BOUND;
-
-      if (!dynamicCalibrationActive && sensorCalibrated) {
-        currentState = CHOOSE_ACTIVE_TARGET;
-        systemEnabled = true;
-      }
-      else if (!dynamicCalibrationActive && !sensorCalibrated) {
-        // Go directly to sensor calibration (range will be found after calibration)
-        startDynamicCalibration();
-        desiredPosition = LOWER_BOUND;
-        systemEnabled = true;
-      }
+      // No calibration needed - sensors use hardcoded ranges
+      currentState = CHOOSE_ACTIVE_TARGET;
+      systemEnabled = true;
       break;
     
     case CHOOSE_ACTIVE_TARGET:
@@ -680,33 +599,39 @@ void runStateMachine() {
         break;
       }
       
-      // Apply hysteresis - compare new target against CURRENT active target (not previous)
-      // This ensures we always switch to the closest available target
-      if (activeTargetIndex >= 0 && 
-          activeTargetIndex < 4 &&
-          newTargetIndex >= 0 &&
-          newTargetIndex != activeTargetIndex &&
-          ProxSensors[activeTargetIndex].direction == FORWARD &&
-          zombieDistances[activeTargetIndex] < MIN_COMMIT_DISTANCE) {
-        // Current target is still close and forward - compare distances
-        float currentDist = zombieDistances[activeTargetIndex];
-        float newDist = zombieDistances[newTargetIndex];
-        
-        // Switch if new target is closer (very low threshold for responsiveness)
-        if (newDist < (currentDist - 0.05)) {  // Even lower threshold - switch if 5% closer
-          // New target is closer - switch to it
+      // Always select the closest target - simple and direct
+      // If we found a new target, use it (it's already the closest)
+      if (newTargetIndex >= 0) {
+        // Always switch to the closest target found, unless current is very close and committed
+        if (activeTargetIndex >= 0 && 
+            activeTargetIndex < 4 &&
+            activeTargetIndex != newTargetIndex) {
+          float currentDist = zombieDistances[activeTargetIndex];
+          float newDist = zombieDistances[newTargetIndex];
+          
+          // Only keep current target if it's very close AND within commit time
+          bool keepCurrent = (currentDist < MIN_COMMIT_DISTANCE && 
+                             targetCommitTime > 0 &&
+                             (millis() - targetCommitTime) < MIN_TARGET_COMMIT_TIME &&
+                             newDist >= (currentDist - 0.01));  // New must be at least 1% closer to switch
+          
+          if (!keepCurrent) {
+            // Switch to new target (it's closer or current is far)
+            activeTargetIndex = newTargetIndex;
+            closestZombieDist = newClosestDist;
+          }
+        } else {
+          // No current target or same target - use new target
           activeTargetIndex = newTargetIndex;
           closestZombieDist = newClosestDist;
-        } else {
-          // Current target is still closer - keep it
-          // activeTargetIndex stays the same
-          closestZombieDist = zombieDistances[activeTargetIndex];
         }
       } else {
-        // No current target, or current target is no longer valid, or no new target found
-        // Use the new target if found (this is the normal case)
-        activeTargetIndex = newTargetIndex;
-        closestZombieDist = newClosestDist;
+        // No new target found - clear current if it's no longer valid
+        if (activeTargetIndex >= 0 && 
+            activeTargetIndex < 4 &&
+            ProxSensors[activeTargetIndex].direction != FORWARD) {
+          activeTargetIndex = -1;
+        }
       }
       
       if (activeTargetIndex >= 0) {
@@ -1368,16 +1293,6 @@ void runMotionControl() {
     }
   }
   
-  if (dynamicCalibrationActive) {
-    desiredPosition = LOWER_BOUND;
-    float error = desiredPosition - rawPosition;
-    if (abs(error) > 10) {
-      setMotor(constrain(error * 0.05, -2.0, 2.0));
-    } else {
-      stopMotor();
-    }
-    return;
-  }
   
   // Use simplified PID update (like PIDAutoTune) - this handles filtering internally
   float voltage = updatePID(desiredPosition);
@@ -1761,7 +1676,7 @@ void stopMotor() {
 
 // DRIFT MITIGATION
 void mitigateDrift() {
-  if (!autoMode || dynamicCalibrationActive) return;
+  if (!autoMode) return;
   
   long currentPos = encoder.read();
   
@@ -1827,7 +1742,7 @@ void mitigateDrift() {
 
 // POSITION VALIDATION
 void validatePosition() {
-  if (!autoMode || dynamicCalibrationActive) return;
+  if (!autoMode) return;
   
   long currentPos = encoder.read();
   
@@ -1898,7 +1813,6 @@ void checkLimitSwitches() {
   if (digitalRead(LIMIT_LEFT) == HIGH && 
       currentState != CALIBRATE && 
       currentState != FIND_RANGE &&
-      !dynamicCalibrationActive &&
       abs(motorVelocity) < 10) {
     
     delay(50);
@@ -2435,8 +2349,6 @@ void processCommand() {
           autoMode = true;
           systemEnabled = true;
           rangeFindingComplete = true;
-          sensorCalibrated = false;
-          dynamicCalibrationActive = false;
           // Initialize drift check
           lastDriftCheckPosition = encoder.read();
           lastKnownGoodPosition = encoder.read();
@@ -2481,7 +2393,6 @@ void processCommand() {
       Serial.println(F("\nSTOP"));
       autoMode = false;
       systemEnabled = false;
-      dynamicCalibrationActive = false;
       stopMotor();
       errorIntegral = 0;
       break;
@@ -2534,7 +2445,6 @@ void processCommand() {
       adaptiveLearning = false;
       adaptiveLearned = false;
       rangeFindingComplete = false;
-      sensorCalibrated = false;
       adaptiveFrictionLeft = FRICTION_LEFT;
       adaptiveFrictionRight = FRICTION_RIGHT;
       Serial.println(F("Reset"));
