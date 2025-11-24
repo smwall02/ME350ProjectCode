@@ -1976,23 +1976,10 @@ bool homeToLeftLimit() {
       }
     }
 
-    // Continue holding against switch while zeroing to prevent drift
-    // Verify switch is still pressed before zeroing
-    if (!leftPressed()) {
-      // Switch released - try to re-engage
-      setMotor(holdVoltage);
-      delay(100);
-      if (!leftPressed()) {
-        stopMotor();
-        return false;  // Couldn't maintain contact with switch
-      }
-    }
-    
-    // Keep holding while zeroing
+    // Continue holding against switch while zeroing
     setMotor(holdVoltage);
-    delay(100);  // Brief pause while still holding
     
-    // Multiple zeroing attempts to ensure encoder is properly reset
+    // Set encoder to 0 while still holding
     encoder.write(0);
     delay(50);
     if (encoder.read() != 0) {
@@ -2002,35 +1989,16 @@ bool homeToLeftLimit() {
     encoder.write(0);
     delay(50);
     
-    // Verify encoder is actually zeroed and switch is still pressed
-    if (!leftPressed()) {
-      // Switch released during zeroing - re-engage
-      setMotor(holdVoltage);
-      delay(100);
-      if (!leftPressed()) {
-        stopMotor();
-        return false;
-      }
-    }
-    
+    // Verify encoder is zeroed
     long finalPos = encoder.read();
     if (abs(finalPos) > 2) {
       encoder.write(0);
       delay(50);
     }
     
-    // Final verification - ensure switch is still pressed
-    if (!leftPressed()) {
-      setMotor(holdVoltage);
-      delay(100);
-      if (!leftPressed()) {
-        stopMotor();
-        return false;
-      }
-    }
-    
+    // Now stop motor
     stopMotor();
-    delay(50);  // Brief pause after stopping
+    delay(50);
 
     // CRITICAL: Reload lane positions from EEPROM after homing
     // This ensures they're never modified
@@ -2069,7 +2037,7 @@ bool homeToLeftLimit() {
     return false;
   }
   
-  // Reached limit switch - now hold and debounce (same as above)
+  // Reached limit switch - now hold and debounce
   long lastPos = encoder.read();
   unsigned long holdStart = millis();
   int stableTicks = 0;
@@ -2077,46 +2045,21 @@ bool homeToLeftLimit() {
 
   // Hold on the switch with debounce - ensure it settles
   while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
-    if (!leftPressed()) {
-      // Switch released - re-engage
-      setMotor(holdVoltage);
-      delay(50);
-      if (!leftPressed()) {
-        stopMotor();
-        return false;
-      }
-      stableTicks = 0;  // Reset stability counter
-      lastPos = encoder.read();
+    setMotor(holdVoltage);  // Keep holding against switch
+    delay(10);
+    long pos = encoder.read();
+    if (abs(pos - lastPos) <= 1) {
+      stableTicks++;
     } else {
-      setMotor(holdVoltage);  // Keep holding against switch
-      delay(10);
-      long pos = encoder.read();
-      if (abs(pos - lastPos) <= 1) {
-        stableTicks++;
-      } else {
-        stableTicks = 0;
-        lastPos = pos;
-      }
+      stableTicks = 0;
+      lastPos = pos;
     }
   }
 
-  // Continue holding against switch while zeroing to prevent drift
-  // Verify switch is still pressed before zeroing
-  if (!leftPressed()) {
-    // Switch released - try to re-engage
-    setMotor(holdVoltage);
-    delay(100);
-    if (!leftPressed()) {
-      stopMotor();
-      return false;  // Couldn't maintain contact with switch
-    }
-  }
-  
-  // Keep holding while zeroing
+  // Continue holding against switch while zeroing
   setMotor(holdVoltage);
-  delay(100);  // Brief pause while still holding
   
-  // Multiple zeroing attempts to ensure encoder is properly reset
+  // Set encoder to 0 while still holding
   encoder.write(0);
   delay(50);
   if (encoder.read() != 0) {
@@ -2126,35 +2069,16 @@ bool homeToLeftLimit() {
   encoder.write(0);
   delay(50);
   
-  // Verify encoder is actually zeroed and switch is still pressed
-  if (!leftPressed()) {
-    // Switch released during zeroing - re-engage
-    setMotor(holdVoltage);
-    delay(100);
-    if (!leftPressed()) {
-      stopMotor();
-      return false;
-    }
-  }
-  
+  // Verify encoder is zeroed
   long finalPos = encoder.read();
   if (abs(finalPos) > 2) {
     encoder.write(0);
     delay(50);
   }
   
-  // Final verification - ensure switch is still pressed
-  if (!leftPressed()) {
-    setMotor(holdVoltage);
-    delay(100);
-    if (!leftPressed()) {
-      stopMotor();
-      return false;
-    }
-  }
-  
+  // Now stop motor
   stopMotor();
-  delay(50);  // Brief pause after stopping
+  delay(50);
 
   // CRITICAL: Reload lane positions from EEPROM after homing
   // This ensures they're never modified
