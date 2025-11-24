@@ -587,8 +587,29 @@ void runStateMachine() {
         lastKnownGoodPosition = pos;
       }
       
+      // Track position
+      previousMoveStartPosition = encoder.read();
+
+      // Find closest forward zombie FIRST - always check for new targets
+      int newTargetIndex = -1;
+      float newClosestDist = 2.0;
+      for (int i = 0; i < 4; i++) {
+        // Target forward zombies primarily
+        // Also target zombies that are close enough (likely approaching, even if direction not detected yet)
+        bool isForward = (ProxSensors[i].direction == FORWARD);
+        bool isCloseEnough = (zombieDistances[i] < 0.60);  // Within 60% distance - likely a threat
+        bool notRetreating = (ProxSensors[i].direction != BACKWARD);  // Not clearly retreating
+        
+        // Select if: forward, OR (close enough and not retreating)
+        if ((isForward || (isCloseEnough && notRetreating)) &&
+            zombieDistances[i] < newClosestDist) {
+          newClosestDist = zombieDistances[i];
+          newTargetIndex = i;
+        }
+      }
+      
       // Check if we should stay committed to current target
-      // Only check this if we already have an active target
+      // Only if we have a current target AND it's still valid AND we're within commit time
       bool shouldStayCommitted = false;
       if (activeTargetIndex >= 0 && 
           activeTargetIndex < 4 &&
@@ -596,49 +617,51 @@ void runStateMachine() {
           zombieDistances[activeTargetIndex] < MIN_COMMIT_DISTANCE &&
           targetCommitTime > 0 &&
           (millis() - targetCommitTime) < MIN_TARGET_COMMIT_TIME) {
-        // Very close to target and within commit time - stay committed
-        shouldStayCommitted = true;
+        // Check if target is hit or retreated
+        if (!ProxSensors[activeTargetIndex].hitDetected &&
+            !(ProxSensors[activeTargetIndex].direction == BACKWARD && 
+              zombieDistances[activeTargetIndex] > 0.70)) {
+          // Target is still valid - stay committed
+          shouldStayCommitted = true;
+        }
       }
       
-      // If committed, only switch if target is clearly retreating or hit
-      if (shouldStayCommitted) {
-        if (ProxSensors[activeTargetIndex].hitDetected ||
-            (ProxSensors[activeTargetIndex].direction == BACKWARD && 
-             zombieDistances[activeTargetIndex] > 0.70)) {
-          // Target hit or retreated far - allow switch
-          shouldStayCommitted = false;
+      // If no new target found and we're not committed, go to wait position
+      if (newTargetIndex < 0 && !shouldStayCommitted) {
+        activeTargetIndex = -1;
+        activeTargetPosition = WAIT_POSITION;
+        WAIT_POS = true;
+        fineAdjustmentActive = false;
+        fineAdjustmentCount = 0;
+        lastFineAdjustmentTime = 0;
+        lane4LimitSwitchMode = false;
+        lane4AtLimit = false;
+        targetCommitTime = 0;
+        desiredPosition = WAIT_POSITION;
+        moveStartTime = millis();
+        arrivalTime = millis();
+        targetReached = false;
+        stuckCounter = 0;
+        positionRetryCount = 0;
+        voltageRampedForRetry = false;
+        retryStartTime = 0;
+        currentState = MOVE_TO_TARGET;
+        break;
+      }
+      
+      // If committed to current target and it's still valid, keep it
+      if (shouldStayCommitted && activeTargetIndex >= 0) {
+        activeTargetPosition = targetPositions[activeTargetIndex];
+        WAIT_POS = false;
+        if (lane4LimitSwitchMode) {
+          desiredPosition = UPPER_BOUND;
         } else {
-          // Stay with current target
-          activeTargetPosition = targetPositions[activeTargetIndex];
-          WAIT_POS = false;
-          if (lane4LimitSwitchMode) {
-            desiredPosition = UPPER_BOUND;
-          } else {
-            desiredPosition = activeTargetPosition;
-          }
-          moveStartTime = millis();
-          arrivalTime = millis();
-          currentState = MOVE_TO_TARGET;
-          break;
+          desiredPosition = activeTargetPosition;
         }
-      }
-      
-      activeTargetIndex = -1;
-      closestZombieDist = 2.0;
-
-      // Track position
-      previousMoveStartPosition = encoder.read();
-
-      // Find closest forward zombie
-      int newTargetIndex = -1;
-      float newClosestDist = 2.0;
-      for (int i = 0; i < 4; i++) {
-        // Only target forward zombies
-        if (ProxSensors[i].direction == FORWARD &&
-            zombieDistances[i] < newClosestDist) {
-          newClosestDist = zombieDistances[i];
-          newTargetIndex = i;
-        }
+        moveStartTime = millis();
+        arrivalTime = millis();
+        currentState = MOVE_TO_TARGET;
+        break;
       }
       
       // Apply hysteresis only if we have both a previous target AND a new target candidate
@@ -659,9 +682,8 @@ void runStateMachine() {
           closestZombieDist = zombieDistances[activeTargetIndex];
         }
       } else {
-        // No previous target, or previous target is no longer valid (not forward or too far), or no new target found
-        // Use the new target if found, otherwise no target
-        // This ensures we always select a target if one is available, even if we had a previous target
+        // No previous target, or previous target is no longer valid, or no new target found
+        // Use the new target if found
         activeTargetIndex = newTargetIndex;
         closestZombieDist = newClosestDist;
       }
@@ -937,17 +959,22 @@ void runStateMachine() {
         }
       }
       
-      // Check for forward zombies
+      // Check for forward zombies or close threats
       bool hasForwardZombie = false;
+      bool hasCloseThreat = false;
       for (int i = 0; i < 4; i++) {
         if (ProxSensors[i].direction == FORWARD) {
           hasForwardZombie = true;
           break;
         }
+        // Also check for close threats that might not be detected as forward yet
+        if (zombieDistances[i] < 0.60 && ProxSensors[i].direction != BACKWARD) {
+          hasCloseThreat = true;
+        }
       }
 
-      // No forward zombies
-      if (!hasForwardZombie && millis() - moveStartTime > 1000) {
+      // No forward zombies or close threats - re-evaluate
+      if (!hasForwardZombie && !hasCloseThreat && millis() - moveStartTime > 1000) {
         currentState = CHOOSE_ACTIVE_TARGET;
         break;
       }
@@ -1041,8 +1068,8 @@ void runStateMachine() {
       
       if (abs(errorToCurrentTarget) <= TARGET_BAND) {
         if (WAIT_POS) {
-          // At wait position
-          if (hasForwardZombie) {
+          // At wait position - check for any threats
+          if (hasForwardZombie || hasCloseThreat) {
             currentState = CHOOSE_ACTIVE_TARGET;
           }
           // Otherwise stay put at wait position
