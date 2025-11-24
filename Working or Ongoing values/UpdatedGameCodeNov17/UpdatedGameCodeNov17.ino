@@ -2,6 +2,7 @@
 
 #include <Encoder.h>
 #include <EEPROM.h>
+#include <math.h>
 
 // PIN DEFINITIONS
 #define ENCODER_A 2
@@ -165,9 +166,7 @@ const int TARGET_BAND = 2;
 const float MAX_INTEGRAL = 1200.0;
 const unsigned long CONTROL_PERIOD = 10;
 
-  // Momentum compensation
-  const int RIGHTWARD_DRIFT_OFFSET = 2;
-  const int LEFTWARD_DRIFT_OFFSET = 2;
+  // Momentum compensation (removed drift offsets - they caused systematic errors)
 
 // MOTION CONTROL
 long desiredPosition = 0;
@@ -198,10 +197,19 @@ bool autoMode = false;
 unsigned long lastPrintTime = 0;
 unsigned long moveStartTime = 0;
 bool targetReached = false;
+bool voltageRampedForRetry = false;
+unsigned long retryStartTime = 0;
+const unsigned long RETRY_TIME_THRESHOLD = 2000;  // 2 seconds
+const unsigned long TARGET_SWITCH_TIME = 4000;  // 4 seconds
+const long RETRY_LARGE_ERROR_THRESHOLD = 50;  // Error threshold for retry
 unsigned long lastDriftCheckTime = 0;
-const unsigned long DRIFT_CHECK_INTERVAL = 5000;  // Check drift every 5 seconds
+const unsigned long DRIFT_CHECK_INTERVAL = 2000;  // Check drift every 2 seconds (more frequent)
+const unsigned long DRIFT_CHECK_DURING_MOVE = 1000;  // Check drift every 1 second during movement
 long lastDriftCheckPosition = 0;
-const long MAX_DRIFT_THRESHOLD = 20;  // Maximum allowed drift before correction
+const long MAX_DRIFT_THRESHOLD = 15;  // Reduced threshold for earlier detection
+long lastKnownGoodPosition = 0;
+unsigned long lastPositionValidationTime = 0;
+const unsigned long POSITION_VALIDATION_INTERVAL = 500;  // Validate position every 500ms
 
 const float CALIBRATION_VOLTAGE = 4.0;
 const float HOMING_VOLTAGE = 4.0;
@@ -261,6 +269,11 @@ void setup() {
   delay(500);
 
   loadCalibrationFromEEPROM();
+  if (EEPROM.read(EEPROM_FLAG) == 0xAA) {
+    Serial.println(F("EEPROM OK"));
+  } else {
+    Serial.println(F("EEPROM empty"));
+  }
 
   printWelcome();
   printHelp();
@@ -306,10 +319,19 @@ void loop() {
       }
     }
     
-    // Drift mitigation - check periodically during auto mode
-    if (autoMode && !dynamicCalibrationActive && (currentTime - lastDriftCheckTime >= DRIFT_CHECK_INTERVAL)) {
+    // Drift mitigation - check more frequently during auto mode
+    bool isMoving = (currentState == MOVE_TO_TARGET && abs(motorVelocity) > 5);
+    unsigned long driftInterval = isMoving ? DRIFT_CHECK_DURING_MOVE : DRIFT_CHECK_INTERVAL;
+    
+    if (autoMode && !dynamicCalibrationActive && (currentTime - lastDriftCheckTime >= driftInterval)) {
       mitigateDrift();
       lastDriftCheckTime = currentTime;
+    }
+    
+    // Continuous position validation - runs very frequently
+    if (autoMode && !dynamicCalibrationActive && (currentTime - lastPositionValidationTime >= POSITION_VALIDATION_INTERVAL)) {
+      validatePosition();
+      lastPositionValidationTime = currentTime;
     }
   }
   
@@ -424,8 +446,6 @@ void updateVelocity() {
 // DYNAMIC SENSOR CALIBRATION
 // ============================================
 void startDynamicCalibration() {
-  Serial.println(F("\nSENSOR CALIBRATION"));
-  Serial.println(F("5 seconds...\n"));
   
   dynamicCalibrationActive = true;
   calibrationStartTime = millis();
@@ -458,136 +478,60 @@ void updateDynamicCalibration() {
 void finalizeDynamicCalibration() {
   dynamicCalibrationActive = false;
   
-  Serial.println(F("\nCALIBRATION COMPLETE"));
-  
   bool allValid = true;
-  
   for (int i = 0; i < 4; i++) {
     int range = dynamicMax[i] - dynamicMin[i];
-    
-    Serial.print(F("Lane "));
-    Serial.print(i + 1);
-    Serial.print(F(": MIN="));
-    Serial.print(dynamicMin[i]);
-    Serial.print(F(", MAX="));
-    Serial.print(dynamicMax[i]);
-    Serial.print(F(", Range="));
-    Serial.print(range);
-    
-      if (range < 50) {
-        Serial.println(F(" WARN"));
-        allValid = false;
-      } else {
-        Serial.println(F(" OK"));
-      }
-    
+    if (range < 50) allValid = false;
     ProxRange[i][0] = dynamicMax[i];
     ProxRange[i][1] = dynamicMin[i];
   }
-  
-  if (allValid) {
-    sensorCalibrated = true;
-    Serial.println(F("\nSensors OK"));
-    Serial.println(F("Rehoming...\n"));
-    if (homeToLeftLimit()) {
-      Serial.println(F("Rehomed\n"));
-      // Find range and set bounds
-      findRangeAndSetBounds();
-    } else {
-      Serial.println(F("Rehome failed\n"));
-    }
-  } else {
-    Serial.println(F("\nSome sensors small range"));
-    Serial.println(F("Rehoming...\n"));
-    sensorCalibrated = true;
-    if (homeToLeftLimit()) {
-      Serial.println(F("Rehomed\n"));
-      // Find range and set bounds
-      findRangeAndSetBounds();
-    } else {
-      Serial.println(F("Rehome failed\n"));
-    }
+  sensorCalibrated = true;
+  if (homeToLeftLimit()) {
+    findRangeAndSetBounds();
   }
 }
 
 void printCalibrationProgress() {
-  unsigned long elapsed = millis() - calibrationStartTime;
-  unsigned long remaining = DYNAMIC_CALIBRATION_TIME - elapsed;
-  
-  Serial.print(F("Cal: "));
-  Serial.print(remaining / 1000);
-  Serial.print(F("s | "));
-  
+  Serial.print((DYNAMIC_CALIBRATION_TIME - (millis() - calibrationStartTime)) / 1000);
   for (int i = 0; i < 4; i++) {
-    int range = dynamicMax[i] - dynamicMin[i];
-    Serial.print(range);
     Serial.print(F(" "));
+    Serial.print(dynamicMax[i] - dynamicMin[i]);
   }
   Serial.println();
 }
 
-// RANGE FINDING - Find and set encoder bounds
 void findRangeAndSetBounds() {
-  Serial.println(F("Finding range..."));
+  // CRITICAL: Lane positions are NEVER modified during range finding
+  // They remain as loaded from EEPROM
   
-  // Home to left limit first
-  if (!homeToLeftLimit()) {
-    Serial.println(F("Range find failed: homing failed"));
-    return;
-  }
-  
-  // Set LOWER_BOUND at left limit (should be 0 after homing)
+  if (!homeToLeftLimit()) return;
   LOWER_BOUND = encoder.read();
-  Serial.print(F("LOWER_BOUND set to: "));
-  Serial.println(LOWER_BOUND);
-  
-  // Move to right limit
-  Serial.println(F("Moving to right limit..."));
   unsigned long startTime = millis();
-  float driveVoltage = max(FRICTION_LEFT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
-  setMotor(-driveVoltage);  // Negative voltage moves right (more negative)
-  
-  while (digitalRead(LIMIT_RIGHT) == LOW && (millis() - startTime) < 15000) {
-    delay(10);
-  }
-  
+  setMotor(-max(FRICTION_LEFT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE));
+  while (digitalRead(LIMIT_RIGHT) == LOW && (millis() - startTime) < 15000) delay(10);
   if (digitalRead(LIMIT_RIGHT) == HIGH) {
-    // Hold at limit
     long currentPos = encoder.read();
     long lastPos = currentPos;
     unsigned long holdStart = millis();
     int stableTicks = 0;
     float holdVoltage = max(FRICTION_LEFT, CALIBRATE_MIN_VOLTAGE - 0.5);
-    
     while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
       setMotor(-holdVoltage);
       delay(10);
       long pos = encoder.read();
-      if (abs(pos - lastPos) <= 1) {
-        stableTicks++;
-      } else {
-        stableTicks = 0;
-        lastPos = pos;
-      }
+      if (abs(pos - lastPos) <= 1) stableTicks++;
+      else { stableTicks = 0; lastPos = pos; }
     }
-    
     stopMotor();
     delay(100);
-    
-    // Set UPPER_BOUND at right limit
     UPPER_BOUND = encoder.read();
-    Serial.print(F("UPPER_BOUND set to: "));
-    Serial.println(UPPER_BOUND);
-    Serial.print(F("Range: "));
-    Serial.print(LOWER_BOUND);
-    Serial.print(F(" to "));
-    Serial.println(UPPER_BOUND);
-    
-    // Mark range finding as complete
     rangeFindingComplete = true;
+    
+    // CRITICAL: Reload lane positions from EEPROM after range finding
+    // This ensures they're never modified
+    loadCalibrationFromEEPROM();
   } else {
     stopMotor();
-    Serial.println(F("Range find failed: timeout"));
   }
 }
 
@@ -599,13 +543,11 @@ void runStateMachine() {
       desiredPosition = LOWER_BOUND;
 
       if (!dynamicCalibrationActive && sensorCalibrated) {
-        Serial.println(F("State: TRACKING\n"));
         currentState = CHOOSE_ACTIVE_TARGET;
         systemEnabled = true;
       }
       else if (!dynamicCalibrationActive && !sensorCalibrated) {
         // Go directly to sensor calibration (range will be found after calibration)
-        Serial.println(F("State: SENSOR CAL\n"));
         startDynamicCalibration();
         desiredPosition = LOWER_BOUND;
         systemEnabled = true;
@@ -613,6 +555,19 @@ void runStateMachine() {
       break;
     
     case CHOOSE_ACTIVE_TARGET:
+      if (autoMode) {
+        long pos = encoder.read();
+        if (pos < UPPER_BOUND) {
+          encoder.write(UPPER_BOUND);
+          pos = UPPER_BOUND;
+        }
+        if (pos > LOWER_BOUND) {
+          encoder.write(LOWER_BOUND);
+          pos = LOWER_BOUND;
+        }
+        lastKnownGoodPosition = pos;
+      }
+      
       activeTargetIndex = -1;
       closestZombieDist = 2.0;
 
@@ -636,12 +591,10 @@ void runStateMachine() {
         lastFineAdjustmentTime = 0;
         previousZombieDistance = zombieDistances[activeTargetIndex];
         
-        // Lane 4: limit switch mode
         if (activeTargetIndex == 3) {
           lane4LimitSwitchMode = true;
           lane4AtLimit = false;
           lane4LimitTime = 0;
-          Serial.println(F("Lane 4: limit switch mode"));
         } else {
           lane4LimitSwitchMode = false;
           lane4AtLimit = false;
@@ -650,11 +603,6 @@ void runStateMachine() {
         int percentToPhoto = (int)((1.0 - zombieDistances[activeTargetIndex]) * 100);
         
         if (activeTargetIndex != 3) {
-        Serial.print(F("Target: L"));
-        Serial.print(activeTargetIndex + 1);
-        Serial.print(F(" ("));
-        Serial.print(percentToPhoto);
-        Serial.println(F("%)"));
         }
         
         previousTargetIndex = activeTargetIndex;
@@ -668,10 +616,8 @@ void runStateMachine() {
         lastFineAdjustmentTime = 0;
         lane4LimitSwitchMode = false;
         lane4AtLimit = false;
-        Serial.println(F("No targets, wait pos"));
       }
       
-      // Lane 4: go to limit first
       if (lane4LimitSwitchMode) {
         desiredPosition = UPPER_BOUND;  // Go to right limit switch first
       } else {
@@ -683,32 +629,45 @@ void runStateMachine() {
       targetReached = false;
       stuckCounter = 0;
       positionRetryCount = 0;
+      voltageRampedForRetry = false;
+      retryStartTime = 0;
       currentState = MOVE_TO_TARGET;
       break;
     
     case MOVE_TO_TARGET:
       long currentPos = encoder.read();
       
-      // Clamp encoder at bounds - prevent reading beyond UPPER_BOUND or LOWER_BOUND
+      // Check for large jumps before movement - only if truly stationary
+      // Don't over-correct during leftward movement preparation
+      if (autoMode && lastKnownGoodPosition != 0 && abs(motorVelocity) < 3) {
+        long jump = abs(currentPos - lastKnownGoodPosition);
+        // Only correct very large jumps when stationary
+        if (jump > 100) {
+          encoder.write(lastKnownGoodPosition);
+          currentPos = lastKnownGoodPosition;
+        }
+      }
+      
       if (currentPos < UPPER_BOUND) {
         encoder.write(UPPER_BOUND);
         currentPos = UPPER_BOUND;
+        lastKnownGoodPosition = UPPER_BOUND;
       }
       if (currentPos > LOWER_BOUND) {
         encoder.write(LOWER_BOUND);
         currentPos = LOWER_BOUND;
+        lastKnownGoodPosition = LOWER_BOUND;
       }
       
-      // Lane 4: limit switch approach
       if (lane4LimitSwitchMode && activeTargetIndex == 3) {
         if (!lane4AtLimit) {
           if (rightPressed()) {
             lane4AtLimit = true;
             lane4LimitTime = millis();
-            Serial.println(F("Lane 4: at limit"));
             encoder.write(UPPER_BOUND);
             currentPos = UPPER_BOUND;
           }
+          // Force movement to right limit
           desiredPosition = UPPER_BOUND;
         }
         else if (millis() - lane4LimitTime < LANE4_LIMIT_HOLD_TIME) {
@@ -738,27 +697,22 @@ void runStateMachine() {
       
       long error = desiredPosition - currentPos;
       
-      // Prevent corrections beyond right limit - if at limit and trying to move right, stop
       if (rightPressed() && error < 0) {
         stopMotor();
         encoder.write(UPPER_BOUND);
         return;
       }
-      // Lane 4: Never exceed UPPER_BOUND
       if (activeTargetIndex == 3 && currentPos < UPPER_BOUND) {
         stopMotor();
         encoder.write(UPPER_BOUND);
         return;
       }
       
-      // Safety check - disabled during auto mode (right limit needed for Lane 4)
       if (!autoMode && !lane4LimitSwitchMode && currentPos < UPPER_BOUND - 50) {
-        Serial.println(F("Near right limit"));
         currentState = CHOOSE_ACTIVE_TARGET;
         break;
       }
       
-  // Hit detection - skip during lane 4 limit approach
       if (activeTargetIndex >= 0 && !WAIT_POS && !lane4LimitSwitchMode) {
         int targetDirection = ProxSensors[activeTargetIndex].direction;
         bool hitDetected = ProxSensors[activeTargetIndex].hitDetected;
@@ -768,7 +722,6 @@ void runStateMachine() {
         if (hitDetected && hitTime > 0) {
           // Confirm hit
           if (millis() - hitTime >= MIN_HIT_TIME) {
-            Serial.println(F("Target HIT"));
             // Reset hit detection for this sensor
             ProxSensors[activeTargetIndex].hitDetected = false;
             ProxSensors[activeTargetIndex].hitTime = 0;
@@ -788,7 +741,6 @@ void runStateMachine() {
           
           // Confirm hit
           if (millis() - targetHitTime >= MIN_HIT_TIME) {
-            Serial.println(F("Target HIT (dir)"));
             targetHitTime = 0;
             currentState = CHOOSE_ACTIVE_TARGET;
             break;
@@ -801,7 +753,6 @@ void runStateMachine() {
         if (prevDirection == FORWARD && 
             (targetDirection == BACKWARD || targetDirection == STOPPED)) {
           // Switch immediately
-          Serial.println(F("Target stopped"));
           currentState = CHOOSE_ACTIVE_TARGET;
           break;
         }
@@ -809,7 +760,6 @@ void runStateMachine() {
         // Switch if retreated far
         if (targetDirection == BACKWARD &&
             zombieDistances[activeTargetIndex] > 0.80) {
-          Serial.println(F("Target retreated"));
           currentState = CHOOSE_ACTIVE_TARGET;
           break;
         }
@@ -819,8 +769,6 @@ void runStateMachine() {
           if (i != activeTargetIndex &&
               ProxSensors[i].direction == FORWARD &&
               zombieDistances[i] < zombieDistances[activeTargetIndex] - 0.20) {
-            Serial.print(F("Closer: L"));
-            Serial.println(i + 1);
             currentState = CHOOSE_ACTIVE_TARGET;
             break;
           }
@@ -838,7 +786,6 @@ void runStateMachine() {
 
       // No forward zombies
       if (!hasForwardZombie && millis() - moveStartTime > 1000) {
-        Serial.println(F("No threats"));
         currentState = CHOOSE_ACTIVE_TARGET;
         break;
       }
@@ -848,7 +795,51 @@ void runStateMachine() {
       // Also check against original target for fine adjustment logic
       long errorToOriginalTarget = activeTargetPosition - currentPos;
       
-      // Early fine adjustment - prevent loops when stuck at lane 4
+      // Retry logic: After 2 seconds, increase voltage if error is too large
+      unsigned long moveDuration = millis() - moveStartTime;
+      if (moveDuration >= RETRY_TIME_THRESHOLD && abs(errorToOriginalTarget) > RETRY_LARGE_ERROR_THRESHOLD) {
+        if (!voltageRampedForRetry) {
+          voltageRampedForRetry = true;
+          retryStartTime = millis();
+        }
+      } else if (abs(errorToOriginalTarget) <= RETRY_LARGE_ERROR_THRESHOLD) {
+        voltageRampedForRetry = false;
+        retryStartTime = 0;
+      }
+      
+      // After 4 seconds, switch to next closest target if still too far
+      if (moveDuration >= TARGET_SWITCH_TIME && abs(errorToOriginalTarget) > RETRY_LARGE_ERROR_THRESHOLD) {
+        // Find next closest forward zombie
+        int nextTarget = -1;
+        float nextClosestDist = 2.0;
+        for (int i = 0; i < 4; i++) {
+          if (i != activeTargetIndex && 
+              ProxSensors[i].direction == FORWARD &&
+              zombieDistances[i] < nextClosestDist) {
+            nextClosestDist = zombieDistances[i];
+            nextTarget = i;
+          }
+        }
+        if (nextTarget >= 0) {
+          activeTargetIndex = nextTarget;
+          activeTargetPosition = targetPositions[nextTarget];
+          moveStartTime = millis();
+          voltageRampedForRetry = false;
+          retryStartTime = 0;
+          fineAdjustmentActive = false;
+          fineAdjustmentCount = 0;
+          if (activeTargetIndex == 3) {
+            lane4LimitSwitchMode = true;
+            lane4AtLimit = false;
+          } else {
+            lane4LimitSwitchMode = false;
+          }
+        } else {
+          currentState = CHOOSE_ACTIVE_TARGET;
+        }
+        break;
+      }
+      
       static long lastFineAdjustPosition = 0;
       static unsigned long lastFineAdjustPositionTime = 0;
       bool positionChanged = false;
@@ -860,8 +851,6 @@ void runStateMachine() {
         positionChanged = true;
       }
       bool notStuckAtLane4 = !(currentPos < -1200 && !positionChanged && abs(errorToOriginalTarget) > 3);
-      
-      // Early fine adjustment - DISABLED for Lane 4 to prevent oscillation
       if (activeTargetIndex >= 0 && activeTargetIndex != 3 &&
           !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
@@ -878,11 +867,10 @@ void runStateMachine() {
         
         fineAdjustmentCount++;
         lastFineAdjustmentTime = millis();
-        Serial.print(F("Fine adj: err="));
+        Serial.print(F("FA:"));
         Serial.print(errorToOriginalTarget);
-        Serial.print(F(" ("));
-        Serial.print(fineAdjustmentCount);
-        Serial.println(F("/3)"));
+        Serial.print(F("/"));
+        Serial.println(fineAdjustmentCount);
         
         fineAdjustmentActive = true;
         desiredPosition = fineAdjustmentTarget;
@@ -893,7 +881,6 @@ void runStateMachine() {
         if (WAIT_POS) {
           // At wait position
           if (hasForwardZombie) {
-            Serial.println(F("New threat"));
             currentState = CHOOSE_ACTIVE_TARGET;
           }
           // Otherwise stay put at wait position
@@ -905,14 +892,12 @@ void runStateMachine() {
             
             // Check hit
             if (hitDetected && hitTime > 0 && millis() - hitTime >= MIN_HIT_TIME) {
-              Serial.println(F("Target HIT"));
               ProxSensors[activeTargetIndex].hitDetected = false;
               ProxSensors[activeTargetIndex].hitTime = 0;
               currentState = CHOOSE_ACTIVE_TARGET;
             }
             // Check retreat
             else if (ProxSensors[activeTargetIndex].direction == BACKWARD) {
-              Serial.println(F("Target retreating"));
               currentState = CHOOSE_ACTIVE_TARGET;
             }
             // Fine positioning - DISABLED for Lane 4 to prevent oscillation
@@ -931,11 +916,6 @@ void runStateMachine() {
                 
                 fineAdjustmentCount++;
                 lastFineAdjustmentTime = millis();
-                Serial.print(F("Fine adj: err="));
-                Serial.print(errorToOriginalTarget);
-                Serial.print(F(" ("));
-                Serial.print(fineAdjustmentCount);
-                Serial.println(F("/3)"));
                 
                 fineAdjustmentActive = true;
                 desiredPosition = fineAdjustmentTarget;
@@ -943,7 +923,6 @@ void runStateMachine() {
               }
             }
             
-            // Continuous fine adjustment - DISABLED for Lane 4 to prevent oscillation
             else if (activeTargetIndex != 3 &&
                      ProxSensors[activeTargetIndex].direction == FORWARD && 
                      fineAdjustmentActive &&
@@ -952,20 +931,20 @@ void runStateMachine() {
                      abs(motorVelocity) < 25 &&
                      abs(errorToCurrentTarget) > 5 &&
                      !ProxSensors[activeTargetIndex].hitDetected &&
-                     (millis() - arrivalTime) >= 100) {
+                     (millis() - arrivalTime) >= 100 &&
+                     (millis() - arrivalTime) < 2000) {  // Timeout after 2 seconds
               
               fineAdjustmentTarget = activeTargetPosition;
               
               fineAdjustmentCount++;
               lastFineAdjustmentTime = millis();
-              Serial.print(F("Fine adj cont: err="));
-              Serial.print(errorToCurrentTarget);
-              Serial.print(F(" ("));
-              Serial.print(fineAdjustmentCount);
-              Serial.println(F("/3)"));
               
               desiredPosition = fineAdjustmentTarget;
               arrivalTime = millis();
+            }
+            else if (fineAdjustmentActive && (millis() - arrivalTime) >= 2000) {
+              fineAdjustmentActive = false;
+              fineAdjustmentCount = 0;
             }
             if (activeTargetIndex >= 0) {
               previousZombieDistance = zombieDistances[activeTargetIndex];
@@ -988,57 +967,64 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
-  // Clamp encoder reading at bounds - prevent reading beyond UPPER_BOUND or LOWER_BOUND
-  // This prevents the encoder from counting beyond the physical limits
   if (currentPosition < UPPER_BOUND) {
-    // Clamp to UPPER_BOUND if beyond (more negative)
     encoder.write(UPPER_BOUND);
     currentPosition = UPPER_BOUND;
+    lastKnownGoodPosition = UPPER_BOUND;
   }
   if (currentPosition > LOWER_BOUND) {
-    // Clamp to LOWER_BOUND if beyond (less negative/positive)
     encoder.write(LOWER_BOUND);
     currentPosition = LOWER_BOUND;
+    lastKnownGoodPosition = LOWER_BOUND;
   }
   
-  long adjustedDesiredPosition = desiredPosition;
-  // Disable momentum compensation when very close to target to prevent oscillation
-  long errorToTarget = abs(desiredPosition - currentPosition);
-  if (!fineAdjustmentActive && errorToTarget > 10) {
-    if (currentPosition > desiredPosition) {
-      adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
-    } else if (currentPosition < desiredPosition) {
-      adjustedDesiredPosition = desiredPosition - LEFTWARD_DRIFT_OFFSET;
+  // Quick drift check - only when truly stationary, not during movement
+  // During leftward movement, encoder readings can vary - don't interfere
+  if (autoMode && lastKnownGoodPosition != 0 && abs(motorVelocity) < 3 && currentState != MOVE_TO_TARGET) {
+    long positionChange = abs(currentPosition - lastKnownGoodPosition);
+    // Only correct large unexpected changes when truly stationary
+    if (positionChange > 100) {
+      encoder.write(lastKnownGoodPosition);
+      currentPosition = lastKnownGoodPosition;
     }
   }
   
-  float error = adjustedDesiredPosition - currentPosition;
+  // Remove drift offsets - they were causing systematic errors
+  // Drift is now handled by dedicated drift detection functions
+  float error = desiredPosition - currentPosition;
   
-  // Prevent any corrections that would try to move right (more negative) when at right limit
   if (rightPressed() && error < 0) {
     stopMotor();
     encoder.write(UPPER_BOUND);
     return;
   }
   
-  // Drift check is now handled by periodic mitigateDrift() function
-  // This immediate check is kept as a safety measure
-  if (currentState == MOVE_TO_TARGET && autoMode) {
-    if (currentPosition > 50) {
-      Serial.println(F("Position drift - immediate correction"));
-      // Try to correct by moving back
-      desiredPosition = LOWER_BOUND;
-      return;
-    }
-    if (currentPosition < UPPER_BOUND) {
-      encoder.write(UPPER_BOUND);
-      currentPosition = UPPER_BOUND;
+  // Immediate bounds enforcement - catch encoder glitches early
+  if (currentPosition < UPPER_BOUND) {
+    encoder.write(UPPER_BOUND);
+    currentPosition = UPPER_BOUND;
+    lastKnownGoodPosition = UPPER_BOUND;
+  }
+  if (currentPosition > LOWER_BOUND) {
+    encoder.write(LOWER_BOUND);
+    currentPosition = LOWER_BOUND;
+    lastKnownGoodPosition = LOWER_BOUND;
+  }
+  
+  // Detect large jumps - only when truly stationary, not during movement
+  // During leftward movement, encoder readings can vary slightly - don't over-correct
+  if (autoMode && lastKnownGoodPosition != 0) {
+    long jump = abs(currentPosition - lastKnownGoodPosition);
+    // Only correct if truly stationary and jump is very large (likely encoder glitch)
+    // Don't correct during active movement to avoid interfering with leftward motion
+    if (jump > 100 && abs(motorVelocity) < 5 && currentState != MOVE_TO_TARGET) {
+      encoder.write(lastKnownGoodPosition);
+      currentPosition = lastKnownGoodPosition;
     }
   }
   
   if (dynamicCalibrationActive) {
     desiredPosition = LOWER_BOUND;
-    adjustedDesiredPosition = LOWER_BOUND;
     error = desiredPosition - currentPosition;
     if (abs(error) > 10) {
       setMotor(constrain(error * 0.05, -2.0, 2.0));
@@ -1050,10 +1036,9 @@ void runMotionControl() {
   
   float originalError = desiredPosition - currentPosition;
   
-  // Lane 4: Use larger deadband to prevent oscillation, but allow movement
   bool isLane4 = (activeTargetIndex == 3);
-  int deadbandSize = isLane4 ? 5 : 3;  // Larger deadband for Lane 4
-  int hysteresisThreshold = isLane4 ? 8 : 5;  // Larger hysteresis for Lane 4
+  int deadbandSize = isLane4 ? 5 : 3;
+  int hysteresisThreshold = isLane4 ? 8 : 5;
   
   static bool inDeadband = false;
   static unsigned long lastMoveStart = 0;
@@ -1092,23 +1077,15 @@ void runMotionControl() {
     adaptiveLearning = false;
     if (!targetReached) {
       targetReached = true;
-      Serial.print(F("At "));
-      Serial.print(currentPosition);
-      Serial.print(F(" err="));
-      Serial.println(originalError);
     }
     return;
   }
 
   targetReached = false;
 
-  // Retry logic - skip if within deadband
   if (abs(originalError) > 3 && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
-    // Check if stuck
     if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
-      Serial.print(F("Stuck err="));
-      Serial.println(abs(originalError));
 
       errorIntegral = 0;
       lastError = 0;
@@ -1130,8 +1107,6 @@ void runMotionControl() {
     
     // Direction
     bool movingRight = (error < 0);
-    Serial.print(F("Learning friction "));
-    Serial.println(movingRight ? F("R") : F("L"));
   }
   
   if (adaptiveLearning) {
@@ -1150,9 +1125,6 @@ void runMotionControl() {
         FRICTION_RIGHT = adaptiveFrictionVoltage;
       }
       
-      Serial.print(F("Friction: "));
-      Serial.print(adaptiveFrictionVoltage, 2);
-      Serial.println(F("V"));
       
       adaptiveLearning = false;
       adaptiveLearned = true;
@@ -1168,7 +1140,6 @@ void runMotionControl() {
         adaptiveStartTime = millis();
         lastAdaptivePosition = currentPosition;
       if (adaptiveFrictionVoltage > 4.5) {
-        Serial.println(F("Max friction"));
         adaptiveFrictionVoltage = 2.5;
         adaptiveLearning = false;
         adaptiveLearned = true;
@@ -1183,7 +1154,6 @@ void runMotionControl() {
       }
     }
     if (elapsed > 2000) {
-      Serial.println(F("Friction timeout"));
       adaptiveLearning = false;
       adaptiveLearned = true;
       adaptiveFrictionVoltage = 2.0;
@@ -1200,8 +1170,6 @@ void runMotionControl() {
     return;
   }
   
-  // Skip PID correction if error is within deadband
-  // Note: Lane 4 already handled above with early return
   if (abs(error) <= 3) {
     stopMotor();
     lastError = 0;  // Reset to prevent derivative spikes
@@ -1210,9 +1178,6 @@ void runMotionControl() {
   
   float dt = CONTROL_PERIOD / 1000.0;
   
-  // PID CONTROL - uses EEPROM values
-  
-  // Adaptive PID gains - reduce aggressiveness when close to target, especially for Lane 4
   if (abs(error) > 1000) {
     if (isLane4) {
       KP_active = KP * 2.0;  // More conservative for Lane 4
@@ -1257,7 +1222,6 @@ void runMotionControl() {
       KD_active = KD * 1.2;
     }
   } else if (abs(error) > 10) {
-    // Reduced gains when close to target to prevent oscillation
     if (isLane4) {
       KP_active = KP * 0.5;  // Very conservative for Lane 4
       KI_active = KI * 0.2;
@@ -1269,9 +1233,8 @@ void runMotionControl() {
     }
     errorIntegral += error * dt;
     errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
-  } else {
-    // Very close - minimal gains
-    if (isLane4) {
+    } else {
+      if (isLane4) {
       KP_active = KP * 0.2;  // Very low for Lane 4
       KI_active = 0;
       KD_active = KD * 3.0;  // Very high damping
@@ -1280,22 +1243,14 @@ void runMotionControl() {
       KI_active = 0;
       KD_active = KD * 2.0;
     }
-    errorIntegral = 0;  // Reset integral
+    errorIntegral = 0;
   }
-  
   float errorDerivative = (error - lastError) / dt;
-  
-  float pidVoltage = (KP_active * error) +
-                     (KI_active * errorIntegral) +
-                     (KD_active * errorDerivative);
-  
-  // Momentum compensation - disabled when very close to target, especially for Lane 4
+  float pidVoltage = (KP_active * error) + (KI_active * errorIntegral) + (KD_active * errorDerivative);
   float momentumCompensation = 1.0;
   if (isLane4 && abs(error) <= 20) {
-    // Lane 4: disable momentum compensation when close to prevent oscillation
     momentumCompensation = 1.0;
   } else if (abs(error) <= 10) {
-    // Disable momentum compensation when very close to prevent oscillation
     momentumCompensation = 1.0;
   } else if (abs(error) > 200) {
     momentumCompensation = 1.0;
@@ -1310,15 +1265,15 @@ void runMotionControl() {
   }
   
   pidVoltage *= momentumCompensation;
-
-  // FRICTION COMPENSATION - higher on right side (lane 4)
-  // Skip friction compensation if within deadband
   float frictionComp = 0;
   if (abs(error) > 3) {
     bool movingTowardMoreNegative = (error < 0);
     float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float positionFrictionBoost = 1.0;
-    if (currentPosition < -1200) {
+    
+    if (isLane4 && abs(error) > 200) {
+      positionFrictionBoost = 3.0;
+    } else if (currentPosition < -1200) {
       float lane4Factor = (currentPosition + 1200) / -224.0;
       lane4Factor = constrain(lane4Factor, 0.0, 1.0);
       positionFrictionBoost = 2.0 + (lane4Factor * 2.0);
@@ -1360,7 +1315,6 @@ void runMotionControl() {
   }
 
   float velocityFF = 0;
-  // Fine adjustment boost - disabled when very close
   float fineAdjustmentBoost = 0;
   if (fineAdjustmentActive && abs(error) > 3 && abs(error) <= 5 && abs(motorVelocity) < 15) {
     float boostMultiplier = 1.2;
@@ -1368,23 +1322,28 @@ void runMotionControl() {
     fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);
   }
 
-  // Total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
-
-  // Voltage capping - 9V nominal, limit large moves to prevent slamming
-  float voltageLimit = 9.0;
+  float voltageLimit = 9.5;
   long absErr = abs(error);
-  if (absErr > 1000) voltageLimit = 7.0;
-  else if (absErr > 800) voltageLimit = 7.5;
-  else if (absErr > 500) voltageLimit = 8.0;
-  else if (absErr > 300) voltageLimit = 7.5;
-  else if (absErr > 100) voltageLimit = 7.0;
-  else if (absErr > 50) voltageLimit = 6.0;
-  else voltageLimit = 5.0;
-
+  
+  float retryMultiplier = 1.0;
+  if (voltageRampedForRetry && retryStartTime > 0) {
+    unsigned long retryDuration = millis() - retryStartTime;
+    if (retryDuration > 1000) retryMultiplier = 1.3;
+    else retryMultiplier = 1.15;
+  }
+  
+  if (absErr > 1000) voltageLimit = 9.0;
+  else if (absErr > 800) voltageLimit = 9.0;
+  else if (absErr > 500) voltageLimit = 9.0;
+  else if (absErr > 300) voltageLimit = 8.5;
+  else if (absErr > 100) voltageLimit = 8.0;
+  else if (absErr > 50) voltageLimit = 7.5;
+  else voltageLimit = 7.0;
+  
+  voltageLimit *= retryMultiplier;
+  voltageLimit = min(voltageLimit, 9.5);
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
-
-  // Limit switch protection - slow down before hitting limits
   if (currentState == MOVE_TO_TARGET && autoMode) {
     bool isLargeMove = (absErr > 1000);
     int leftSlowdownDistance = isLargeMove ? 200 : 100;
@@ -1399,7 +1358,6 @@ void runMotionControl() {
         return;
       }
     }
-    // Right limit slowdown disabled during Lane 4 limit switch mode (need to reach limit)
     if (!lane4LimitSwitchMode) {
       int rightSlowdownDistance = isLargeMove ? 200 : 100;
       if (error < 0 && currentPosition < (UPPER_BOUND + rightSlowdownDistance)) {
@@ -1413,13 +1371,10 @@ void runMotionControl() {
     }
   }
 
-  // Anti-windup on zero crossing
   if ((error != 0) && (error * lastError < 0)) {
     errorIntegral *= 0.5;
   }
 
-  // Stuck detection with voltage ramping
-  // Skip stuck detection if within deadband
   unsigned long currentTime = millis();
   if (abs(originalError) > 3) {
     if (currentTime - lastStuckCheckTime >= 150) {
@@ -1463,8 +1418,6 @@ void runMotionControl() {
     voltageRamping = false;
   }
 
-  // Ensure minimum voltage for error correction
-  // Skip if within deadband
   if (abs(originalError) > 3 && !voltageRamping) {
     bool movingRight = (error < 0);
     float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
@@ -1479,15 +1432,12 @@ void runMotionControl() {
     }
   }
 
-  // Final check: prevent moving right (more negative) when at right limit
-  // Also prevent exceeding UPPER_BOUND (Lane 4 already handled with early return above)
   if (rightPressed() && totalVoltage < 0) {
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
     return;
   }
-  // Prevent exceeding UPPER_BOUND
   if (currentPosition < UPPER_BOUND) {
     stopMotor();
     encoder.write(UPPER_BOUND);
@@ -1515,7 +1465,6 @@ void setMotor(float voltage) {
   bool enabled = isSwitchEnabled();
   if (!enabled) {
     if (lastSwitchState != enabled) {
-      Serial.println(F("Flip switch OFF - motor disabled"));
     }
     lastSwitchState = enabled;
     digitalWrite(MOTOR_IN2, LOW);
@@ -1524,7 +1473,6 @@ void setMotor(float voltage) {
     return;
   }
   if (lastSwitchState != enabled) {
-    Serial.println(F("Flip switch ON - motor enabled"));
   }
   lastSwitchState = enabled;
 
@@ -1566,60 +1514,101 @@ void mitigateDrift() {
   
   long currentPos = encoder.read();
   
-  // Check if position is beyond physical bounds
+  // Immediate bounds check - catch extreme encoder glitches
   if (currentPos < UPPER_BOUND) {
-    // Beyond right limit - clamp to UPPER_BOUND
     encoder.write(UPPER_BOUND);
-    Serial.println(F("Drift: clamped to UPPER_BOUND"));
     lastDriftCheckPosition = UPPER_BOUND;
+    lastKnownGoodPosition = UPPER_BOUND;
     return;
   }
   if (currentPos > LOWER_BOUND) {
-    // Beyond left limit - clamp to LOWER_BOUND
     encoder.write(LOWER_BOUND);
-    Serial.println(F("Drift: clamped to LOWER_BOUND"));
     lastDriftCheckPosition = LOWER_BOUND;
+    lastKnownGoodPosition = LOWER_BOUND;
     return;
   }
   
-  // Check for gradual drift when not moving
-  if (currentState == CHOOSE_ACTIVE_TARGET || (currentState == MOVE_TO_TARGET && abs(motorVelocity) < 5)) {
-    // Only check drift when stationary or choosing target
-    if (lastDriftCheckPosition != 0) {
-      long driftAmount = abs(currentPos - lastDriftCheckPosition);
-      
-      if (driftAmount > MAX_DRIFT_THRESHOLD) {
-        // Significant drift detected
-        Serial.print(F("Drift detected: "));
-        Serial.print(driftAmount);
-        Serial.print(F(" counts from "));
-        Serial.print(lastDriftCheckPosition);
-        Serial.print(F(" to "));
-        Serial.println(currentPos);
-        
-        // If drift is very large, consider re-homing
-        if (driftAmount > 100 || currentPos > 50) {
-          Serial.println(F("Large drift - rehoming..."));
-          if (homeToLeftLimit()) {
-            Serial.println(F("Rehomed after drift"));
-            lastDriftCheckPosition = 0;  // Reset after rehome
-            return;
-          }
-        } else {
-          // Small drift - correct encoder value back
-          encoder.write(lastDriftCheckPosition);
-          Serial.print(F("Corrected drift to "));
-          Serial.println(lastDriftCheckPosition);
-          currentPos = lastDriftCheckPosition;
+  // Check for large jumps (encoder glitches) - only when truly stationary
+  // During leftward movement, don't over-correct small variations
+  if (lastKnownGoodPosition != 0) {
+    long jump = abs(currentPos - lastKnownGoodPosition);
+    // Only correct large jumps when truly stationary (not during movement)
+    if (jump > 150 && abs(motorVelocity) < 5) {
+      encoder.write(lastKnownGoodPosition);
+      currentPos = lastKnownGoodPosition;
+      return;
+    }
+  }
+  
+  // Drift detection - only check when stationary to avoid interfering with movement
+  bool isStationary = (currentState == CHOOSE_ACTIVE_TARGET || abs(motorVelocity) < 3);
+  if (isStationary && lastDriftCheckPosition != 0) {
+    long driftAmount = abs(currentPos - lastDriftCheckPosition);
+    // Check direction of drift - leftward movement should increase encoder value
+    long driftDirection = currentPos - lastDriftCheckPosition;
+    
+    // Only correct if drift is significant and in wrong direction when stationary
+    if (driftAmount > MAX_DRIFT_THRESHOLD) {
+      // Only rehome for extreme cases
+      if (driftAmount > 500 || currentPos > 100 || currentPos < UPPER_BOUND - 100) {
+        if (homeToLeftLimit()) {
+          loadCalibrationFromEEPROM();
+          lastDriftCheckPosition = 0;
+          lastKnownGoodPosition = 0;
+          return;
         }
+      } else {
+        // Small drift when stationary - correct it
+        encoder.write(lastDriftCheckPosition);
+        currentPos = lastDriftCheckPosition;
       }
     }
-    
-    // Update last known good position
+  }
+  
+  // Only update reference positions when truly stationary
+  // This prevents locking in incorrect positions during movement
+  if (isStationary) {
     lastDriftCheckPosition = currentPos;
-  } else {
-    // Moving - update reference position
-    lastDriftCheckPosition = currentPos;
+    lastKnownGoodPosition = currentPos;
+  }
+  // Don't update during movement - wait until stationary to establish new reference
+}
+
+// POSITION VALIDATION
+void validatePosition() {
+  if (!autoMode || dynamicCalibrationActive) return;
+  
+  long currentPos = encoder.read();
+  
+  // Always enforce bounds
+  if (currentPos < UPPER_BOUND) {
+    encoder.write(UPPER_BOUND);
+    currentPos = UPPER_BOUND;
+    lastKnownGoodPosition = UPPER_BOUND;
+    return;
+  }
+  if (currentPos > LOWER_BOUND) {
+    encoder.write(LOWER_BOUND);
+    currentPos = LOWER_BOUND;
+    lastKnownGoodPosition = LOWER_BOUND;
+    return;
+  }
+  
+  // Detect large jumps - only when truly stationary
+  // During leftward movement, encoder readings can vary - don't over-correct
+  if (lastKnownGoodPosition != 0) {
+    long positionJump = abs(currentPos - lastKnownGoodPosition);
+    // Only correct large jumps when stationary (not during active movement)
+    if (positionJump > 100 && abs(motorVelocity) < 5) {
+      encoder.write(lastKnownGoodPosition);
+      currentPos = lastKnownGoodPosition;
+    }
+  }
+  
+  // Only update reference position when stationary
+  // This prevents incorrect positions from being locked in during movement
+  if (abs(motorVelocity) < 5) {
+    lastKnownGoodPosition = currentPos;
   }
 }
 
@@ -1645,24 +1634,19 @@ void checkLimitSwitches() {
     }
     
     errorIntegral = 0;
-    Serial.println(F("Recal at left"));
   }
   
-  // Right limit switch: clamp encoder if accidentally hit (not during Lane 4)
-  // During Lane 4, the limit switch is used intentionally, so don't interfere
   if (digitalRead(LIMIT_RIGHT) == HIGH && 
       !lane4LimitSwitchMode && 
       !lane4AtLimit &&
       currentState == MOVE_TO_TARGET &&
       abs(motorVelocity) < 10) {
-    // Accidentally hit right limit - clamp encoder to UPPER_BOUND
     long currentPos = encoder.read();
     if (currentPos < UPPER_BOUND) {
       encoder.write(UPPER_BOUND);
       errorIntegral = 0;
     }
   }
-  // Left limit switch: clamp encoder to LOWER_BOUND
   if (digitalRead(LIMIT_LEFT) == HIGH && 
       currentState == MOVE_TO_TARGET &&
       abs(motorVelocity) < 10) {
@@ -1684,11 +1668,10 @@ bool rightPressed() {
 
 // HOMING
 bool homeToLeftLimit() {
-  Serial.println(F("\nHoming..."));
-
+  // CRITICAL: Lane positions are NEVER modified during homing
+  // They remain as loaded from EEPROM
+  
   if (leftPressed()) {
-    Serial.println(F("At limit"));
-
     // Hold at limit
     long lastPos = encoder.read();
     unsigned long holdStart = millis();
@@ -1723,13 +1706,14 @@ bool homeToLeftLimit() {
     // Verify encoder is actually zeroed
     long finalPos = encoder.read();
     if (abs(finalPos) > 2) {
-      Serial.print(F("⚠️  Warning: Encoder not zeroed, reading: "));
-      Serial.println(finalPos);
-      encoder.write(0);  // Try one more time
+      encoder.write(0);
       delay(50);
     }
 
-  Serial.println(F("Homed"));
+    // CRITICAL: Reload lane positions from EEPROM after homing
+    // This ensures they're never modified
+    loadCalibrationFromEEPROM();
+    
     return true;
   }
 
@@ -1743,7 +1727,6 @@ bool homeToLeftLimit() {
   }
 
   if (leftPressed()) {
-    Serial.println(F("Contact"));
 
     // Hold at limit
     long currentPos = encoder.read();
@@ -1780,13 +1763,10 @@ bool homeToLeftLimit() {
     // Verify encoder is actually zeroed
     long finalPos = encoder.read();
     if (abs(finalPos) > 2) {
-      Serial.print(F("⚠️  Warning: Encoder not zeroed, reading: "));
-      Serial.println(finalPos);
       encoder.write(0);  // Try one more time
       delay(50);
     }
 
-  Serial.println(F("Homed"));
     return true;
   } else {
     stopMotor();
@@ -1796,12 +1776,196 @@ bool homeToLeftLimit() {
 }
 
 
+void characterizeFriction() {
+  
+  stopMotor();
+  delay(500);
+  
+  // Home to left limit first
+  if (!homeToLeftLimit()) {
+    return;
+  }
+  
+  delay(500);
+  
+  float measurements[3];
+  int measurementCount = 0;
+  
+  for (int attempt = 0; attempt < 3; attempt++) {
+    float testVoltage = 0.5;
+    bool motionDetected = false;
+    
+    while (!motionDetected && testVoltage < 8.0) {
+      long startPos = encoder.read();
+      setMotor(-testVoltage);  // Negative = RIGHT
+      delay(400);
+      long endPos = encoder.read();
+      setMotor(0);
+      delay(300);
+      
+      long movement = abs(endPos - startPos);
+      
+      if (movement > 15) {
+        motionDetected = true;
+        measurements[measurementCount] = testVoltage - 0.15;  // Safety margin
+        measurementCount++;
+        
+        if (!homeToLeftLimit()) return;
+        delay(1000);
+        break;
+      } else {
+        testVoltage += 0.2;
+      }
+    }
+  }
+  
+  if (measurementCount < 2) {
+    return;
+  }
+  
+  // Calculate average, rejecting outliers
+  float sum = 0;
+  for (int i = 0; i < measurementCount; i++) {
+    sum += measurements[i];
+  }
+  float avg = sum / measurementCount;
+  
+  // Calculate standard deviation
+  float variance = 0;
+  for (int i = 0; i < measurementCount; i++) {
+    variance += (measurements[i] - avg) * (measurements[i] - avg);
+  }
+  float stdDev = sqrt(variance / measurementCount);
+  
+  // Use median if high variance (outlier rejection)
+  if (stdDev > 0.3) {
+    // Simple bubble sort for median
+    for (int i = 0; i < measurementCount - 1; i++) {
+      for (int j = 0; j < measurementCount - i - 1; j++) {
+        if (measurements[j] > measurements[j + 1]) {
+          float temp = measurements[j];
+          measurements[j] = measurements[j + 1];
+          measurements[j + 1] = temp;
+        }
+      }
+    }
+    FRICTION_LEFT = measurements[measurementCount / 2];  // Median
+  } else {
+    FRICTION_LEFT = avg;
+  }
+  
+  float driveRight = -max(FRICTION_LEFT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+  setMotor(driveRight);
+  unsigned long driveStart = millis();
+  while (digitalRead(LIMIT_RIGHT) == LOW) {
+    if (millis() - driveStart > 15000) {
+      setMotor(0);
+      return;
+    }
+    delay(10);
+  }
+  // Hold briefly on right limit
+  unsigned long holdStart = millis();
+  float holdRight = -max(FRICTION_LEFT, CALIBRATE_MIN_VOLTAGE - 0.5);
+  while (millis() - holdStart < CALIBRATE_HOLD_TIME) {
+    setMotor(holdRight);
+    delay(10);
+  }
+  setMotor(0);
+  delay(500);
+  
+  
+  measurementCount = 0;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    float testVoltage = 0.5;
+    bool motionDetected = false;
+    
+    while (!motionDetected && testVoltage < 8.0) {
+      long startPos = encoder.read();
+      setMotor(testVoltage);  // Positive = LEFT
+      delay(400);
+      long endPos = encoder.read();
+      setMotor(0);
+      delay(300);
+      
+      long movement = abs(endPos - startPos);
+      
+      if (movement > 15) {
+        motionDetected = true;
+        measurements[measurementCount] = testVoltage - 0.15;
+        measurementCount++;
+        
+        // Return to right limit
+        driveRight = -max(FRICTION_LEFT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+        setMotor(driveRight);
+        driveStart = millis();
+        while (digitalRead(LIMIT_RIGHT) == LOW && millis() - driveStart < 15000) {
+          delay(10);
+        }
+        setMotor(0);
+        delay(1000);
+        break;
+      } else {
+        testVoltage += 0.2;
+      }
+    }
+  }
+  
+  if (measurementCount < 2) {
+    return;
+  }
+  
+  // Calculate average with outlier rejection
+  sum = 0;
+  for (int i = 0; i < measurementCount; i++) {
+    sum += measurements[i];
+  }
+  avg = sum / measurementCount;
+  
+  variance = 0;
+  for (int i = 0; i < measurementCount; i++) {
+    variance += (measurements[i] - avg) * (measurements[i] - avg);
+  }
+  stdDev = sqrt(variance / measurementCount);
+  
+  if (stdDev > 0.3) {
+    // Median
+    for (int i = 0; i < measurementCount - 1; i++) {
+      for (int j = 0; j < measurementCount - i - 1; j++) {
+        if (measurements[j] > measurements[j + 1]) {
+          float temp = measurements[j];
+          measurements[j] = measurements[j + 1];
+          measurements[j + 1] = temp;
+        }
+      }
+    }
+    FRICTION_RIGHT = measurements[measurementCount / 2];
+  } else {
+    FRICTION_RIGHT = avg;
+  }
+  
+  // Update adaptive friction values
+  adaptiveFrictionLeft = FRICTION_LEFT;
+  adaptiveFrictionRight = FRICTION_RIGHT;
+  
+  // Save to EEPROM
+  saveFrictionToEEPROM();
+  
+  Serial.print(FRICTION_LEFT, 1);
+  Serial.print(F(" "));
+  Serial.println(FRICTION_RIGHT, 1);
+  
+  // Return home - lane positions preserved via loadCalibrationFromEEPROM in homeToLeftLimit
+  homeToLeftLimit();
+}
+
 // EEPROM
 void loadCalibrationFromEEPROM() {
+  // CRITICAL: This function preserves lane positions from EEPROM
+  // It should be called after any homing or range finding operation
   byte flag = EEPROM.read(EEPROM_FLAG);
   if (flag != 0xAA) {
-    Serial.println(F("EEPROM empty"));
-    return;
+    return;  // Don't print during auto operations
   }
 
   EEPROM.get(EEPROM_KP, KP);
@@ -1813,6 +1977,8 @@ void loadCalibrationFromEEPROM() {
   adaptiveFrictionLeft = FRICTION_LEFT;
   adaptiveFrictionRight = FRICTION_RIGHT;
 
+  // CRITICAL: Always reload lane positions from EEPROM
+  // This ensures they're never modified by homing or range finding
   for (int i = 0; i < 4; i++) {
     long v;
     EEPROM.get(EEPROM_LANES_BASE + i * sizeof(long), v);
@@ -1824,8 +1990,6 @@ void loadCalibrationFromEEPROM() {
   TARGET_3_POSITION = targetPositions[2];
   TARGET_4_POSITION = targetPositions[3];
   WAIT_POSITION = TARGET_3_POSITION;
-
-  Serial.println(F("EEPROM OK"));
 }
 
 void saveTargetsToEEPROM() {
@@ -1833,7 +1997,6 @@ void saveTargetsToEEPROM() {
   for (int i = 0; i < 4; i++) {
     EEPROM.put(EEPROM_LANES_BASE + i * sizeof(long), targetPositions[i]);
   }
-  Serial.println(F("OK"));
 }
 
 void savePIDToEEPROM() {
@@ -1841,25 +2004,23 @@ void savePIDToEEPROM() {
   EEPROM.put(EEPROM_KP, KP);
   EEPROM.put(EEPROM_KI, KI);
   EEPROM.put(EEPROM_KD, KD);
-  Serial.println(F("OK"));
 }
 
 void saveFrictionToEEPROM() {
   EEPROM.write(EEPROM_FLAG, 0xAA);
   EEPROM.put(EEPROM_FRICTION_LEFT, FRICTION_LEFT);
   EEPROM.put(EEPROM_FRICTION_RIGHT, FRICTION_RIGHT);
-  Serial.println(F("OK"));
 }
 
 // MANUAL CALIBRATION
 void manualCalibration() {
-  Serial.println(F("\nMANUAL CAL"));
+  Serial.println(F("\nMAN CAL"));
   bool wasEnabled = systemEnabled;
   bool wasAuto = autoMode;
   systemEnabled = false;
   autoMode = false;
   stopMotor();
-  Serial.println(F("R=Right L=Left S=Stop 1-4=Save Q=Quit\n"));
+  Serial.println(F("R/L/S 1-4=Save Q=Quit\n"));
   
   while (true) {
     if (Serial.available()) {
@@ -1873,15 +2034,12 @@ void manualCalibration() {
       switch (cmd) {
         case 'R':
           setMotor(-3.5);
-          Serial.println(F("Right"));
           break;
         case 'L':
           setMotor(3.5);
-          Serial.println(F("Left"));
           break;
         case 'S':
           stopMotor();
-          Serial.print(F("Stop: "));
           Serial.println(pos);
           break;
           
@@ -1889,7 +2047,6 @@ void manualCalibration() {
           stopMotor();
           TARGET_1_POSITION = pos;
           targetPositions[0] = pos;
-          Serial.print(F("✓ Lane 1 = "));
           Serial.println(TARGET_1_POSITION);
           break;
           
@@ -1897,7 +2054,6 @@ void manualCalibration() {
           stopMotor();
           TARGET_2_POSITION = pos;
           targetPositions[1] = pos;
-          Serial.print(F("✓ Lane 2 = "));
           Serial.println(TARGET_2_POSITION);
           break;
           
@@ -1906,7 +2062,6 @@ void manualCalibration() {
           TARGET_3_POSITION = pos;
           targetPositions[2] = pos;
           WAIT_POSITION = TARGET_3_POSITION;
-          Serial.print(F("✓ Lane 3 = "));
           Serial.println(TARGET_3_POSITION);
           break;
           
@@ -1914,20 +2069,17 @@ void manualCalibration() {
           stopMotor();
           TARGET_4_POSITION = pos;
           targetPositions[3] = pos;
-          Serial.print(F("✓ Lane 4 = "));
           Serial.println(TARGET_4_POSITION);
           break;
           
         case 'Q':
           stopMotor();
-          Serial.println(F("\nCalibration done\n"));
-          Serial.print(F("T1="));
           Serial.print(TARGET_1_POSITION);
-          Serial.print(F(" T2="));
+          Serial.print(F(" "));
           Serial.print(TARGET_2_POSITION);
-          Serial.print(F(" T3="));
+          Serial.print(F(" "));
           Serial.print(TARGET_3_POSITION);
-          Serial.print(F(" T4="));
+          Serial.print(F(" "));
           Serial.println(TARGET_4_POSITION);
 
           saveTargetsToEEPROM();
@@ -1956,8 +2108,7 @@ void processCommand() {
   switch (cmd) {
     case 'G':
       if (!autoMode) {
-        Serial.println(F("\nAUTO MODE"));
-        Serial.println(F("Bounds: will be set after calibration\n"));
+        Serial.println(F("\nAUTO"));
 
           stopMotor();
           delay(200);
@@ -1976,7 +2127,9 @@ void processCommand() {
           dynamicCalibrationActive = false;
           // Initialize drift check
           lastDriftCheckPosition = encoder.read();
+          lastKnownGoodPosition = encoder.read();
           lastDriftCheckTime = millis();
+          lastPositionValidationTime = millis();
           
           currentState = CALIBRATE;
           errorIntegral = 0;
@@ -2006,15 +2159,13 @@ void processCommand() {
           
           targetHitTime = 0;
 
-          Serial.println(F("Homed"));
         } else {
-          Serial.println(F("Homing failed\n"));
         }
       }
       break;
     
     case 'S':
-      Serial.println(F("\nSTOP\n"));
+      Serial.println(F("\nSTOP"));
       autoMode = false;
       systemEnabled = false;
       dynamicCalibrationActive = false;
@@ -2031,7 +2182,6 @@ void processCommand() {
         systemEnabled = true;
         lastPrintTime = 0;
       } else {
-        Serial.println(F("\nStop auto mode first\n"));
       }
       break;
     
@@ -2059,6 +2209,13 @@ void processCommand() {
       continuousMonitor();
       break;
     
+    case 'F':
+      if (!autoMode) {
+        characterizeFriction();
+      } else {
+      }
+      break;
+
     case 'R':
       adaptiveFrictionVoltage = 0;
       adaptiveLearning = false;
@@ -2078,7 +2235,6 @@ void processCommand() {
       saveTargetsToEEPROM();
       savePIDToEEPROM();
       saveFrictionToEEPROM();
-      Serial.println(F("OK"));
       break;
 
     default:
@@ -2102,135 +2258,63 @@ void setTargetLane(int lane) {
   long currentPos = encoder.read();
   long error = desiredPosition - currentPos;
   
-  Serial.print(F("\nL"));
-  Serial.print(lane);
-  Serial.print(F(": "));
   Serial.print(currentPos);
-  Serial.print(F("->"));
+  Serial.print(F(" "));
   Serial.print(desiredPosition);
-  Serial.print(F(" err="));
+  Serial.print(F(" "));
   Serial.println(error);
 }
 
 // DISPLAY
 void printWelcome() {
-  Serial.println(F("\nPLANTS VS ZOMBIES"));
 }
 
 void printHelp() {
-  Serial.println(F("\nCmds: C Z G S 1-4 P D M R L W H"));
+  Serial.println(F("\nCmds: C Z G S 1-4 P D M R L W H F"));
 }
 
 void printCompactStatus() {
-  long pos = encoder.read();
-  
-  Serial.print(F("State:"));
-  switch(currentState) {
-    case CALIBRATE: Serial.print(F("CAL")); break;
-    case FIND_RANGE: Serial.print(F("RANGE")); break;
-    case CHOOSE_ACTIVE_TARGET: Serial.print(F("CHOOSE")); break;
-    case MOVE_TO_TARGET: Serial.print(F("MOVE")); break;
-  }
-  
-  Serial.print(F(" | Pos:"));
-  Serial.print(pos);
-  Serial.print(F("→"));
+  Serial.print(encoder.read());
+  Serial.print(F(" "));
   Serial.print(desiredPosition);
-  Serial.print(F(" | Active:"));
-  if (activeTargetIndex >= 0) {
-    Serial.print(activeTargetIndex + 1);
-  } else {
-    Serial.print(F("-"));
-  }
-  
-  Serial.print(F(" | Zombies: "));
+  Serial.print(F(" "));
+  Serial.print(activeTargetIndex >= 0 ? activeTargetIndex + 1 : 0);
   for (int i = 0; i < 4; i++) {
-    if (ProxSensors[i].direction == FORWARD) {
-      Serial.print(F("▶"));
-    } else if (ProxSensors[i].direction == BACKWARD) {
-      Serial.print(F("◀"));
-    } else {
-      Serial.print(F("■"));
-    }
-    
-    int percentToPhoto = (int)((1.0 - zombieDistances[i]) * 100);
-    Serial.print(percentToPhoto);
-    Serial.print(F("% "));
+    Serial.print(F(" "));
+    Serial.print((int)((1.0 - zombieDistances[i]) * 100));
   }
   Serial.println();
 }
 
 void printStatus() {
-  long currentPos = encoder.read();
-  float error = desiredPosition - currentPos;
-  Serial.println(F("\nSTATUS"));
-  Serial.print(F("Mode: "));
-  Serial.println(autoMode ? F("AUTO") : F("MAN"));
-  Serial.print(F("State: "));
-  switch(currentState) {
-    case CALIBRATE: Serial.println(F("CAL")); break;
-    case FIND_RANGE: Serial.println(F("RNG")); break;
-    case CHOOSE_ACTIVE_TARGET: Serial.println(F("CHS")); break;
-    case MOVE_TO_TARGET: Serial.println(F("MOV")); break;
-  }
-  Serial.print(F("Pos: "));
-  Serial.print(currentPos);
-  Serial.print(F(" Tgt: "));
+  long p = encoder.read();
+  Serial.print(autoMode ? F("A") : F("M"));
+  Serial.print(F(" "));
+  Serial.print(p);
+  Serial.print(F(" "));
   Serial.print(desiredPosition);
-  Serial.print(F(" Err: "));
-  Serial.println((int)error);
-  Serial.print(F("Vel: "));
+  Serial.print(F(" "));
+  Serial.print((int)(desiredPosition - p));
+  Serial.print(F(" "));
   Serial.print((int)motorVelocity);
-  Serial.println(F(" cnt/s"));
-  Serial.print(F("Range: "));
-  Serial.print(LOWER_BOUND);
-  Serial.print(F(" to "));
-  Serial.println(UPPER_BOUND);
-  Serial.print(F("Target: "));
-  Serial.println(activeTargetIndex >= 0 ? activeTargetIndex + 1 : 0);
-  Serial.print(F("PID: Kp="));
-  Serial.print(KP, 4);
-  Serial.print(F(" Ki="));
-  Serial.print(KI, 4);
-  Serial.print(F(" Kd="));
-  Serial.println(KD, 4);
-  Serial.print(F("Friction: L="));
-  Serial.print(FRICTION_LEFT, 2);
-  Serial.print(F(" R="));
-  Serial.println(FRICTION_RIGHT, 2);
+  Serial.print(F(" "));
+  Serial.print(activeTargetIndex >= 0 ? activeTargetIndex + 1 : 0);
   Serial.println();
 }
 
 void printAllSensors() {
-  Serial.println(F("\nSENSORS"));
-  Serial.print(F("Enc: "));
-  Serial.println(encoder.read());
-  Serial.print(F("Limits: L="));
+  Serial.print(encoder.read());
+  Serial.print(F(" "));
   Serial.print(leftPressed() ? 1 : 0);
-  Serial.print(F(" R="));
-  Serial.println(rightPressed() ? 1 : 0);
-  Serial.print(F("Raw: "));
+  Serial.print(rightPressed() ? 1 : 0);
   for (int i = 0; i < 4; i++) {
+    Serial.print(F(" "));
     Serial.print(analogRead(ProxSensors[i].pin));
-    Serial.print(F(" "));
-  }
-  Serial.println();
-  Serial.print(F("Filt: "));
-  for (int i = 0; i < 4; i++) {
-    Serial.print((int)ProxSensors[i].currVal);
-    Serial.print(F(" "));
-  }
-  Serial.println();
-  Serial.print(F("Dist: "));
-  for (int i = 0; i < 4; i++) {
-    Serial.print((int)((1.0 - zombieDistances[i]) * 100));
-    Serial.print(F("% "));
   }
   Serial.println();
 }
 
 void continuousMonitor() {
-  Serial.println(F("\nMONITOR - key to stop\n"));
   bool wasEnabled = systemEnabled;
   bool wasAuto = autoMode;
   systemEnabled = false;
@@ -2238,27 +2322,18 @@ void continuousMonitor() {
   stopMotor();
   while (!Serial.available()) {
     updateAllSensors();
-    Serial.print(F("E:"));
     Serial.print(encoder.read());
-    Serial.print(F(" L:"));
+    Serial.print(F(" "));
     Serial.print(leftPressed() ? 1 : 0);
-    Serial.print(F(" R:"));
     Serial.print(rightPressed() ? 1 : 0);
-    Serial.print(F(" P:"));
     for (int i = 0; i < 4; i++) {
-      Serial.print((int)ProxSensors[i].currVal);
       Serial.print(F(" "));
-    }
-    Serial.print(F(" D:"));
-    for (int i = 0; i < 4; i++) {
-      Serial.print(ProxSensors[i].direction == FORWARD ? F(">") : 
-                   ProxSensors[i].direction == BACKWARD ? F("<") : F("-"));
+      Serial.print((int)ProxSensors[i].currVal);
     }
     Serial.println();
     delay(100);
   }
   while (Serial.available()) Serial.read();
-  Serial.println(F("\nStopped\n"));
   systemEnabled = wasEnabled;
   autoMode = wasAuto;
 }
