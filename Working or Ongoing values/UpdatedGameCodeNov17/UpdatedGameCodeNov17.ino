@@ -1034,13 +1034,22 @@ float updatePID(long targetPosition) {
   }
   
   // Prevent crossing bounds - don't apply voltage that would cross limits
-  if (currentPosition >= LOWER_BOUND && (pidOutput + frictionComp) > 0) {
-    // At or past lower bound, don't move leftward
+  // But allow reaching the target if it's at the bound
+  if (currentPosition > LOWER_BOUND) {
+    // Past lower bound - block all leftward movement
+    frictionComp = 0;
+    if (pidOutput > 0) pidOutput = 0;
+  } else if (currentPosition == LOWER_BOUND && targetPosition > LOWER_BOUND) {
+    // At lower bound but target is beyond it - block leftward movement
     frictionComp = 0;
     if (pidOutput > 0) pidOutput = 0;
   }
-  if (currentPosition <= UPPER_BOUND && (pidOutput + frictionComp) < 0) {
-    // At or past upper bound, don't move rightward
+  if (currentPosition < UPPER_BOUND) {
+    // Past upper bound - block all rightward movement
+    frictionComp = 0;
+    if (pidOutput < 0) pidOutput = 0;
+  } else if (currentPosition == UPPER_BOUND && targetPosition < UPPER_BOUND) {
+    // At upper bound but target is beyond it - block rightward movement
     frictionComp = 0;
     if (pidOutput < 0) pidOutput = 0;
   }
@@ -1129,16 +1138,31 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
-  // Also check if we're at or past the bounds
-  if (currentPos >= LOWER_BOUND && error > 0) {
+  // Prevent crossing bounds, but allow reaching the target if it's at the bound
+  // Only block if we're past the bound OR if target is not at the bound
+  if (currentPos > LOWER_BOUND) {
+    // Already past lower bound - stop and clamp
     stopMotor();
     encoder.write(LOWER_BOUND);
     lastError = 0;
     return;
   }
-  if (currentPos <= UPPER_BOUND && error < 0) {
+  if (currentPos < UPPER_BOUND) {
+    // Already past upper bound - stop and clamp
     stopMotor();
     encoder.write(UPPER_BOUND);
+    lastError = 0;
+    return;
+  }
+  // If at LOWER_BOUND and trying to move leftward, only block if target is not at LOWER_BOUND
+  if (currentPos == LOWER_BOUND && error > 0 && desiredPosition > LOWER_BOUND) {
+    stopMotor();
+    lastError = 0;
+    return;
+  }
+  // If at UPPER_BOUND and trying to move rightward, only block if target is not at UPPER_BOUND
+  if (currentPos == UPPER_BOUND && error < 0 && desiredPosition < UPPER_BOUND) {
+    stopMotor();
     lastError = 0;
     return;
   }
@@ -1363,6 +1387,7 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
+  // Only block if we're past the bounds, not if we're at them
   if (currentPos < UPPER_BOUND) {
     stopMotor();
     encoder.write(UPPER_BOUND);
@@ -1372,6 +1397,17 @@ void runMotionControl() {
   if (currentPos > LOWER_BOUND) {
     stopMotor();
     encoder.write(LOWER_BOUND);
+    lastError = 0;
+    return;
+  }
+  // If at bounds, only block if trying to move away from target
+  if (currentPos == LOWER_BOUND && totalVoltage > 0 && desiredPosition > LOWER_BOUND) {
+    stopMotor();
+    lastError = 0;
+    return;
+  }
+  if (currentPos == UPPER_BOUND && totalVoltage < 0 && desiredPosition < UPPER_BOUND) {
+    stopMotor();
     lastError = 0;
     return;
   }
@@ -1416,7 +1452,8 @@ void setMotor(float voltage) {
   }
   // Also check encoder position to prevent crossing LOWER_BOUND
   long currentPos = encoder.read();
-  if (currentPos >= LOWER_BOUND && voltage > 0) {
+  // Only block if past the bound, not if at it (allows reaching target at bound)
+  if (currentPos > LOWER_BOUND && voltage > 0) {
     voltage = 0;
     pwm = 0;
   }
@@ -1426,7 +1463,8 @@ void setMotor(float voltage) {
     pwm = 0;
   }
   // Also check encoder position to prevent crossing UPPER_BOUND
-  if (currentPos <= UPPER_BOUND && voltage < 0) {
+  // Only block if past the bound, not if at it
+  if (currentPos < UPPER_BOUND && voltage < 0) {
     voltage = 0;
     pwm = 0;
   }
