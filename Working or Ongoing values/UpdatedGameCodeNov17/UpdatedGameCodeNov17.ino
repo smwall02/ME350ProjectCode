@@ -2,6 +2,7 @@
 
 #include <Encoder.h>
 #include <EEPROM.h>
+#include <math.h>
 
 // PIN DEFINITIONS
 #define ENCODER_A 2
@@ -699,7 +700,7 @@ void runStateMachine() {
         currentPos = LOWER_BOUND;
       }
       
-      // Lane 4: limit switch approach
+      // Lane 4: limit switch approach - ensure we actually move right
       if (lane4LimitSwitchMode && activeTargetIndex == 3) {
         if (!lane4AtLimit) {
           if (rightPressed()) {
@@ -709,6 +710,7 @@ void runStateMachine() {
             encoder.write(UPPER_BOUND);
             currentPos = UPPER_BOUND;
           }
+          // Force movement to right limit
           desiredPosition = UPPER_BOUND;
         }
         else if (millis() - lane4LimitTime < LANE4_LIMIT_HOLD_TIME) {
@@ -944,6 +946,7 @@ void runStateMachine() {
             }
             
             // Continuous fine adjustment - DISABLED for Lane 4 to prevent oscillation
+            // Also prevent infinite loops with timeout
             else if (activeTargetIndex != 3 &&
                      ProxSensors[activeTargetIndex].direction == FORWARD && 
                      fineAdjustmentActive &&
@@ -952,7 +955,8 @@ void runStateMachine() {
                      abs(motorVelocity) < 25 &&
                      abs(errorToCurrentTarget) > 5 &&
                      !ProxSensors[activeTargetIndex].hitDetected &&
-                     (millis() - arrivalTime) >= 100) {
+                     (millis() - arrivalTime) >= 100 &&
+                     (millis() - arrivalTime) < 2000) {  // Timeout after 2 seconds
               
               fineAdjustmentTarget = activeTargetPosition;
               
@@ -966,6 +970,12 @@ void runStateMachine() {
               
               desiredPosition = fineAdjustmentTarget;
               arrivalTime = millis();
+            }
+            // Timeout fine adjustment if stuck
+            else if (fineAdjustmentActive && (millis() - arrivalTime) >= 2000) {
+              fineAdjustmentActive = false;
+              fineAdjustmentCount = 0;
+              Serial.println(F("Fine adj timeout"));
             }
             if (activeTargetIndex >= 0) {
               previousZombieDistance = zombieDistances[activeTargetIndex];
@@ -1318,7 +1328,12 @@ void runMotionControl() {
     bool movingTowardMoreNegative = (error < 0);
     float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float positionFrictionBoost = 1.0;
-    if (currentPosition < -1200) {
+    
+    // Lane 4: Extra boost when moving to Lane 4 or when far from target
+    if (isLane4 && abs(error) > 200) {
+      // Large error to Lane 4 - use aggressive friction
+      positionFrictionBoost = 3.0;
+    } else if (currentPosition < -1200) {
       float lane4Factor = (currentPosition + 1200) / -224.0;
       lane4Factor = constrain(lane4Factor, 0.0, 1.0);
       positionFrictionBoost = 2.0 + (lane4Factor * 2.0);
@@ -1796,6 +1811,226 @@ bool homeToLeftLimit() {
 }
 
 
+// FRICTION CHARACTERIZATION
+void characterizeFriction() {
+  Serial.println(F("\n=== FRICTION CHARACTERIZATION ==="));
+  Serial.println(F("Measuring breakaway friction..."));
+  
+  stopMotor();
+  delay(500);
+  
+  // Home to left limit first
+  if (!homeToLeftLimit()) {
+    Serial.println(F("ERROR: Homing failed"));
+    return;
+  }
+  
+  delay(500);
+  
+  // Characterize RIGHT friction (moving from left to right) - multiple measurements
+  Serial.println(F("\nMeasuring friction for RIGHT movement..."));
+  float measurements[3];
+  int measurementCount = 0;
+  
+  for (int attempt = 0; attempt < 3; attempt++) {
+    float testVoltage = 0.5;
+    bool motionDetected = false;
+    
+    while (!motionDetected && testVoltage < 8.0) {
+      long startPos = encoder.read();
+      setMotor(-testVoltage);  // Negative = RIGHT
+      delay(400);
+      long endPos = encoder.read();
+      setMotor(0);
+      delay(300);
+      
+      long movement = abs(endPos - startPos);
+      
+      if (movement > 15) {
+        motionDetected = true;
+        measurements[measurementCount] = testVoltage - 0.15;  // Safety margin
+        measurementCount++;
+        Serial.print(F("Attempt "));
+        Serial.print(attempt + 1);
+        Serial.print(F(": Breakaway voltage = "));
+        Serial.print(measurements[measurementCount - 1], 2);
+        Serial.println(F(" V"));
+        
+        // Return to start position
+        if (!homeToLeftLimit()) {
+          Serial.println(F("ERROR: Rehoming failed"));
+          return;
+        }
+        delay(1000);
+        break;
+      } else {
+        testVoltage += 0.2;
+      }
+    }
+  }
+  
+  if (measurementCount < 2) {
+    Serial.println(F("ERROR: Could not get reliable friction measurements."));
+    return;
+  }
+  
+  // Calculate average, rejecting outliers
+  float sum = 0;
+  for (int i = 0; i < measurementCount; i++) {
+    sum += measurements[i];
+  }
+  float avg = sum / measurementCount;
+  
+  // Calculate standard deviation
+  float variance = 0;
+  for (int i = 0; i < measurementCount; i++) {
+    variance += (measurements[i] - avg) * (measurements[i] - avg);
+  }
+  float stdDev = sqrt(variance / measurementCount);
+  
+  // Use median if high variance (outlier rejection)
+  if (stdDev > 0.3) {
+    // Simple bubble sort for median
+    for (int i = 0; i < measurementCount - 1; i++) {
+      for (int j = 0; j < measurementCount - i - 1; j++) {
+        if (measurements[j] > measurements[j + 1]) {
+          float temp = measurements[j];
+          measurements[j] = measurements[j + 1];
+          measurements[j + 1] = temp;
+        }
+      }
+    }
+    FRICTION_LEFT = measurements[measurementCount / 2];  // Median
+    Serial.println(F("High variance detected, using median value."));
+  } else {
+    FRICTION_LEFT = avg;
+  }
+  
+  Serial.print(F("RIGHT friction voltage: "));
+  Serial.print(FRICTION_LEFT, 2);
+  Serial.println(F(" V"));
+  
+  // Move to right limit
+  Serial.println(F("Moving to right limit..."));
+  float driveRight = -max(FRICTION_LEFT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+  setMotor(driveRight);
+  unsigned long driveStart = millis();
+  while (digitalRead(LIMIT_RIGHT) == LOW) {
+    if (millis() - driveStart > 15000) {
+      Serial.println(F("ERROR: Timeout moving to right limit"));
+      setMotor(0);
+      return;
+    }
+    delay(10);
+  }
+  // Hold briefly on right limit
+  unsigned long holdStart = millis();
+  float holdRight = -max(FRICTION_LEFT, CALIBRATE_MIN_VOLTAGE - 0.5);
+  while (millis() - holdStart < CALIBRATE_HOLD_TIME) {
+    setMotor(holdRight);
+    delay(10);
+  }
+  setMotor(0);
+  delay(500);
+  
+  // Characterize LEFT friction (moving from right to left) - multiple measurements
+  Serial.println(F("\nMeasuring friction for LEFT movement..."));
+  
+  measurementCount = 0;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    float testVoltage = 0.5;
+    bool motionDetected = false;
+    
+    while (!motionDetected && testVoltage < 8.0) {
+      long startPos = encoder.read();
+      setMotor(testVoltage);  // Positive = LEFT
+      delay(400);
+      long endPos = encoder.read();
+      setMotor(0);
+      delay(300);
+      
+      long movement = abs(endPos - startPos);
+      
+      if (movement > 15) {
+        motionDetected = true;
+        measurements[measurementCount] = testVoltage - 0.15;
+        measurementCount++;
+        Serial.print(F("Attempt "));
+        Serial.print(attempt + 1);
+        Serial.print(F(": Breakaway voltage = "));
+        Serial.print(measurements[measurementCount - 1], 2);
+        Serial.println(F(" V"));
+        
+        // Return to right limit
+        driveRight = -max(FRICTION_LEFT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+        setMotor(driveRight);
+        driveStart = millis();
+        while (digitalRead(LIMIT_RIGHT) == LOW && millis() - driveStart < 15000) {
+          delay(10);
+        }
+        setMotor(0);
+        delay(1000);
+        break;
+      } else {
+        testVoltage += 0.2;
+      }
+    }
+  }
+  
+  if (measurementCount < 2) {
+    Serial.println(F("ERROR: Could not get reliable friction measurements."));
+    return;
+  }
+  
+  // Calculate average with outlier rejection
+  sum = 0;
+  for (int i = 0; i < measurementCount; i++) {
+    sum += measurements[i];
+  }
+  avg = sum / measurementCount;
+  
+  variance = 0;
+  for (int i = 0; i < measurementCount; i++) {
+    variance += (measurements[i] - avg) * (measurements[i] - avg);
+  }
+  stdDev = sqrt(variance / measurementCount);
+  
+  if (stdDev > 0.3) {
+    // Median
+    for (int i = 0; i < measurementCount - 1; i++) {
+      for (int j = 0; j < measurementCount - i - 1; j++) {
+        if (measurements[j] > measurements[j + 1]) {
+          float temp = measurements[j];
+          measurements[j] = measurements[j + 1];
+          measurements[j + 1] = temp;
+        }
+      }
+    }
+    FRICTION_RIGHT = measurements[measurementCount / 2];
+    Serial.println(F("High variance detected, using median value."));
+  } else {
+    FRICTION_RIGHT = avg;
+  }
+  
+  // Update adaptive friction values
+  adaptiveFrictionLeft = FRICTION_LEFT;
+  adaptiveFrictionRight = FRICTION_RIGHT;
+  
+  // Save to EEPROM
+  saveFrictionToEEPROM();
+  
+  Serial.println(F("\n=== Friction Characterization Complete ==="));
+  Serial.print(F("FRICTION_LEFT (moving RIGHT): "));
+  Serial.print(FRICTION_LEFT, 2);
+  Serial.println(F(" V"));
+  Serial.print(F("FRICTION_RIGHT (moving LEFT): "));
+  Serial.print(FRICTION_RIGHT, 2);
+  Serial.println(F(" V"));
+  
+  // Return home
+  homeToLeftLimit();
+}
+
 // EEPROM
 void loadCalibrationFromEEPROM() {
   byte flag = EEPROM.read(EEPROM_FLAG);
@@ -2059,6 +2294,14 @@ void processCommand() {
       continuousMonitor();
       break;
     
+    case 'F':
+      if (!autoMode) {
+        characterizeFriction();
+      } else {
+        Serial.println(F("Stop auto mode first"));
+      }
+      break;
+
     case 'R':
       adaptiveFrictionVoltage = 0;
       adaptiveLearning = false;
@@ -2118,7 +2361,8 @@ void printWelcome() {
 }
 
 void printHelp() {
-  Serial.println(F("\nCmds: C Z G S 1-4 P D M R L W H"));
+  Serial.println(F("\nCmds: C Z G S 1-4 P D M R L W H F"));
+  Serial.println(F("F - Friction Characterization"));
 }
 
 void printCompactStatus() {
