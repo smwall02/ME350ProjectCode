@@ -144,6 +144,13 @@ const int MAX_FINE_ADJUSTMENTS = 5;  // Maximum number of fine adjustments per t
 unsigned long lastFineAdjustmentTime = 0;  // Timestamp of last fine adjustment to prevent rapid triggering
 const unsigned long MIN_FINE_ADJUSTMENT_INTERVAL = 50;  // Minimum time between fine adjustments (ms) - reduced for faster correction
 
+// Lane 4 limit switch approach
+bool lane4LimitSwitchMode = false;  // Flag for lane 4: go to limit switch first, then fine-tune
+bool lane4AtLimit = false;  // Flag indicating we've reached the right limit switch for lane 4
+unsigned long lane4LimitTime = 0;  // Time when we reached the limit switch
+const unsigned long LANE4_LIMIT_HOLD_TIME = 200;  // Time to hold at limit switch (ms)
+const int LANE4_BACKOFF_DISTANCE = 20;  // Distance to back off from limit switch before fine-tuning
+
 // ============================================
 // FRICTION COMPENSATION (Improved)
 // ============================================
@@ -542,11 +549,25 @@ void finalizeDynamicCalibration() {
   if (allValid) {
     sensorCalibrated = true;
     Serial.println(F("\n✓ Sensors calibrated successfully!"));
-    Serial.println(F("Starting target tracking...\n"));
+    Serial.println(F("Rehoming to left limit switch...\n"));
+    
+    // Rehome after calibration to ensure accurate positioning
+    if (homeToLeftLimit()) {
+      Serial.println(F("✓ Rehoming complete! Starting target tracking...\n"));
+    } else {
+      Serial.println(F("⚠️  Rehoming failed, but proceeding...\n"));
+    }
   } else {
     Serial.println(F("\n⚠️  Some sensors may not have seen full range."));
-    Serial.println(F("Proceeding anyway...\n"));
+    Serial.println(F("Rehoming to left limit switch...\n"));
     sensorCalibrated = true;
+    
+    // Still rehome even if calibration wasn't perfect
+    if (homeToLeftLimit()) {
+      Serial.println(F("✓ Rehoming complete! Proceeding...\n"));
+    } else {
+      Serial.println(F("⚠️  Rehoming failed, but proceeding...\n"));
+    }
   }
 }
 
@@ -616,15 +637,29 @@ void runStateMachine() {
         lastFineAdjustmentTime = 0;  // Reset timestamp
         previousZombieDistance = zombieDistances[activeTargetIndex];  // Initialize distance tracking
         
+        // SPECIAL HANDLING FOR LANE 4: Use limit switch approach
+        // Lane 4 is index 3 (0-indexed), target position is around -1254
+        if (activeTargetIndex == 3) {
+          lane4LimitSwitchMode = true;
+          lane4AtLimit = false;
+          lane4LimitTime = 0;
+          Serial.println(F("🎯 Target: Lane 4 - Using limit switch approach (go to right limit, then fine-tune)"));
+        } else {
+          lane4LimitSwitchMode = false;
+          lane4AtLimit = false;
+        }
+        
         int percentToPhoto = (int)((1.0 - zombieDistances[activeTargetIndex]) * 100);
         
-        Serial.print(F("🎯 Target: Lane "));
-        Serial.print(activeTargetIndex + 1);
-        Serial.print(F(" ("));
-        Serial.print(percentToPhoto);
-        Serial.print(F("% to photo = DANGER!, dist="));
-        Serial.print(zombieDistances[activeTargetIndex], 2);
-        Serial.println(F(")"));
+        if (activeTargetIndex != 3) {  // Don't print duplicate message for lane 4
+          Serial.print(F("🎯 Target: Lane "));
+          Serial.print(activeTargetIndex + 1);
+          Serial.print(F(" ("));
+          Serial.print(percentToPhoto);
+          Serial.print(F("% to photo = DANGER!, dist="));
+          Serial.print(zombieDistances[activeTargetIndex], 2);
+          Serial.println(F(")"));
+        }
         
         previousTargetIndex = activeTargetIndex;
         targetHitTime = 0;
@@ -635,10 +670,19 @@ void runStateMachine() {
         fineAdjustmentActive = false;
         fineAdjustmentCount = 0;  // Reset counter
         lastFineAdjustmentTime = 0;  // Reset timestamp
+        lane4LimitSwitchMode = false;
+        lane4AtLimit = false;
         Serial.println(F("No active FORWARD targets, moving to wait position"));
       }
       
-      desiredPosition = activeTargetPosition;
+      // For lane 4 limit switch mode, set desired position to right limit (UPPER_BOUND)
+      // Otherwise use normal target position
+      if (lane4LimitSwitchMode) {
+        desiredPosition = UPPER_BOUND;  // Go to right limit switch first
+      } else {
+        desiredPosition = activeTargetPosition;
+      }
+      
       moveStartTime = millis();
       arrivalTime = millis();
       targetReached = false;
@@ -648,25 +692,73 @@ void runStateMachine() {
       break;
     
     case MOVE_TO_TARGET:
-      // Use fine adjustment target if active, otherwise use original target
-      if (fineAdjustmentActive) {
-        desiredPosition = fineAdjustmentTarget;
-      } else {
-        desiredPosition = activeTargetPosition;
+      long currentPos = encoder.read();
+      
+      // SPECIAL HANDLING FOR LANE 4: Limit switch approach
+      if (lane4LimitSwitchMode && activeTargetIndex == 3) {
+        // Phase 1: Go to right limit switch
+        if (!lane4AtLimit) {
+          // Check if we've hit the right limit switch
+          if (rightPressed()) {
+            lane4AtLimit = true;
+            lane4LimitTime = millis();
+            Serial.println(F("✓ Lane 4: Reached right limit switch, holding..."));
+            // Set encoder to UPPER_BOUND when we hit the limit
+            encoder.write(UPPER_BOUND);
+            currentPos = UPPER_BOUND;
+          }
+          // Keep going to the limit
+          desiredPosition = UPPER_BOUND;
+        }
+        // Phase 2: Hold at limit switch briefly
+        else if (millis() - lane4LimitTime < LANE4_LIMIT_HOLD_TIME) {
+          // Still holding at limit
+          desiredPosition = UPPER_BOUND;
+          // Keep encoder at UPPER_BOUND
+          if (encoder.read() != UPPER_BOUND) {
+            encoder.write(UPPER_BOUND);
+            currentPos = UPPER_BOUND;
+          }
+        }
+        // Phase 3: Back off from limit switch
+        // UPPER_BOUND is -1424, so backing off means moving to -1424 + 20 = -1404 (less negative)
+        else if (currentPos < (UPPER_BOUND + LANE4_BACKOFF_DISTANCE)) {
+          // Back off from limit switch (move left, toward less negative)
+          desiredPosition = UPPER_BOUND + LANE4_BACKOFF_DISTANCE;
+          Serial.print(F("✓ Lane 4: Backing off from limit switch to "));
+          Serial.println(desiredPosition);
+        }
+        // Phase 4: Fine-tune to exact target position
+        else {
+          // Now fine-tune to the exact target position
+          desiredPosition = activeTargetPosition;
+          lane4LimitSwitchMode = false;  // Switch to normal fine-tuning mode
+          Serial.print(F("✓ Lane 4: Fine-tuning to exact position: "));
+          Serial.println(activeTargetPosition);
+        }
+      }
+      // Normal mode: Use fine adjustment target if active, otherwise use original target
+      else {
+        if (fineAdjustmentActive) {
+          desiredPosition = fineAdjustmentTarget;
+        } else {
+          desiredPosition = activeTargetPosition;
+        }
       }
       
-      long currentPos = encoder.read();
       long error = desiredPosition - currentPos;
       
-      // Safety check - approaching right limit
-      if (currentPos < UPPER_BOUND - 50) {
+      // Safety check - approaching right limit (but allow lane 4 limit switch mode)
+      if (!lane4LimitSwitchMode && currentPos < UPPER_BOUND - 50) {
         Serial.println(F("⚠️  Approaching right limit, returning to safe zone"));
         currentState = CHOOSE_ACTIVE_TARGET;
         break;
       }
       
       // IMPROVED: Velocity-based hit detection
-      if (activeTargetIndex >= 0 && !WAIT_POS) {
+      // Skip hit detection during lane 4 limit switch approach (phases 1-3)
+      // Only enable hit detection during fine-tuning phase (phase 4, when lane4LimitSwitchMode becomes false) or normal operation
+      if (activeTargetIndex >= 0 && !WAIT_POS && !lane4LimitSwitchMode) {
         int targetDirection = ProxSensors[activeTargetIndex].direction;
         bool hitDetected = ProxSensors[activeTargetIndex].hitDetected;
         unsigned long hitTime = ProxSensors[activeTargetIndex].hitTime;
@@ -1900,6 +1992,11 @@ void processCommand() {
           lastFineAdjustmentTime = 0;  // Reset timestamp
           stuckStartTime = 0;  // Reset stuck tracking
           voltageRamping = false;  // Reset voltage ramping
+          
+          // Reset lane 4 limit switch mode
+          lane4LimitSwitchMode = false;
+          lane4AtLimit = false;
+          lane4LimitTime = 0;
           
           // Reset target tracking
           activeTargetIndex = -1;
