@@ -611,6 +611,14 @@ void runStateMachine() {
     case MOVE_TO_TARGET:
       long currentPos = encoder.read();
       
+      // Clamp encoder at right limit - prevent reading beyond UPPER_BOUND
+      // Always clamp if reading beyond UPPER_BOUND to prevent drift
+      if (currentPos < UPPER_BOUND) {
+        // Always clamp if beyond limit - prevents encoder drift
+        encoder.write(UPPER_BOUND);
+        currentPos = UPPER_BOUND;
+      }
+      
       // Lane 4: limit switch approach
       if (lane4LimitSwitchMode && activeTargetIndex == 3) {
         if (!lane4AtLimit) {
@@ -625,7 +633,8 @@ void runStateMachine() {
         }
         else if (millis() - lane4LimitTime < LANE4_LIMIT_HOLD_TIME) {
           desiredPosition = UPPER_BOUND;
-          if (encoder.read() != UPPER_BOUND) {
+          // Continuously clamp encoder while at limit
+          if (rightPressed() || currentPos < UPPER_BOUND) {
             encoder.write(UPPER_BOUND);
             currentPos = UPPER_BOUND;
           }
@@ -648,6 +657,13 @@ void runStateMachine() {
       }
       
       long error = desiredPosition - currentPos;
+      
+      // Prevent corrections beyond right limit - if at limit and trying to move right, stop
+      if (rightPressed() && error < 0) {
+        stopMotor();
+        encoder.write(UPPER_BOUND);
+        return;
+      }
       
       // Safety check - disabled during auto mode (right limit needed for Lane 4)
       if (!autoMode && !lane4LimitSwitchMode && currentPos < UPPER_BOUND - 50) {
@@ -882,6 +898,15 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
+  // Clamp encoder reading at right limit switch - prevent reading beyond UPPER_BOUND
+  // This prevents the encoder from counting beyond the physical limit
+  // Always clamp if reading beyond UPPER_BOUND (encoder can drift due to mechanical play)
+  if (currentPosition < UPPER_BOUND) {
+    // Always clamp if beyond limit - prevents encoder drift
+    encoder.write(UPPER_BOUND);
+    currentPosition = UPPER_BOUND;
+  }
+  
   long adjustedDesiredPosition = desiredPosition;
   // Disable momentum compensation when very close to target to prevent oscillation
   long errorToTarget = abs(desiredPosition - currentPosition);
@@ -894,6 +919,13 @@ void runMotionControl() {
   }
   
   float error = adjustedDesiredPosition - currentPosition;
+  
+  // Prevent any corrections that would try to move right (more negative) when at right limit
+  if (rightPressed() && error < 0) {
+    stopMotor();
+    encoder.write(UPPER_BOUND);
+    return;
+  }
   
   if (currentState == MOVE_TO_TARGET && autoMode) {
     // Check drift
@@ -1303,6 +1335,14 @@ void runMotionControl() {
     }
   }
 
+  // Final check: prevent moving right (more negative) when at right limit
+  if (rightPressed() && totalVoltage < 0) {
+    stopMotor();
+    encoder.write(UPPER_BOUND);
+    lastError = 0;
+    return;
+  }
+  
   if (abs(totalVoltage) >= MIN_CONTROL_VOLTAGE) {
     setMotor(totalVoltage);
   } else {
@@ -1392,7 +1432,21 @@ void checkLimitSwitches() {
     errorIntegral = 0;
     Serial.println(F("Recal at left"));
   }
-
+  
+  // Right limit switch: clamp encoder if accidentally hit (not during Lane 4)
+  // During Lane 4, the limit switch is used intentionally, so don't interfere
+  if (digitalRead(LIMIT_RIGHT) == HIGH && 
+      !lane4LimitSwitchMode && 
+      !lane4AtLimit &&
+      currentState == MOVE_TO_TARGET &&
+      abs(motorVelocity) < 10) {
+    // Accidentally hit right limit - clamp encoder to prevent drift
+    long currentPos = encoder.read();
+    if (currentPos < UPPER_BOUND) {
+      encoder.write(UPPER_BOUND);
+      errorIntegral = 0;
+    }
+  }
 }
 
 bool leftPressed() {
