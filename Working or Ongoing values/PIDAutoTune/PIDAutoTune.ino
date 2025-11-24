@@ -1,29 +1,10 @@
-/*
- * ME350 PID Auto-Tune System - Optimized Version
- *
- * Comprehensive PID tuning tool for ME350 mechatronics project
- * Implements multiple industry-standard tuning methods with enhanced accuracy
- *
- * Features:
- * - Automatic range calibration with enhanced stability checks
- * - Advanced directional friction characterization
- * - Enhanced Ziegler-Nichols relay oscillation method with peak detection
- * - Multiple tuning presets (Conservative, Classic, Aggressive, Tyreus-Luyben)
- * - EEPROM persistent storage
- * - Step response analysis with parameter extraction
- * - Manual position testing with performance metrics
- * - Noise filtering and outlier rejection
- *
- * Compatible with standard ME350 hardware configuration
- */
+// ME350 PID Auto-Tune
 
 #include <Encoder.h>
 #include <EEPROM.h>
 #include <math.h>
 
-// ============================================================================
-// PIN CONFIGURATION (Standard ME350 Setup)
-// ============================================================================
+// PIN CONFIGURATION
 
 // Encoder
 #define ENCODER_A 2
@@ -47,15 +28,11 @@
 #define PROX_SENSOR_3 A2
 #define PROX_SENSOR_4 A3
 
-// ============================================================================
 // GLOBAL OBJECTS
-// ============================================================================
 
 Encoder motorEncoder(ENCODER_A, ENCODER_B);
 
-// ============================================================================
-// PID CONTROLLER PARAMETERS
-// ============================================================================
+// PID PARAMETERS
 
 float KP = 0.020;  // Proportional gain
 float KI = 0.005;  // Integral gain
@@ -83,9 +60,7 @@ const float INTEGRAL_MAX = 1000.0;  // Maximum integral accumulation
 const float INTEGRAL_DECAY_FAR = 0.95;  // Decay rate when far from target
 const float INTEGRAL_DECAY_CROSS = 0.5;  // Decay on zero crossing
 
-// ============================================================================
-// FRICTION COMPENSATION
-// ============================================================================
+// FRICTION
 
 float FRICTION_LEFT = 2.2;   // Voltage to overcome friction moving LEFT
 float FRICTION_RIGHT = 2.9;  // Voltage to overcome friction moving RIGHT
@@ -95,9 +70,7 @@ const float HOMING_EXTRA_VOLTAGE = 0.6;     // Added on top of friction during h
 const unsigned long HOMING_HOLD_TIME = 500; // ms to hold on switch before zeroing (increased)
 const int HOMING_STABLE_TICKS = 5;          // Require this many consecutive stable readings (increased)
 
-// ============================================================================
-// CALIBRATION DATA
-// ============================================================================
+// CALIBRATION
 
 long LEFT_LIMIT_POSITION = 0;
 long RIGHT_LIMIT_POSITION = -1800;
@@ -108,9 +81,7 @@ long LANE_POSITIONS[4] = {0, -350, -700, -1050};
 
 bool isCalibrated = false;
 
-// ============================================================================
 // EEPROM STORAGE
-// ============================================================================
 
 const int EEPROM_CALIBRATION_FLAG = 0;
 const int EEPROM_KP = 1;
@@ -122,9 +93,7 @@ const int EEPROM_LEFT_LIMIT = 21;
 const int EEPROM_RIGHT_LIMIT = 25;
 const int EEPROM_LANES_BASE = 29;  // 4 lanes * 4 bytes each
 
-// ============================================================================
 // AUTO-TUNE RESULTS
-// ============================================================================
 
 struct TuneResults {
   float Ku;           // Ultimate gain
@@ -151,9 +120,7 @@ float filteredDerivative(float rawDerivative) {
   return lastDerivative;
 }
 
-// ============================================================================
 // SETUP
-// ============================================================================
 
 void setup() {
   Serial.begin(115200);
@@ -180,9 +147,7 @@ void setup() {
   printWelcome();
 }
 
-// ============================================================================
 // MAIN LOOP
-// ============================================================================
 
 void loop() {
   if (Serial.available() > 0) {
@@ -191,9 +156,7 @@ void loop() {
   }
 }
 
-// ============================================================================
-// COMMAND PROCESSING
-// ============================================================================
+// COMMANDS
 
 void processCommand(char cmd) {
   // Ignore whitespace/newlines to reduce "Unknown command" spam
@@ -249,9 +212,9 @@ void processCommand(char cmd) {
     case '1': case '2': case '3': case '4': {
       int lane = cmd - '1';
       LANE_POSITIONS[lane] = motorEncoder.read();
-      Serial.print(F("Lane "));
+      Serial.print(F("L"));
       Serial.print(lane + 1);
-      Serial.print(F(" set to "));
+      Serial.print(F(":"));
       Serial.println(LANE_POSITIONS[lane]);
       saveCalibration();
       break;
@@ -259,13 +222,13 @@ void processCommand(char cmd) {
 
     case 'L':
       loadCalibration();
-      Serial.println(F("Loaded calibration and lane positions from EEPROM."));
+      Serial.println(F("Loaded"));
       printStatus();
       break;
 
     case 'W':
       saveCalibration();
-      Serial.println(F("Saved calibration and lane positions to EEPROM."));
+      Serial.println(F("Saved"));
       break;
 
     case '?':
@@ -274,14 +237,12 @@ void processCommand(char cmd) {
       break;
 
     default:
-      Serial.println(F("Unknown command. Press '?' for help."));
+      Serial.println(F("? for help"));
       break;
   }
 }
 
-// ============================================================================
 // MOTOR CONTROL
-// ============================================================================
 
 bool isSwitchEnabled() {
   return digitalRead(ON_OFF_SWITCH_PIN) == HIGH;
@@ -342,18 +303,14 @@ void setMotorVoltage(float voltage) {
   }
 }
 
-// ============================================================================
-// PID CONTROLLER - ENHANCED
-// ============================================================================
+// PID CONTROLLER
 
 bool ensureRangeAndFrictionReady() {
   if (!isCalibrated) {
-    Serial.println(F("Range not calibrated. Running range calibration..."));
     calibrateRange();
   }
 
   if (!frictionCharacterized) {
-    Serial.println(F("Friction not characterized. Running friction characterization..."));
     characterizeFriction();
   }
 
@@ -425,16 +382,12 @@ float updatePID(long targetPosition) {
   return voltage;
 }
 
-// ============================================================================
-// RANGE CALIBRATION - ENHANCED
-// ============================================================================
+// RANGE CALIBRATION
 
 void calibrateRange() {
-  Serial.println(F("\n=== RANGE CALIBRATION ==="));
-  Serial.println(F("Finding left and right limit positions..."));
+  Serial.println(F("\nRANGE CAL"));
 
   // Move to left limit
-  Serial.println(F("Moving to left limit..."));
   float leftDrive = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotorVoltage(leftDrive);
 
@@ -444,7 +397,7 @@ void calibrateRange() {
 
   while (digitalRead(LIMIT_LEFT) == LOW) {  // LOW = not pressed
     if (millis() - startTime > 12000) {  // Increased timeout
-      Serial.println(F("ERROR: Timeout waiting for left limit"));
+      Serial.println(F("ERR: timeout"));
       setMotorVoltage(0);
       return;
     }
@@ -455,7 +408,6 @@ void calibrateRange() {
       lastMoveTime = millis();
       lastPosition = currentPos;
     } else if (millis() - lastMoveTime > 3000) {
-      Serial.println(F("WARNING: Motor appears stuck, increasing voltage..."));
       leftDrive = min(leftDrive + 0.5, 8.0);
       setMotorVoltage(leftDrive);
       lastMoveTime = millis();
@@ -490,10 +442,8 @@ void calibrateRange() {
   motorEncoder.write(0);
   LEFT_LIMIT_POSITION = 0;
   positionFilterInitialized = false;  // Reset filter
-  Serial.println(F("Left limit found, encoder zeroed."));
 
   // Move to right limit
-  Serial.println(F("Moving to right limit..."));
   delay(500);
   float rightDrive = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotorVoltage(rightDrive);
@@ -504,7 +454,7 @@ void calibrateRange() {
 
   while (digitalRead(LIMIT_RIGHT) == LOW) {
     if (millis() - startTime > 12000) {
-      Serial.println(F("ERROR: Timeout waiting for right limit"));
+      Serial.println(F("ERR: timeout"));
       setMotorVoltage(0);
       return;
     }
@@ -515,7 +465,6 @@ void calibrateRange() {
       lastMoveTime = millis();
       lastPosition = currentPos;
     } else if (millis() - lastMoveTime > 3000) {
-      Serial.println(F("WARNING: Motor appears stuck, increasing voltage..."));
       rightDrive = max(rightDrive - 0.5, -8.0);
       setMotorVoltage(rightDrive);
       lastMoveTime = millis();
@@ -550,16 +499,14 @@ void calibrateRange() {
   RIGHT_LIMIT_POSITION = motorEncoder.read();
   TOTAL_RANGE = abs(RIGHT_LIMIT_POSITION - LEFT_LIMIT_POSITION);
 
-  Serial.print(F("Right limit found at: "));
-  Serial.print(RIGHT_LIMIT_POSITION);
-  Serial.println(F(" counts"));
+  Serial.print(F("R:"));
+  Serial.println(RIGHT_LIMIT_POSITION);
 
-  Serial.print(F("Total range: "));
-  Serial.print(TOTAL_RANGE);
-  Serial.println(F(" encoder counts"));
+  Serial.print(F("Range:"));
+  Serial.println(TOTAL_RANGE);
 
   if (TOTAL_RANGE < 100) {
-    Serial.println(F("ERROR: Range too small. Check limit switches."));
+    Serial.println(F("ERR: range too small"));
     return;
   }
 
@@ -572,15 +519,13 @@ void calibrateRange() {
   homeToLeft();
 }
 
-// ============================================================================
-// FRICTION CHARACTERIZATION - ENHANCED
-// ============================================================================
+// FRICTION CHARACTERIZATION
 
 void characterizeFriction() {
-  Serial.println(F("\n=== FRICTION CHARACTERIZATION ==="));
+  Serial.println(F("\nFRICTION CAL"));
 
   if (!isCalibrated) {
-    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    Serial.println(F("ERR: Run R first"));
     return;
   }
 
@@ -589,7 +534,6 @@ void characterizeFriction() {
   delay(1000);
 
   // Characterize RIGHT friction (moving from left to right) - multiple measurements
-  Serial.println(F("\nMeasuring RIGHT friction..."));
 
   float measurements[3];
   int measurementCount = 0;
@@ -612,11 +556,6 @@ void characterizeFriction() {
         motionDetected = true;
         measurements[measurementCount] = testVoltage - 0.15;  // Safety margin
         measurementCount++;
-        Serial.print(F("Attempt "));
-        Serial.print(attempt + 1);
-        Serial.print(F(": Breakaway voltage = "));
-        Serial.print(measurements[measurementCount - 1], 2);
-        Serial.println(F(" V"));
         
         // Return to start position
         homeToLeft();
@@ -630,7 +569,7 @@ void characterizeFriction() {
   }
 
   if (measurementCount < 2) {
-    Serial.println(F("ERROR: Could not get reliable friction measurements."));
+    Serial.println(F("ERR"));
     return;
   }
 
@@ -661,23 +600,20 @@ void characterizeFriction() {
       }
     }
     FRICTION_LEFT = measurements[measurementCount / 2];  // Median
-    Serial.println(F("High variance detected, using median value."));
   } else {
     FRICTION_LEFT = avg;
   }
 
-  Serial.print(F("RIGHT friction voltage: "));
-  Serial.print(FRICTION_LEFT, 2);
-  Serial.println(F(" V"));
+  Serial.print(F("R:"));
+  Serial.println(FRICTION_LEFT, 1);
 
   // Move to right limit
-  Serial.println(F("Moving to right limit..."));
   float driveRight = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotorVoltage(driveRight);
   unsigned long driveStart = millis();
   while (digitalRead(LIMIT_RIGHT) == LOW) {
     if (millis() - driveStart > 12000) {
-      Serial.println(F("ERROR: Timeout moving to right limit during friction characterization"));
+      Serial.println(F("ERR: timeout"));
       setMotorVoltage(0);
       return;
     }
@@ -694,7 +630,6 @@ void characterizeFriction() {
   delay(500);
 
   // Characterize LEFT friction (moving from right to left) - multiple measurements
-  Serial.println(F("\nMeasuring friction for LEFT movement..."));
 
   measurementCount = 0;
   for (int attempt = 0; attempt < 3; attempt++) {
@@ -715,11 +650,6 @@ void characterizeFriction() {
         motionDetected = true;
         measurements[measurementCount] = testVoltage - 0.15;
         measurementCount++;
-        Serial.print(F("Attempt "));
-        Serial.print(attempt + 1);
-        Serial.print(F(": Breakaway voltage = "));
-        Serial.print(measurements[measurementCount - 1], 2);
-        Serial.println(F(" V"));
         
         // Return to right limit
         driveRight = -max(FRICTION_LEFT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
@@ -739,7 +669,7 @@ void characterizeFriction() {
   }
 
   if (measurementCount < 2) {
-    Serial.println(F("ERROR: Could not get reliable friction measurements."));
+    Serial.println(F("ERR"));
     return;
   }
 
@@ -768,7 +698,6 @@ void characterizeFriction() {
       }
     }
     FRICTION_RIGHT = measurements[measurementCount / 2];
-    Serial.println(F("High variance detected, using median value."));
   } else {
     FRICTION_RIGHT = avg;
   }
@@ -776,32 +705,26 @@ void characterizeFriction() {
   frictionCharacterized = true;
   saveCalibration();
 
-  Serial.println(F("\n=== Friction Characterization Complete ==="));
-  Serial.print(F("FRICTION_LEFT (moving RIGHT): "));
-  Serial.print(FRICTION_LEFT, 2);
-  Serial.println(F(" V"));
-  Serial.print(F("FRICTION_RIGHT (moving LEFT): "));
-  Serial.print(FRICTION_RIGHT, 2);
-  Serial.println(F(" V"));
+  Serial.print(F("F L:"));
+  Serial.print(FRICTION_LEFT, 1);
+  Serial.print(F(" R:"));
+  Serial.println(FRICTION_RIGHT, 1);
 
   // Return home
   homeToLeft();
 }
 
-// ============================================================================
-// ZIEGLER-NICHOLS AUTO-TUNE - ENHANCED WITH PEAK DETECTION
-// ============================================================================
+// ZIEGLER-NICHOLS AUTO-TUNE
 
 void autoTuneZieglerNichols() {
-  Serial.println(F("\n=== ZIEGLER-NICHOLS AUTO-TUNE (Enhanced) ==="));
+  Serial.println(F("\nZN TUNE"));
 
   if (!isCalibrated) {
-    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    Serial.println(F("ERR: Run R first"));
     return;
   }
 
-  Serial.println(F("Relay oscillation method to find Ku and Tu."));
-  Serial.println(F("Press 'Y' to continue or any key to cancel..."));
+  Serial.println(F("ZN: Y to start"));
 
   // Flush any stray input
   while (Serial.available()) { Serial.read(); }
@@ -813,15 +736,8 @@ void autoTuneZieglerNichols() {
     response = c;
   }
 
-  if (toupper(response) != 'Y') {
-    Serial.println(F("Auto-tune cancelled."));
-    return;
-  }
-
-  // Move to center position with enhanced approach
+  if (toupper(response) != 'Y') return;
   long centerPosition = (LEFT_LIMIT_POSITION + RIGHT_LIMIT_POSITION) / 2;
-  Serial.print(F("Moving to center position: "));
-  Serial.println(centerPosition);
 
   positionFilterInitialized = false;
   
@@ -881,11 +797,6 @@ void autoTuneZieglerNichols() {
   delay(800);  // Longer settle time
 
   long finalCenterPos = motorEncoder.read();
-  Serial.print(F("Center approach ended at: "));
-  Serial.println(finalCenterPos);
-  if (abs(finalCenterPos - centerPosition) > 20) {
-    Serial.println(F("Warning: Not well centered; results may be less accurate."));
-  }
 
   // Enhanced relay parameters - using 9V nominal voltage
   const float TEST_VOLTAGE = 9.0;  // Relay amplitude (9V as per UpdatedGameCodeNov17.ino)
@@ -895,10 +806,8 @@ void autoTuneZieglerNichols() {
   const int SETTLE_PEAKS = 6;        // Peaks to skip for settling (increased)
   const unsigned long TIMEOUT = 180000;  // 180 seconds (increased)
 
-  Serial.println(F("\nStarting relay oscillation test..."));
-  Serial.print(F("Voltage: "));
   Serial.print(TEST_VOLTAGE);
-  Serial.print(F("V, Hyst: ±"));
+  Serial.print(F("V "));
   Serial.println(HYSTERESIS);
 
   // Use zero-crossing detection for period measurement (standard ZN method)
@@ -1036,7 +945,7 @@ void autoTuneZieglerNichols() {
     lastTime = currentTime;
 
     if (peakCount > 0 && peakCount % 6 == 0) {
-      Serial.print(F("Peaks: "));
+      Serial.print(F("P:"));
       Serial.print(peakCount);
       Serial.print(F(", Xings: "));
       Serial.println(crossingCount);
@@ -1138,10 +1047,9 @@ void autoTuneZieglerNichols() {
   
   // Check if we have enough period measurements
   if (periodCount < 5) {
-    Serial.println(F("ERROR: Insufficient period measurements for reliable tuning."));
-    Serial.print(F("Collected "));
+    Serial.print(F("ERR: "));
     Serial.print(periodCount);
-    Serial.println(F(" period measurements."));
+    Serial.println(F(" periods"));
     lastTuneResults.valid = false;
     return;
   }
@@ -1216,11 +1124,11 @@ void autoTuneZieglerNichols() {
 
   // Validate results
   if (avgAmplitude < 10.0 || avgPeriod < 0.01 || avgPeriod > 10.0) {
-    Serial.println(F("ERROR: Invalid measurements detected."));
-    Serial.print(F("Amplitude: "));
-    Serial.print(avgAmplitude);
-    Serial.print(F(", Period: "));
-    Serial.println(avgPeriod);
+    Serial.println(F("ERR"));
+    Serial.print(F("A:"));
+    Serial.print(avgAmplitude, 0);
+    Serial.print(F(" T:"));
+    Serial.println(avgPeriod, 2);
     lastTuneResults.valid = false;
     return;
   }
@@ -1238,37 +1146,31 @@ void autoTuneZieglerNichols() {
   lastTuneResults.stdDev = periodStdDev;
   lastTuneResults.valid = true;
 
-  // Display results
-  Serial.println(F("\n=== RESULTS ==="));
-  Serial.print(F("Peaks: "));
   Serial.print(peaksUsed);
-  Serial.print(F(", Periods: "));
-  Serial.println(periodCount);
-  Serial.print(F("Amp: "));
+  Serial.print(F(","));
+  Serial.print(periodCount);
+  Serial.print(F(","));
   Serial.print(avgAmplitude, 0);
-  Serial.print(F(" cnt, Period: "));
-  Serial.print(avgPeriod, 3);
-  Serial.print(F("s, Tu: "));
-  Serial.print(lastTuneResults.Tu, 3);
-  Serial.print(F("s, Ku: "));
-  Serial.println(Ku, 4);
+  Serial.print(F(","));
+  Serial.print(avgPeriod, 2);
+  Serial.print(F(","));
+  Serial.print(lastTuneResults.Tu, 2);
+  Serial.print(F(","));
+  Serial.println(Ku, 2);
   
   if (periodStdDev > avgPeriod * 0.15 && avgPeriod > 0.01) {
-    Serial.println(F("WARNING: High variance"));
   }
 
   // Validate Tu before calculating gains
   if (lastTuneResults.Tu < 0.01 || lastTuneResults.Tu > 10.0) {
-    Serial.println(F("ERROR: Invalid ultimate period (Tu). Cannot calculate gains."));
-    Serial.print(F("Tu = "));
-    Serial.println(lastTuneResults.Tu, 3);
+    Serial.print(F("ERR Tu:"));
+    Serial.println(lastTuneResults.Tu, 2);
     lastTuneResults.valid = false;
     return;
   }
 
   // Offer tuning options
-  Serial.println(F("\n=== TUNING OPTIONS ==="));
-  Serial.println(F("Select a tuning method:"));
+  Serial.println(F("\nSelect 1-6:"));
   
   // Pre-compute suggested gains with safety checks
   float Tu = lastTuneResults.Tu;
@@ -1288,14 +1190,37 @@ void autoTuneZieglerNichols() {
   float ki5 = 0.0;
   float kd5 = 0.125 * Ku * Tu;
 
-  Serial.print(F("1. Conservative -> Kp=")); Serial.print(kp1, 4); Serial.print(F(" Ki=")); Serial.print(ki1, 4); Serial.print(F(" Kd=")); Serial.println(kd1, 4);
-  Serial.print(F("2. Classic ZN -> Kp=")); Serial.print(kp2, 4); Serial.print(F(" Ki=")); Serial.print(ki2, 4); Serial.print(F(" Kd=")); Serial.println(kd2, 4);
-  Serial.print(F("3. Aggressive -> Kp=")); Serial.print(kp3, 4); Serial.print(F(" Ki=")); Serial.print(ki3, 4); Serial.print(F(" Kd=")); Serial.println(kd3, 4);
-  Serial.print(F("4. Tyreus-Luyben -> Kp=")); Serial.print(kp4, 4); Serial.print(F(" Ki=")); Serial.print(ki4, 4); Serial.print(F(" Kd=")); Serial.println(kd4, 4);
-  Serial.print(F("5. PD-Only -> Kp=")); Serial.print(kp5, 4); Serial.print(F(" Ki=")); Serial.print(ki5, 4); Serial.print(F(" Kd=")); Serial.println(kd5, 4);
-  Serial.println(F("6. Cancel"));
-
-  Serial.println(F("\nEnter selection (1-6):"));
+  Serial.print(F("1:"));
+  Serial.print(kp1, 3);
+  Serial.print(F(","));
+  Serial.print(ki1, 3);
+  Serial.print(F(","));
+  Serial.println(kd1, 3);
+  Serial.print(F("2:"));
+  Serial.print(kp2, 3);
+  Serial.print(F(","));
+  Serial.print(ki2, 3);
+  Serial.print(F(","));
+  Serial.println(kd2, 3);
+  Serial.print(F("3:"));
+  Serial.print(kp3, 3);
+  Serial.print(F(","));
+  Serial.print(ki3, 3);
+  Serial.print(F(","));
+  Serial.println(kd3, 3);
+  Serial.print(F("4:"));
+  Serial.print(kp4, 3);
+  Serial.print(F(","));
+  Serial.print(ki4, 3);
+  Serial.print(F(","));
+  Serial.println(kd4, 3);
+  Serial.print(F("5:"));
+  Serial.print(kp5, 3);
+  Serial.print(F(","));
+  Serial.print(ki5, 3);
+  Serial.print(F(","));
+  Serial.println(kd5, 3);
+  Serial.println(F("6: Cancel"));
 
   // Flush any leftover input
   while (Serial.available()) { Serial.read(); }
@@ -1314,28 +1239,24 @@ void autoTuneZieglerNichols() {
       newKp = 0.3 * 0.6 * Ku;
       newKi = (Tu > 0.001) ? (0.3 * 1.2 * Ku / Tu) : 0.0;
       newKd = 0.3 * 0.075 * Ku * Tu;
-      Serial.println(F("Applying Conservative gains..."));
       break;
 
     case '2':  // Classic ZN
       newKp = 0.6 * Ku;
       newKi = (Tu > 0.001) ? (1.2 * Ku / Tu) : 0.0;
       newKd = 0.075 * Ku * Tu;
-      Serial.println(F("Applying Classic ZN gains..."));
       break;
 
     case '3':  // Aggressive
       newKp = 0.8 * 0.6 * Ku;
       newKi = (Tu > 0.001) ? (0.8 * 1.2 * Ku / Tu) : 0.0;
       newKd = 0.8 * 0.075 * Ku * Tu;
-      Serial.println(F("Applying Aggressive gains..."));
       break;
 
     case '4': {  // Tyreus-Luyben
       newKp = 0.45 * Ku;
       newKi = (Tu > 0.001) ? (newKp * 2.2 / Tu) : 0.0;
       newKd = newKp * (Tu / 6.3);
-      Serial.println(F("Applying Tyreus-Luyben gains..."));
       break;
     }
 
@@ -1343,11 +1264,10 @@ void autoTuneZieglerNichols() {
       newKp = 0.6 * Ku;
       newKi = 0.0;
       newKd = 0.125 * Ku * Tu;
-      Serial.println(F("Applying PD-Only gains..."));
       break;
 
     default:
-      Serial.println(F("Auto-tune cancelled. Gains not changed."));
+      Serial.println(F("Cancel"));
       return;
   }
 
@@ -1355,32 +1275,24 @@ void autoTuneZieglerNichols() {
   KI = newKi;
   KD = newKd;
 
-  Serial.println(F("\n=== NEW GAINS ==="));
-  Serial.print(F("Kp="));
-  Serial.print(KP, 6);
-  Serial.print(F(" Ki="));
-  Serial.print(KI, 6);
-  Serial.print(F(" Kd="));
-  Serial.println(KD, 6);
-
+  Serial.print(F("P:"));
+  Serial.print(KP, 4);
+  Serial.print(F(" I:"));
+  Serial.print(KI, 4);
+  Serial.print(F(" D:"));
+  Serial.println(KD, 4);
   saveCalibration();
-  Serial.println(F("Saved. Use 'T' to test."));
 }
 
-// ============================================================================
-// STEP RESPONSE ANALYSIS - ENHANCED
-// ============================================================================
+// STEP RESPONSE
 
 void stepResponse() {
-  Serial.println(F("\n=== STEP RESPONSE ANALYSIS ==="));
-
+  Serial.println(F("\nSTEP"));
   if (!isCalibrated) {
-    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    Serial.println(F("ERR: Run R first"));
     return;
   }
-
-  Serial.println(F("This will apply a step voltage and record the response."));
-  Serial.println(F("Press 'Y' to continue..."));
+  Serial.println(F("Y to start"));
 
   // Flush and wait for response
   while (Serial.available()) { Serial.read(); }
@@ -1393,7 +1305,7 @@ void stepResponse() {
   }
 
   if (toupper(response) != 'Y') {
-    Serial.println(F("Cancelled."));
+    Serial.println(F("Cancel"));
     return;
   }
 
@@ -1401,8 +1313,7 @@ void stepResponse() {
   homeToLeft();
   delay(1000);
 
-  Serial.println(F("\nApplying step voltage of 9.0V..."));
-  Serial.println(F("Time(ms),Position(counts),Velocity(counts/s)"));
+  Serial.println(F("T(ms),Pos,Vel"));
 
   unsigned long startTime = millis();
   long startPosition = motorEncoder.read();
@@ -1451,35 +1362,24 @@ void stepResponse() {
   long finalPosition = motorEncoder.read();
   long totalMovement = abs(finalPosition - startPosition);
 
-  // Analyze response
-  Serial.println(F("\n=== STEP RESPONSE ANALYSIS ==="));
-  Serial.print(F("Total movement: "));
-  Serial.print(totalMovement);
-  Serial.println(F(" encoder counts"));
-  
-  // Find 10%, 50%, 90% points for rise time calculation
+  Serial.print(F("Move:"));
+  Serial.println(totalMovement);
   long target10 = startPosition + (long)(totalMovement * 0.1);
   long target50 = startPosition + (long)(totalMovement * 0.5);
   long target90 = startPosition + (long)(totalMovement * 0.9);
-  
   unsigned long time10 = 0, time50 = 0, time90 = 0;
-  
   for (int i = 0; i < sampleCount; i++) {
     if (time10 == 0 && positions[i] >= target10) time10 = times[i];
     if (time50 == 0 && positions[i] >= target50) time50 = times[i];
     if (time90 == 0 && positions[i] >= target90) time90 = times[i];
   }
-  
   if (time10 > 0 && time90 > 0) {
-    Serial.print(F("Rise time (10%-90%): "));
-    Serial.print(time90 - time10);
-    Serial.println(F(" ms"));
+    Serial.print(F("Rise:"));
+    Serial.println(time90 - time10);
   }
-  
   if (time50 > 0) {
-    Serial.print(F("Time to 50%: "));
-    Serial.print(time50);
-    Serial.println(F(" ms"));
+    Serial.print(F("T50:"));
+    Serial.println(time50);
   }
 
   // Return home
@@ -1495,7 +1395,7 @@ void manualPositionTest() {
   Serial.println(F("\n=== MANUAL POSITION TEST ==="));
 
   if (!isCalibrated) {
-    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    Serial.println(F("ERR: Run R first"));
     return;
   }
 
@@ -1515,10 +1415,7 @@ void manualPositionTest() {
   // Always target Lane 3 for this test
   long targetPosition = LANE_POSITIONS[2];
 
-  Serial.print(F("Moving to Lane 3 position: "));
-  Serial.println(targetPosition);
-  Serial.println(F("Press any key to stop test early."));
-  Serial.println(F("\nTime(s),Position,Error,Integral,AppliedVoltage"));
+  Serial.println(F("\nT(s),Pos,Err,I,V"));
 
   // Reset PID state
   error = 0;
@@ -1595,42 +1492,28 @@ void manualPositionTest() {
 
   setMotorVoltage(0);
 
-  Serial.println(F("\n=== TEST COMPLETE ==="));
-  Serial.print(F("Final position: "));
-  Serial.println(motorEncoder.read());
-  Serial.print(F("Final error: "));
+  Serial.print(F("Final:"));
+  Serial.print(motorEncoder.read());
+  Serial.print(F(" Err:"));
   Serial.println(error);
-  
   if (hasSettled) {
-    float settleTime = (settledTime - startTime) / 1000.0;
-    Serial.print(F("Settling time: "));
-    Serial.print(settleTime, 2);
-    Serial.println(F(" seconds"));
+    Serial.print(F("Settle:"));
+    Serial.println((settledTime - startTime) / 1000.0, 1);
   }
-  else {
-    Serial.println(F("Warning: Did not settle within test period."));
-  }
-  
   if (maxOvershoot > 0) {
-    Serial.print(F("Max overshoot: "));
-    Serial.print(maxOvershoot);
-    Serial.println(F(" counts"));
+    Serial.print(F("Overshoot:"));
+    Serial.println(maxOvershoot);
   }
 }
 
-// ============================================================================
 // MANUAL LANE MOVE
-// ============================================================================
 
 void manualLaneMove() {
-  Serial.println(F("\n=== MANUAL LANE MOVE ==="));
-
   if (!isCalibrated) {
-    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    Serial.println(F("ERR: Run R first"));
     return;
   }
-
-  Serial.println(F("Enter lane number (1-4), or 0 to cancel:"));
+  Serial.println(F("Lane 1-4:"));
   while (Serial.available()) Serial.read();
   int lane = -1;
   while (lane == -1) {
@@ -1643,16 +1526,8 @@ void manualLaneMove() {
     while (Serial.available()) Serial.read();
   }
 
-  if (lane < 1 || lane > 4) {
-    Serial.println(F("Cancelled."));
-    return;
-  }
-
+  if (lane < 1 || lane > 4) return;
   long target = LANE_POSITIONS[lane - 1];
-  Serial.print(F("Homing then moving to lane "));
-  Serial.print(lane);
-  Serial.print(F(" at position "));
-  Serial.println(target);
 
   homeToLeft();
   delay(300);
@@ -1661,12 +1536,10 @@ void manualLaneMove() {
   manualMoveTo(target);
 }
 
-// ============================================================================
-// SHARED MANUAL MOVE HELPER - ENHANCED
-// ============================================================================
+// MANUAL MOVE HELPER
 
 void manualMoveTo(long targetPosition) {
-  Serial.println(F("\nTime(s),Position,Error,Integral,AppliedVoltage"));
+  Serial.println(F("\nT(s),Pos,Err,I,V"));
 
   // Clear any pending serial input
   while (Serial.available()) { Serial.read(); }
@@ -1729,33 +1602,22 @@ void manualMoveTo(long targetPosition) {
 
   setMotorVoltage(0);
 
-  Serial.println(F("\n=== MOVE COMPLETE ==="));
-  Serial.print(F("Final position: "));
-  Serial.println(motorEncoder.read());
-  Serial.print(F("Final error: "));
+  Serial.print(motorEncoder.read());
+  Serial.print(F(" "));
   Serial.println(error);
-
   if (hasSettled) {
-    float settleTime = (settledTime - startTime) / 1000.0;
-    Serial.print(F("Settling time: "));
-    Serial.print(settleTime, 2);
-    Serial.println(F(" seconds"));
-  } else {
-    Serial.println(F("Warning: Did not settle within test period."));
+    Serial.print(F("Settle:"));
+    Serial.println((settledTime - startTime) / 1000.0, 1);
   }
 }
 
-// ============================================================================
 // LANE TRANSITION TEST
-// ============================================================================
 
 void testLaneTransitions() {
-  Serial.println(F("\n=== LANE TRANSITION TEST ==="));
-  Serial.println(F("Tests all lane-to-lane transitions"));
-  Serial.println(F("Press any key to stop early\n"));
+  Serial.println(F("\nLANE TRANS TEST"));
 
   if (!isCalibrated) {
-    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    Serial.println(F("ERR: Run R first"));
     return;
   }
 
@@ -1793,8 +1655,7 @@ void testLaneTransitions() {
     {4, 1}, {4, 2}, {4, 3}
   };
 
-  Serial.println(F("From,To,Time(s),Overshoot,FinalErr,Settled"));
-  Serial.println(F("----------------------------------------"));
+  Serial.println(F("From,To,T(s),Ovr,Err,Set"));
 
   for (int t = 0; t < 12; t++) {
     int fromLane = transitions[t][0];
@@ -1804,9 +1665,6 @@ void testLaneTransitions() {
     long targetPos = LANE_POSITIONS[toLane - 1];
     
     // Move to starting lane
-    Serial.print(F("Moving to L"));
-    Serial.print(fromLane);
-    Serial.print(F("..."));
     manualMoveToPosition(startPos, 3000);
     delay(500);
     
@@ -1895,12 +1753,11 @@ void testLaneTransitions() {
     delay(500);
     
     if (earlyStop) {
-      Serial.println(F("\nTest stopped by user"));
+      Serial.println(F("Stop"));
       break;
     }
   }
   
-  Serial.println(F("\n=== TEST COMPLETE ==="));
   setMotorVoltage(0);
 }
 
@@ -1935,12 +1792,9 @@ void manualMoveToPosition(long targetPosition, unsigned long maxTime) {
   setMotorVoltage(0);
 }
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
+// UTILITY
 
 void homeToLeft() {
-  Serial.println(F("Homing to left limit..."));
 
   float driveVoltage = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotorVoltage(driveVoltage);
@@ -1951,7 +1805,7 @@ void homeToLeft() {
   
   while (digitalRead(LIMIT_LEFT) == LOW) {  // LOW = not pressed
     if (millis() - startTime > 12000) {
-      Serial.println(F("ERROR: Timeout during homing"));
+      Serial.println(F("ERR: timeout"));
       setMotorVoltage(0);
       return;
     }
@@ -1962,7 +1816,6 @@ void homeToLeft() {
       lastMoveTime = millis();
       lastPosition = currentPos;
     } else if (millis() - lastMoveTime > 3000) {
-      Serial.println(F("WARNING: Motor appears stuck, increasing voltage..."));
       driveVoltage = min(driveVoltage + 0.5, 8.0);
       setMotorVoltage(driveVoltage);
       lastMoveTime = millis();
@@ -1992,81 +1845,54 @@ void homeToLeft() {
 
   motorEncoder.write(0);
   positionFilterInitialized = false;
-  Serial.println(F("Homed. Encoder zeroed."));
 }
 
 void printStatus() {
-  Serial.println(F("\n=== STATUS ==="));
-  Serial.print(F("Cal: "));
-  Serial.print(isCalibrated ? F("YES") : F("NO"));
-  Serial.print(F(", Pos: "));
-  Serial.println(motorEncoder.read());
-  Serial.print(F("Range: "));
+  Serial.print(isCalibrated ? F("Y") : F("N"));
+  Serial.print(F(" "));
+  Serial.print(motorEncoder.read());
+  Serial.print(F(" "));
   Serial.print(LEFT_LIMIT_POSITION);
-  Serial.print(F(" to "));
-  Serial.println(RIGHT_LIMIT_POSITION);
-  Serial.print(F("Kp="));
-  Serial.print(KP, 4);
-  Serial.print(F(" Ki="));
-  Serial.print(KI, 4);
-  Serial.print(F(" Kd="));
-  Serial.println(KD, 4);
-  Serial.print(F("Friction L="));
-  Serial.print(FRICTION_LEFT, 2);
-  Serial.print(F(" R="));
-  Serial.println(FRICTION_RIGHT, 2);
-  Serial.print(F("Lanes: "));
+  Serial.print(F("-"));
+  Serial.print(RIGHT_LIMIT_POSITION);
+  Serial.print(F(" P:"));
+  Serial.print(KP, 2);
+  Serial.print(F(" I:"));
+  Serial.print(KI, 2);
+  Serial.print(F(" D:"));
+  Serial.print(KD, 2);
+  Serial.print(F(" F:"));
+  Serial.print(FRICTION_LEFT, 1);
+  Serial.print(F("/"));
+  Serial.print(FRICTION_RIGHT, 1);
+  Serial.print(F(" L:"));
   for (int i = 0; i < 4; i++) {
     Serial.print(LANE_POSITIONS[i]);
     if (i < 3) Serial.print(F(","));
   }
-  Serial.println();
   if (lastTuneResults.valid) {
-    Serial.print(F("Last tune: Ku="));
-    Serial.print(lastTuneResults.Ku, 3);
-    Serial.print(F(" Tu="));
-    Serial.print(lastTuneResults.Tu, 2);
-    Serial.print(F("s"));
-    Serial.println();
+    Serial.print(F(" Ku:"));
+    Serial.print(lastTuneResults.Ku, 1);
+    Serial.print(F(" Tu:"));
+    Serial.print(lastTuneResults.Tu, 1);
   }
+  Serial.println();
 }
 
 void printHelp() {
-  Serial.println(F("\n=== COMMANDS ==="));
-  Serial.println(F("R - Calibrate Range"));
-  Serial.println(F("F - Friction Characterization"));
-  Serial.println(F("Z - Ziegler-Nichols Auto-Tune"));
-  Serial.println(F("S - Step Response"));
-  Serial.println(F("T - Manual Position Test"));
-  Serial.println(F("M - Manual lane move"));
-  Serial.println(F("X - Lane Transition Test (all transitions)"));
-  Serial.println(F("H - Home"));
-  Serial.println(F("P - Print Status"));
-  Serial.println(F("C - Clear Calibration"));
-  Serial.println(F("1-4 - Set lane position"));
-  Serial.println(F("L - Load from EEPROM"));
-  Serial.println(F("W - Write to EEPROM"));
-  Serial.println(F("? - Help"));
-  Serial.println(F("\nWorkflow: R -> F -> Z -> T"));
+  Serial.println(F("\nR F Z S T M X H P C 1-4 L W ?"));
 }
 
 void printWelcome() {
-  Serial.println(F("\n=== ME350 PID AUTO-TUNE ==="));
-  Serial.println(F("Press '?' for help\n"));
-
+  Serial.println(F("\nPID TUNE"));
   if (isCalibrated) {
-    Serial.println(F("Calibration loaded from EEPROM."));
-    Serial.println(F("Use 'P' to view current settings."));
-  }
-  else {
-    Serial.println(F("System not calibrated."));
-    Serial.println(F("Run 'R' command to calibrate range."));
+    Serial.println(F("Cal OK"));
+  } else {
+    Serial.println(F("Run R"));
   }
 }
 
-// ============================================================================
-// EEPROM FUNCTIONS
-// ============================================================================
+// EEPROM
 
 void saveCalibration() {
   EEPROM.write(EEPROM_CALIBRATION_FLAG, 0xAA);  // Magic number
@@ -2081,7 +1907,7 @@ void saveCalibration() {
     EEPROM.put(EEPROM_LANES_BASE + i * sizeof(long), LANE_POSITIONS[i]);
   }
 
-  Serial.println(F("Calibration saved to EEPROM."));
+  Serial.println(F("Saved"));
 }
 
 void loadCalibration() {
@@ -2126,8 +1952,7 @@ void clearCalibration() {
   isCalibrated = false;
   frictionCharacterized = false;
 
-  Serial.println(F("Calibration cleared. Defaults restored."));
-  Serial.println(F("Run 'R' to recalibrate."));
+  Serial.println(F("Cleared"));
 }
 
 float cappedVoltageForError(float voltage, long error) {
