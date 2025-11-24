@@ -680,31 +680,31 @@ void runStateMachine() {
         break;
       }
       
-      // Apply hysteresis only if we have both a previous target AND a new target candidate
-      // AND the previous target is still valid (forward and close)
-      // But be more willing to switch if new target is closer
-      if (previousTargetIndex >= 0 && 
-          previousTargetIndex < 4 &&
+      // Apply hysteresis - compare new target against CURRENT active target (not previous)
+      // This ensures we always switch to the closest available target
+      if (activeTargetIndex >= 0 && 
+          activeTargetIndex < 4 &&
           newTargetIndex >= 0 &&
-          ProxSensors[previousTargetIndex].direction == FORWARD &&
-          zombieDistances[previousTargetIndex] < MIN_COMMIT_DISTANCE) {
-        // Previous target is still close and forward
-        float prevDist = zombieDistances[previousTargetIndex];
+          newTargetIndex != activeTargetIndex &&
+          ProxSensors[activeTargetIndex].direction == FORWARD &&
+          zombieDistances[activeTargetIndex] < MIN_COMMIT_DISTANCE) {
+        // Current target is still close and forward - compare distances
+        float currentDist = zombieDistances[activeTargetIndex];
         float newDist = zombieDistances[newTargetIndex];
         
-        // Switch if new target is closer (reduced threshold for more responsiveness)
-        if (newDist < (prevDist - 0.10)) {  // Reduced from CLOSER_THREAT_THRESHOLD (0.20) to 0.10
+        // Switch if new target is closer (very low threshold for responsiveness)
+        if (newDist < (currentDist - 0.05)) {  // Even lower threshold - switch if 5% closer
           // New target is closer - switch to it
           activeTargetIndex = newTargetIndex;
           closestZombieDist = newClosestDist;
         } else {
-          // Stay with previous target only if it's still closer
-          activeTargetIndex = previousTargetIndex;
+          // Current target is still closer - keep it
+          // activeTargetIndex stays the same
           closestZombieDist = zombieDistances[activeTargetIndex];
         }
       } else {
-        // No previous target, or previous target is no longer valid, or no new target found
-        // Use the new target if found
+        // No current target, or current target is no longer valid, or no new target found
+        // Use the new target if found (this is the normal case)
         activeTargetIndex = newTargetIndex;
         closestZombieDist = newClosestDist;
       }
@@ -1976,9 +1976,22 @@ bool homeToLeftLimit() {
       }
     }
 
-    stopMotor();
-    delay(200);  // Brief pause before zeroing
-
+    // Continue holding against switch while zeroing to prevent drift
+    // Verify switch is still pressed before zeroing
+    if (!leftPressed()) {
+      // Switch released - try to re-engage
+      setMotor(holdVoltage);
+      delay(100);
+      if (!leftPressed()) {
+        stopMotor();
+        return false;  // Couldn't maintain contact with switch
+      }
+    }
+    
+    // Keep holding while zeroing
+    setMotor(holdVoltage);
+    delay(100);  // Brief pause while still holding
+    
     // Multiple zeroing attempts to ensure encoder is properly reset
     encoder.write(0);
     delay(50);
@@ -1989,12 +2002,35 @@ bool homeToLeftLimit() {
     encoder.write(0);
     delay(50);
     
-    // Verify encoder is actually zeroed
+    // Verify encoder is actually zeroed and switch is still pressed
+    if (!leftPressed()) {
+      // Switch released during zeroing - re-engage
+      setMotor(holdVoltage);
+      delay(100);
+      if (!leftPressed()) {
+        stopMotor();
+        return false;
+      }
+    }
+    
     long finalPos = encoder.read();
     if (abs(finalPos) > 2) {
       encoder.write(0);
       delay(50);
     }
+    
+    // Final verification - ensure switch is still pressed
+    if (!leftPressed()) {
+      setMotor(holdVoltage);
+      delay(100);
+      if (!leftPressed()) {
+        stopMotor();
+        return false;
+      }
+    }
+    
+    stopMotor();
+    delay(50);  // Brief pause after stopping
 
     // CRITICAL: Reload lane positions from EEPROM after homing
     // This ensures they're never modified
@@ -2041,20 +2077,45 @@ bool homeToLeftLimit() {
 
   // Hold on the switch with debounce - ensure it settles
   while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
-    setMotor(holdVoltage);  // Keep holding against switch
-    delay(10);
-    long pos = encoder.read();
-    if (abs(pos - lastPos) <= 1) {
-      stableTicks++;
+    if (!leftPressed()) {
+      // Switch released - re-engage
+      setMotor(holdVoltage);
+      delay(50);
+      if (!leftPressed()) {
+        stopMotor();
+        return false;
+      }
+      stableTicks = 0;  // Reset stability counter
+      lastPos = encoder.read();
     } else {
-      stableTicks = 0;
-      lastPos = pos;
+      setMotor(holdVoltage);  // Keep holding against switch
+      delay(10);
+      long pos = encoder.read();
+      if (abs(pos - lastPos) <= 1) {
+        stableTicks++;
+      } else {
+        stableTicks = 0;
+        lastPos = pos;
+      }
     }
   }
 
-  stopMotor();
-  delay(200);  // Brief pause before zeroing
-
+  // Continue holding against switch while zeroing to prevent drift
+  // Verify switch is still pressed before zeroing
+  if (!leftPressed()) {
+    // Switch released - try to re-engage
+    setMotor(holdVoltage);
+    delay(100);
+    if (!leftPressed()) {
+      stopMotor();
+      return false;  // Couldn't maintain contact with switch
+    }
+  }
+  
+  // Keep holding while zeroing
+  setMotor(holdVoltage);
+  delay(100);  // Brief pause while still holding
+  
   // Multiple zeroing attempts to ensure encoder is properly reset
   encoder.write(0);
   delay(50);
@@ -2065,12 +2126,35 @@ bool homeToLeftLimit() {
   encoder.write(0);
   delay(50);
   
-  // Verify encoder is actually zeroed
+  // Verify encoder is actually zeroed and switch is still pressed
+  if (!leftPressed()) {
+    // Switch released during zeroing - re-engage
+    setMotor(holdVoltage);
+    delay(100);
+    if (!leftPressed()) {
+      stopMotor();
+      return false;
+    }
+  }
+  
   long finalPos = encoder.read();
   if (abs(finalPos) > 2) {
     encoder.write(0);
     delay(50);
   }
+  
+  // Final verification - ensure switch is still pressed
+  if (!leftPressed()) {
+    setMotor(holdVoltage);
+    delay(100);
+    if (!leftPressed()) {
+      stopMotor();
+      return false;
+    }
+  }
+  
+  stopMotor();
+  delay(50);  // Brief pause after stopping
 
   // CRITICAL: Reload lane positions from EEPROM after homing
   // This ensures they're never modified
