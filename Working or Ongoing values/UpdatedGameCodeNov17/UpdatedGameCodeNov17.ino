@@ -764,7 +764,7 @@ void runStateMachine() {
           (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
                      abs(motorVelocity) < 30 &&
           abs(errorToOriginalTarget) <= 8 &&
-          abs(errorToOriginalTarget) > 2 &&
+          abs(errorToOriginalTarget) > 3 &&
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           !ProxSensors[activeTargetIndex].hitDetected &&
           zombieDistances[activeTargetIndex] < 0.30 &&
@@ -817,7 +817,7 @@ void runStateMachine() {
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
                      abs(motorVelocity) < 30 &&  // Increased threshold to trigger earlier
-                     abs(errorToOriginalTarget) > 2 &&
+                     abs(errorToOriginalTarget) > 3 &&
                      abs(errorToOriginalTarget) <= 7 &&
                      !ProxSensors[activeTargetIndex].hitDetected) {  // Not yet hit
               
@@ -844,7 +844,7 @@ void runStateMachine() {
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
                      abs(motorVelocity) < 25 &&  // Increased threshold to trigger earlier
-                     abs(errorToCurrentTarget) > 2 &&  // Skip if within +/- 2 counts
+                     abs(errorToCurrentTarget) > 3 &&  // Skip if within +/- 3 counts (deadband)
                      !ProxSensors[activeTargetIndex].hitDetected &&  // Not yet hit
                      (millis() - arrivalTime) >= 100) {  // Reduced delay for faster continuous correction
               
@@ -883,7 +883,9 @@ void runMotionControl() {
   long currentPosition = encoder.read();
   
   long adjustedDesiredPosition = desiredPosition;
-  if (!fineAdjustmentActive) {
+  // Disable momentum compensation when very close to target to prevent oscillation
+  long errorToTarget = abs(desiredPosition - currentPosition);
+  if (!fineAdjustmentActive && errorToTarget > 10) {
     if (currentPosition > desiredPosition) {
       adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
     } else if (currentPosition < desiredPosition) {
@@ -916,18 +918,33 @@ void runMotionControl() {
   
   float originalError = desiredPosition - currentPosition;
   
-  // Skip all correction if within +/- 2 counts to prevent oscillation
-  if (abs(originalError) <= 2) {
+  // Deadband with hysteresis: stop if within +/- 3 counts, only resume if error > 5 counts
+  static bool inDeadband = false;
+  static unsigned long lastMoveStart = 0;
+  
+  // Reset deadband flag when starting a new move
+  if (moveStartTime != lastMoveStart) {
+    inDeadband = false;
+    lastMoveStart = moveStartTime;
+  }
+  
+  if (abs(originalError) <= 3) {
+    inDeadband = true;
     stopMotor();
     errorIntegral = 0;
     adaptiveLearning = false;
+    lastError = 0;  // Reset lastError to prevent derivative spikes
     if (!targetReached) {
       targetReached = true;
-      Serial.print(F("At "));
-      Serial.print(currentPosition);
-      Serial.print(F(" err="));
-      Serial.println(originalError);
     }
+    return;
+  }
+  // Hysteresis: only resume correction if error exceeds 5 counts
+  if (inDeadband && abs(originalError) > 5) {
+    inDeadband = false;
+  }
+  if (inDeadband) {
+    stopMotor();
     return;
   }
   
@@ -949,8 +966,8 @@ void runMotionControl() {
 
   targetReached = false;
 
-  // Retry logic - skip if within +/- 2 counts
-  if (abs(originalError) > 2 && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
+  // Retry logic - skip if within +/- 3 counts (deadband)
+  if (abs(originalError) > 3 && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
     // Check if stuck
     if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
@@ -1047,9 +1064,10 @@ void runMotionControl() {
     return;
   }
   
-  // Skip PID correction if error is within +/- 2 counts
-  if (abs(error) <= 2) {
+  // Skip PID correction if error is within +/- 3 counts (deadband)
+  if (abs(error) <= 3) {
     stopMotor();
+    lastError = 0;  // Reset to prevent derivative spikes
     return;
   }
   
@@ -1057,7 +1075,7 @@ void runMotionControl() {
   
   // PID CONTROL - uses EEPROM values
   
-  // Adaptive PID gains
+  // Adaptive PID gains - reduce aggressiveness when close to target
   if (abs(error) > 1000) {
     KP_active = KP * 3.5;
     KI_active = 0;
@@ -1077,13 +1095,19 @@ void runMotionControl() {
     KP_active = KP * 2.0;
     KI_active = KI * 0.8;
     KD_active = KD * 1.2;
-  } else {
-    KP_active = KP * 1.5;
-    KI_active = KI * 1.3;
-    KD_active = KD * 1.2;
-    
+  } else if (abs(error) > 10) {
+    // Reduced gains when close to target to prevent oscillation
+    KP_active = KP * 1.0;
+    KI_active = KI * 0.5;
+    KD_active = KD * 1.5;  // Higher damping when close
     errorIntegral += error * dt;
     errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
+  } else {
+    // Very close - minimal gains
+    KP_active = KP * 0.5;
+    KI_active = 0;  // Disable integral when very close
+    KD_active = KD * 2.0;  // High damping
+    errorIntegral = 0;  // Reset integral
   }
   
   float errorDerivative = (error - lastError) / dt;
@@ -1092,9 +1116,12 @@ void runMotionControl() {
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
   
-  // Momentum compensation
+  // Momentum compensation - disabled when very close to target
   float momentumCompensation = 1.0;
-  if (abs(error) > 200) {
+  if (abs(error) <= 10) {
+    // Disable momentum compensation when very close to prevent oscillation
+    momentumCompensation = 1.0;
+  } else if (abs(error) > 200) {
     momentumCompensation = 1.0;
   } else if (abs(error) < 100 && abs(motorVelocity) > 50) {
     float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);
@@ -1109,9 +1136,9 @@ void runMotionControl() {
   pidVoltage *= momentumCompensation;
 
   // FRICTION COMPENSATION - higher on right side (lane 4)
-  // Skip friction compensation if within +/- 2 counts
+  // Skip friction compensation if within +/- 3 counts (deadband)
   float frictionComp = 0;
-  if (abs(error) > 2) {
+  if (abs(error) > 3) {
     bool movingTowardMoreNegative = (error < 0);
     float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float positionFrictionBoost = 1.0;
@@ -1157,9 +1184,9 @@ void runMotionControl() {
   }
 
   float velocityFF = 0;
-  // Fine adjustment boost
+  // Fine adjustment boost - disabled when very close
   float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && abs(error) > 0 && abs(error) <= 5 && abs(motorVelocity) < 15) {
+  if (fineAdjustmentActive && abs(error) > 3 && abs(error) <= 5 && abs(motorVelocity) < 15) {
     float boostMultiplier = 1.2;
     fineAdjustmentBoost = error * boostMultiplier;
     fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);
@@ -1216,9 +1243,9 @@ void runMotionControl() {
   }
 
   // Stuck detection with voltage ramping
-  // Skip stuck detection if within +/- 2 counts
+  // Skip stuck detection if within +/- 3 counts (deadband)
   unsigned long currentTime = millis();
-  if (abs(originalError) > 2) {
+  if (abs(originalError) > 3) {
     if (currentTime - lastStuckCheckTime >= 150) {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
         stuckCounter++;
@@ -1261,8 +1288,8 @@ void runMotionControl() {
   }
 
   // Ensure minimum voltage for error correction
-  // Skip if within +/- 2 counts
-  if (abs(originalError) > 2 && !voltageRamping) {
+  // Skip if within +/- 3 counts (deadband)
+  if (abs(originalError) > 3 && !voltageRamping) {
     bool movingRight = (error < 0);
     float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);
