@@ -166,9 +166,7 @@ const int TARGET_BAND = 2;
 const float MAX_INTEGRAL = 1200.0;
 const unsigned long CONTROL_PERIOD = 10;
 
-  // Momentum compensation
-  const int RIGHTWARD_DRIFT_OFFSET = 2;
-  const int LEFTWARD_DRIFT_OFFSET = 2;
+  // Momentum compensation (removed drift offsets - they caused systematic errors)
 
 // MOTION CONTROL
 long desiredPosition = 0;
@@ -639,11 +637,12 @@ void runStateMachine() {
     case MOVE_TO_TARGET:
       long currentPos = encoder.read();
       
-      // Immediate drift/jump detection before movement
-      if (autoMode && lastKnownGoodPosition != 0) {
+      // Check for large jumps before movement - only if truly stationary
+      // Don't over-correct during leftward movement preparation
+      if (autoMode && lastKnownGoodPosition != 0 && abs(motorVelocity) < 3) {
         long jump = abs(currentPos - lastKnownGoodPosition);
-        // Lower threshold for immediate correction
-        if (jump > 20 && abs(motorVelocity) < 5) {
+        // Only correct very large jumps when stationary
+        if (jump > 100) {
           encoder.write(lastKnownGoodPosition);
           currentPos = lastKnownGoodPosition;
         }
@@ -979,26 +978,20 @@ void runMotionControl() {
     lastKnownGoodPosition = LOWER_BOUND;
   }
   
-  if (autoMode && lastKnownGoodPosition != 0) {
+  // Quick drift check - only when truly stationary, not during movement
+  // During leftward movement, encoder readings can vary - don't interfere
+  if (autoMode && lastKnownGoodPosition != 0 && abs(motorVelocity) < 3 && currentState != MOVE_TO_TARGET) {
     long positionChange = abs(currentPosition - lastKnownGoodPosition);
-    if (positionChange > 50 && abs(motorVelocity) < 10 && currentState != MOVE_TO_TARGET) {
+    // Only correct large unexpected changes when truly stationary
+    if (positionChange > 100) {
       encoder.write(lastKnownGoodPosition);
       currentPosition = lastKnownGoodPosition;
     }
   }
   
-  long adjustedDesiredPosition = desiredPosition;
-  // Disable momentum compensation when very close to target to prevent oscillation
-  long errorToTarget = abs(desiredPosition - currentPosition);
-  if (!fineAdjustmentActive && errorToTarget > 10) {
-    if (currentPosition > desiredPosition) {
-      adjustedDesiredPosition = desiredPosition + RIGHTWARD_DRIFT_OFFSET;
-    } else if (currentPosition < desiredPosition) {
-      adjustedDesiredPosition = desiredPosition - LEFTWARD_DRIFT_OFFSET;
-    }
-  }
-  
-  float error = adjustedDesiredPosition - currentPosition;
+  // Remove drift offsets - they were causing systematic errors
+  // Drift is now handled by dedicated drift detection functions
+  float error = desiredPosition - currentPosition;
   
   if (rightPressed() && error < 0) {
     stopMotor();
@@ -1018,11 +1011,13 @@ void runMotionControl() {
     lastKnownGoodPosition = LOWER_BOUND;
   }
   
-  // Detect large jumps in runMotionControl - immediate correction
+  // Detect large jumps - only when truly stationary, not during movement
+  // During leftward movement, encoder readings can vary slightly - don't over-correct
   if (autoMode && lastKnownGoodPosition != 0) {
     long jump = abs(currentPosition - lastKnownGoodPosition);
-    // Lower threshold to catch encoder glitches earlier
-    if (jump > 50 && abs(motorVelocity) < 10 && currentState != MOVE_TO_TARGET) {
+    // Only correct if truly stationary and jump is very large (likely encoder glitch)
+    // Don't correct during active movement to avoid interfering with leftward motion
+    if (jump > 100 && abs(motorVelocity) < 5 && currentState != MOVE_TO_TARGET) {
       encoder.write(lastKnownGoodPosition);
       currentPosition = lastKnownGoodPosition;
     }
@@ -1030,7 +1025,6 @@ void runMotionControl() {
   
   if (dynamicCalibrationActive) {
     desiredPosition = LOWER_BOUND;
-    adjustedDesiredPosition = LOWER_BOUND;
     error = desiredPosition - currentPosition;
     if (abs(error) > 10) {
       setMotor(constrain(error * 0.05, -2.0, 2.0));
@@ -1534,45 +1528,50 @@ void mitigateDrift() {
     return;
   }
   
-  // Check for large jumps (encoder glitches) - immediate correction
+  // Check for large jumps (encoder glitches) - only when truly stationary
+  // During leftward movement, don't over-correct small variations
   if (lastKnownGoodPosition != 0) {
     long jump = abs(currentPos - lastKnownGoodPosition);
-    // Large jump when stationary = encoder glitch, correct immediately
-    // Lower threshold to catch smaller glitches (like -542 to 0)
-    if (jump > 100 && abs(motorVelocity) < 10) {
+    // Only correct large jumps when truly stationary (not during movement)
+    if (jump > 150 && abs(motorVelocity) < 5) {
       encoder.write(lastKnownGoodPosition);
       currentPos = lastKnownGoodPosition;
       return;
     }
   }
   
-  bool isStationary = (currentState == CHOOSE_ACTIVE_TARGET || abs(motorVelocity) < 5);
-  if (lastDriftCheckPosition != 0) {
+  // Drift detection - only check when stationary to avoid interfering with movement
+  bool isStationary = (currentState == CHOOSE_ACTIVE_TARGET || abs(motorVelocity) < 3);
+  if (isStationary && lastDriftCheckPosition != 0) {
     long driftAmount = abs(currentPos - lastDriftCheckPosition);
+    // Check direction of drift - leftward movement should increase encoder value
+    long driftDirection = currentPos - lastDriftCheckPosition;
+    
+    // Only correct if drift is significant and in wrong direction when stationary
     if (driftAmount > MAX_DRIFT_THRESHOLD) {
-      // Only rehome for extreme cases - otherwise just correct encoder
+      // Only rehome for extreme cases
       if (driftAmount > 500 || currentPos > 100 || currentPos < UPPER_BOUND - 100) {
-        // Extreme drift - rehome but preserve lane positions
         if (homeToLeftLimit()) {
-          // Reload lane positions from EEPROM to ensure they're never modified
           loadCalibrationFromEEPROM();
           lastDriftCheckPosition = 0;
           lastKnownGoodPosition = 0;
           return;
         }
       } else {
-        // Small drift - just correct encoder value
+        // Small drift when stationary - correct it
         encoder.write(lastDriftCheckPosition);
         currentPos = lastDriftCheckPosition;
       }
     }
   }
-  if (isStationary || abs(motorVelocity) < 10) {
+  
+  // Only update reference positions when truly stationary
+  // This prevents locking in incorrect positions during movement
+  if (isStationary) {
     lastDriftCheckPosition = currentPos;
     lastKnownGoodPosition = currentPos;
-  } else {
-    lastKnownGoodPosition = currentPos;
   }
+  // Don't update during movement - wait until stationary to establish new reference
 }
 
 // POSITION VALIDATION
@@ -1595,17 +1594,22 @@ void validatePosition() {
     return;
   }
   
-  // Detect large jumps (encoder glitches) - more aggressive threshold
+  // Detect large jumps - only when truly stationary
+  // During leftward movement, encoder readings can vary - don't over-correct
   if (lastKnownGoodPosition != 0) {
     long positionJump = abs(currentPos - lastKnownGoodPosition);
-    // Lower threshold for immediate correction of encoder glitches
-    if (positionJump > 50 && abs(motorVelocity) < 15) {
+    // Only correct large jumps when stationary (not during active movement)
+    if (positionJump > 100 && abs(motorVelocity) < 5) {
       encoder.write(lastKnownGoodPosition);
       currentPos = lastKnownGoodPosition;
     }
   }
   
-  lastKnownGoodPosition = currentPos;
+  // Only update reference position when stationary
+  // This prevents incorrect positions from being locked in during movement
+  if (abs(motorVelocity) < 5) {
+    lastKnownGoodPosition = currentPos;
+  }
 }
 
 // LIMIT SWITCHES
