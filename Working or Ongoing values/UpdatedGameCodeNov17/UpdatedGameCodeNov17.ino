@@ -471,7 +471,6 @@ void findRangeAndSetBounds() {
     stopMotor();
     delay(100);
     UPPER_BOUND = encoder.read();
-    rangeFindingComplete = true;
     
     // CRITICAL: Reload lane positions from EEPROM after range finding
     // This ensures they're never modified
@@ -2348,7 +2347,6 @@ void processCommand() {
           }
           autoMode = true;
           systemEnabled = true;
-          rangeFindingComplete = true;
           // Initialize drift check
           lastDriftCheckPosition = encoder.read();
           lastKnownGoodPosition = encoder.read();
@@ -2444,7 +2442,6 @@ void processCommand() {
       adaptiveFrictionVoltage = 0;
       adaptiveLearning = false;
       adaptiveLearned = false;
-      rangeFindingComplete = false;
       adaptiveFrictionLeft = FRICTION_LEFT;
       adaptiveFrictionRight = FRICTION_RIGHT;
       Serial.println(F("Reset"));
