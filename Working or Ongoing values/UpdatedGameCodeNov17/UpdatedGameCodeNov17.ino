@@ -120,10 +120,10 @@ float closestZombieDist = 2.0;
 float zombieDistances[4];
 bool WAIT_POS = true;
 unsigned long targetCommitTime = 0;  // Time when target was committed to
-const unsigned long MIN_TARGET_COMMIT_TIME = 600;  // Minimum time to stay at target (ms) - reduced for responsiveness
+const unsigned long MIN_TARGET_COMMIT_TIME = 400;  // Minimum time to stay at target (ms) - further reduced for responsiveness
 const float TARGET_SWITCH_HYSTERESIS = 0.15;  // Must be this much closer to switch
-const float MIN_COMMIT_DISTANCE = 0.20;  // If closer than this, commit to target (reduced from 0.25)
-const float CLOSER_THREAT_THRESHOLD = 0.20;  // Must be this much closer to interrupt (reduced from 0.25)
+const float MIN_COMMIT_DISTANCE = 0.15;  // If closer than this, commit to target (reduced from 0.20)
+const float CLOSER_THREAT_THRESHOLD = 0.10;  // Must be this much closer to interrupt (reduced from 0.20)
 
 // Fine positioning
 long previousMoveStartPosition = 0;
@@ -610,18 +610,34 @@ void runStateMachine() {
       
       // Check if we should stay committed to current target
       // Only if we have a current target AND it's still valid AND we're within commit time
+      // BUT allow override if a much closer threat appears
       bool shouldStayCommitted = false;
+      bool hasMuchCloserThreat = false;
+      
+      if (activeTargetIndex >= 0 && 
+          activeTargetIndex < 4 &&
+          newTargetIndex >= 0 &&
+          newTargetIndex != activeTargetIndex) {
+        // Check if new target is significantly closer (override threshold)
+        float currentDist = zombieDistances[activeTargetIndex];
+        float newDist = zombieDistances[newTargetIndex];
+        if (newDist < (currentDist - 0.15)) {  // New target is 15% closer - allow override
+          hasMuchCloserThreat = true;
+        }
+      }
+      
       if (activeTargetIndex >= 0 && 
           activeTargetIndex < 4 &&
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           zombieDistances[activeTargetIndex] < MIN_COMMIT_DISTANCE &&
           targetCommitTime > 0 &&
-          (millis() - targetCommitTime) < MIN_TARGET_COMMIT_TIME) {
+          (millis() - targetCommitTime) < MIN_TARGET_COMMIT_TIME &&
+          !hasMuchCloserThreat) {  // Don't stay committed if much closer threat exists
         // Check if target is hit or retreated
         if (!ProxSensors[activeTargetIndex].hitDetected &&
             !(ProxSensors[activeTargetIndex].direction == BACKWARD && 
               zombieDistances[activeTargetIndex] > 0.70)) {
-          // Target is still valid - stay committed
+          // Target is still valid - stay committed (unless much closer threat)
           shouldStayCommitted = true;
         }
       }
@@ -649,8 +665,8 @@ void runStateMachine() {
         break;
       }
       
-      // If committed to current target and it's still valid, keep it
-      if (shouldStayCommitted && activeTargetIndex >= 0) {
+      // If committed to current target and it's still valid, keep it (unless much closer threat)
+      if (shouldStayCommitted && activeTargetIndex >= 0 && !hasMuchCloserThreat) {
         activeTargetPosition = targetPositions[activeTargetIndex];
         WAIT_POS = false;
         if (lane4LimitSwitchMode) {
@@ -666,18 +682,23 @@ void runStateMachine() {
       
       // Apply hysteresis only if we have both a previous target AND a new target candidate
       // AND the previous target is still valid (forward and close)
+      // But be more willing to switch if new target is closer
       if (previousTargetIndex >= 0 && 
           previousTargetIndex < 4 &&
           newTargetIndex >= 0 &&
           ProxSensors[previousTargetIndex].direction == FORWARD &&
           zombieDistances[previousTargetIndex] < MIN_COMMIT_DISTANCE) {
-        // Previous target is still close and forward - only switch if new target is significantly closer
-        if (zombieDistances[newTargetIndex] < (zombieDistances[previousTargetIndex] - CLOSER_THREAT_THRESHOLD)) {
-          // New target is significantly closer - switch to it
+        // Previous target is still close and forward
+        float prevDist = zombieDistances[previousTargetIndex];
+        float newDist = zombieDistances[newTargetIndex];
+        
+        // Switch if new target is closer (reduced threshold for more responsiveness)
+        if (newDist < (prevDist - 0.10)) {  // Reduced from CLOSER_THREAT_THRESHOLD (0.20) to 0.10
+          // New target is closer - switch to it
           activeTargetIndex = newTargetIndex;
           closestZombieDist = newClosestDist;
         } else {
-          // Stay with previous target
+          // Stay with previous target only if it's still closer
           activeTargetIndex = previousTargetIndex;
           closestZombieDist = zombieDistances[activeTargetIndex];
         }
@@ -944,14 +965,17 @@ void runStateMachine() {
           }
         }
 
-        // Check for closer threat - only if significantly closer and we're not too close to current target
-        if (zombieDistances[activeTargetIndex] > MIN_COMMIT_DISTANCE) {
-          // Only check for closer threats if we're not very close to current target
-          for (int i = 0; i < 4; i++) {
-            if (i != activeTargetIndex &&
-                ProxSensors[i].direction == FORWARD &&
-                zombieDistances[i] < (zombieDistances[activeTargetIndex] - CLOSER_THREAT_THRESHOLD)) {
-              // Much closer threat - switch
+        // Check for closer threat - be more responsive to closer targets
+        // Check even if we're close to current target (but allow override)
+        for (int i = 0; i < 4; i++) {
+          if (i != activeTargetIndex &&
+              (ProxSensors[i].direction == FORWARD || 
+               (zombieDistances[i] < 0.60 && ProxSensors[i].direction != BACKWARD))) {
+            float currentDist = zombieDistances[activeTargetIndex];
+            float threatDist = zombieDistances[i];
+            // Switch if threat is significantly closer (reduced threshold)
+            if (threatDist < (currentDist - 0.10)) {  // Reduced threshold for more responsiveness
+              // Closer threat detected - switch
               currentState = CHOOSE_ACTIVE_TARGET;
               break;
             }
