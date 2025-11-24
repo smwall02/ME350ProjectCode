@@ -764,6 +764,24 @@ void runStateMachine() {
       // This helps account for gear backlash when making large moves (e.g., lane 4 to lane 1)
       // GOAL: Get to exactly 0 error (encoder count = target position)
       // Only trigger when motor velocity is low to avoid interfering with active movement
+      // PREVENT LOOPS: Don't trigger if we're stuck (position hasn't changed recently) at lane 4
+      static long lastFineAdjustPosition = 0;
+      static unsigned long lastFineAdjustPositionTime = 0;
+      
+      // Update position tracking if position has changed significantly
+      bool positionChanged = false;
+      if (abs(currentPos - lastFineAdjustPosition) > 2) {
+        lastFineAdjustPosition = currentPos;
+        lastFineAdjustPositionTime = millis();
+        positionChanged = true;
+      } else if (millis() - lastFineAdjustPositionTime < 500) {
+        // Position hasn't changed much, but it's been recent - consider it as "changed" for safety
+        positionChanged = true;
+      }
+      
+      // Don't trigger fine adjustment if stuck at lane 4 (position hasn't changed and error is significant)
+      bool notStuckAtLane4 = !(currentPos < -1200 && !positionChanged && abs(errorToOriginalTarget) > 3);
+      
       if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
           (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
@@ -772,7 +790,8 @@ void runStateMachine() {
           abs(errorToOriginalTarget) > TARGET_BAND &&  // But not quite at target yet
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           !ProxSensors[activeTargetIndex].hitDetected &&
-          zombieDistances[activeTargetIndex] < 0.30) {  // Zombie is close (within 30% of photo)
+          zombieDistances[activeTargetIndex] < 0.30 &&  // Zombie is close (within 30% of photo)
+          notStuckAtLane4) {  // Don't trigger if stuck at lane 4
         
         // CORRECT TO EXACTLY 0: Set target to original position to eliminate error
         fineAdjustmentTarget = activeTargetPosition;
@@ -1100,8 +1119,9 @@ void runMotionControl() {
   // ============================================
   // PID CONTROL CALCULATION (Primary control method)
   // ============================================
-  // NOTE: PID values (KP, KI, KD) are ALWAYS used as the base for motor control
-  // The following sections may add boosts or minimums, but PID is always the foundation
+  // NOTE: PID values (KP, KI, KD) are ALWAYS loaded from EEPROM and used as the base for motor control
+  // These values are loaded in setup() via loadCalibrationFromEEPROM() and used throughout operation
+  // The following sections scale these EEPROM values based on error magnitude, but always use EEPROM as base
   // Adaptive friction learning (above) temporarily bypasses PID only during initial learning phase
   
   // Adaptive PID gains - increased for faster error correction
@@ -1162,22 +1182,72 @@ void runMotionControl() {
   
   pidVoltage *= momentumCompensation;
 
-  // FRICTION COMPENSATION DISABLED - was causing overshoot
+  // FRICTION COMPENSATION - Position-based with MUCH higher compensation on right side (lane 4)
   float frictionComp = 0;
-  // Disabled until proper tuning can be done
-  // if (abs(error) > TARGET_BAND) {
-  //   bool movingTowardMoreNegative = (error < 0);
-  //   float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
-  //   float frictionScale = 1.0;
-  //   float absError = abs(error);
-  //   if (absError < 3) frictionScale = 0.05;
-  //   else if (absError < 10) frictionScale = 0.15;
-  //   else if (absError < 30) frictionScale = 0.4;
-  //   else if (absError < 100) frictionScale = 0.7;
-  //   if (abs(motorVelocity) > 5) frictionScale *= 0.5;
-  //   if (error < 0) frictionComp = -baseFriction * frictionScale;
-  //   else frictionComp = baseFriction * frictionScale;
-  // }
+  if (abs(error) > TARGET_BAND) {
+    bool movingTowardMoreNegative = (error < 0);
+    float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
+    
+    // Position-based friction boost: MUCH higher friction compensation on right side (lane 4 area)
+    // When position is < -1000 (right side), increase friction compensation significantly
+    // ESPECIALLY for lane 4 positions (-1200 to -1254)
+    float positionFrictionBoost = 1.0;
+    if (currentPosition < -1200) {
+      // Lane 4 area (positions -1200 to -1424): Apply VERY significant boost
+      // Scale from 2.0 at -1200 to 4.0 at -1424 (right limit)
+      float lane4Factor = (currentPosition + 1200) / -224.0;  // -1200 to -1424 range
+      lane4Factor = constrain(lane4Factor, 0.0, 1.0);
+      positionFrictionBoost = 2.0 + (lane4Factor * 2.0);  // 2.0x to 4.0x boost for lane 4
+    } else if (currentPosition < -1000) {
+      // Right side but not quite lane 4: Apply significant boost
+      // Scale from 1.5 at -1000 to 2.0 at -1200
+      float rightSideFactor = (currentPosition + 1000) / -200.0;
+      rightSideFactor = constrain(rightSideFactor, 0.0, 1.0);
+      positionFrictionBoost = 1.5 + (rightSideFactor * 0.5);  // 1.5x to 2.0x boost
+    } else if (currentPosition < -500) {
+      // Medium-right side: Moderate boost
+      float mediumRightFactor = (currentPosition + 500) / -500.0;
+      mediumRightFactor = constrain(mediumRightFactor, 0.0, 1.0);
+      positionFrictionBoost = 1.0 + (mediumRightFactor * 0.5);  // 1.0x to 1.5x boost
+    }
+    
+    // Error-based scaling (reduced scaling when close to target, but keep more for lane 4)
+    float frictionScale = 1.0;
+    float absError = abs(error);
+    if (currentPosition < -1200) {
+      // Lane 4 area: Keep higher friction even when close to target
+      if (absError < 3) frictionScale = 0.3;  // Higher than normal
+      else if (absError < 10) frictionScale = 0.6;  // Higher than normal
+      else if (absError < 30) frictionScale = 0.85;
+      else if (absError < 100) frictionScale = 0.95;
+      // For larger errors, use full friction
+    } else {
+      // Normal positions: Standard scaling
+      if (absError < 3) frictionScale = 0.1;
+      else if (absError < 10) frictionScale = 0.3;
+      else if (absError < 30) frictionScale = 0.6;
+      else if (absError < 100) frictionScale = 0.85;
+      // For larger errors, use full friction
+    }
+    
+    // Reduce friction when moving (velocity-based scaling), but less reduction for lane 4
+    if (abs(motorVelocity) > 10) {
+      float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
+      if (currentPosition < -1200) {
+        frictionScale *= (1.0 - velocityFactor * 0.2);  // Only 20% reduction for lane 4
+      } else {
+        frictionScale *= (1.0 - velocityFactor * 0.4);  // 40% reduction for other positions
+      }
+    }
+    
+    // Apply friction compensation with position boost
+    float totalFriction = baseFriction * positionFrictionBoost * frictionScale;
+    if (error < 0) {
+      frictionComp = -totalFriction;  // Moving right (toward more negative)
+    } else {
+      frictionComp = totalFriction;   // Moving left (toward less negative)
+    }
+  }
 
   // Velocity feedforward - DISABLED to prevent overshoot
   float velocityFF = 0;
@@ -1200,40 +1270,54 @@ void runMotionControl() {
   // totalVoltage = PID (primary) + friction compensation + velocity feedforward + fine adjustment boost
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
-  // Voltage capping based on error magnitude - increased for faster error correction
-  // Higher limits for very large errors (lane-to-lane moves) to prevent slow movement
-  float voltageLimit = 7.5;  // Maximum voltage cap (increased for faster large moves)
+  // Voltage capping based on error magnitude - using 9V as nominal voltage
+  // BUT: Limit speed for very large moves (lane 1 to 4 or 4 to 1) to prevent slamming
+  float voltageLimit = 9.0;  // Nominal voltage cap (9V as requested)
   long absErr = abs(error);
+  
+  // Special handling for very large moves (lane 1 to 4 or 4 to 1) - limit speed to prevent slamming
   if (absErr > 1000) {
-    voltageLimit = 7.5;  // Very large moves (lane 4 to lane 1) - maximum speed
+    // Very large moves: Limit to 7V max to prevent slamming into end stops
+    // This is a safety measure for moves between lane 1 and lane 4
+    voltageLimit = 7.0;  // Reduced from 9V to prevent slamming
   } else if (absErr > 800) {
-    voltageLimit = 7.0;  // Large moves - high speed
+    voltageLimit = 7.5;  // Large moves - reduced from 8.5V
   } else if (absErr > 500) {
-    voltageLimit = 6.5;  // Medium-large moves
+    voltageLimit = 8.0;  // Medium-large moves
   } else if (absErr > 300) {
-    voltageLimit = 6.0;  // Medium moves
+    voltageLimit = 7.5;  // Medium moves
   } else if (absErr > 100) {
-    voltageLimit = 5.0;  // Small-medium moves
+    voltageLimit = 7.0;  // Small-medium moves
   } else if (absErr > 50) {
-    voltageLimit = 4.5;  // Small moves
+    voltageLimit = 6.0;  // Small moves
   } else {
-    voltageLimit = 3.5;  // Fine positioning
+    voltageLimit = 5.0;  // Fine positioning
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
 
-  // IMPROVED: Limit switch protection - slow down before hitting limits to prevent slamming
+  // IMPROVED: Limit switch protection - slow down BEFORE hitting limits to prevent slamming
   // This prevents the system from slamming into end stops when making large moves (lane 4 to lane 1)
   // Applied AFTER voltage calculation to properly limit speed near limits
+  // EXPANDED: Start slowing down much earlier for large moves
   if (currentState == MOVE_TO_TARGET && autoMode) {
+    // Determine if this is a large move (lane 1 to 4 or 4 to 1)
+    bool isLargeMove = (absErr > 1000);
+    
     // Slow down when approaching left limit (moving left, error > 0 means moving toward positive)
-    // Reduce voltage significantly when within 100 counts of left limit
-    if (error > 0 && currentPosition > -100) {
+    // For large moves, start slowing down at 200 counts; for normal moves, 100 counts
+    int leftSlowdownDistance = isLargeMove ? 200 : 100;
+    if (error > 0 && currentPosition > -leftSlowdownDistance) {
       // Approaching left limit - reduce voltage to prevent slamming
-      float proximityFactor = (currentPosition + 100) / 100.0;  // 0 at -100, 1 at 0
+      float proximityFactor = (currentPosition + leftSlowdownDistance) / leftSlowdownDistance;  // 0 at -distance, 1 at 0
       proximityFactor = constrain(proximityFactor, 0.0, 1.0);
-      float limitProtection = 0.3 + (proximityFactor * 0.4);  // Reduce to 30-70% of normal voltage
+      
+      // More aggressive reduction for large moves
+      float minVoltage = isLargeMove ? 0.2 : 0.3;
+      float maxVoltage = isLargeMove ? 0.5 : 0.7;
+      float limitProtection = minVoltage + (proximityFactor * (maxVoltage - minVoltage));
       totalVoltage *= limitProtection;
+      
       if (currentPosition > 0) {
         // Already past limit - stop immediately
         stopMotor();
@@ -1242,13 +1326,18 @@ void runMotionControl() {
     }
     
     // Slow down when approaching right limit (moving right, error < 0 means moving toward more negative)
-    // Reduce voltage when within 100 counts of right limit
-    if (error < 0 && currentPosition < (UPPER_BOUND + 100)) {
+    // For large moves, start slowing down at 200 counts; for normal moves, 100 counts
+    int rightSlowdownDistance = isLargeMove ? 200 : 100;
+    if (error < 0 && currentPosition < (UPPER_BOUND + rightSlowdownDistance)) {
       // Approaching right limit - reduce voltage to prevent slamming
       float distanceFromLimit = currentPosition - UPPER_BOUND;  // Negative value, becomes less negative as we approach
-      float proximityFactor = (distanceFromLimit + 100) / 100.0;  // 0 at limit, 1 at 100 counts away
+      float proximityFactor = (distanceFromLimit + rightSlowdownDistance) / rightSlowdownDistance;  // 0 at limit, 1 at distance away
       proximityFactor = constrain(proximityFactor, 0.0, 1.0);
-      float limitProtection = 0.3 + (proximityFactor * 0.4);  // Reduce to 30-70% of normal voltage
+      
+      // More aggressive reduction for large moves
+      float minVoltage = isLargeMove ? 0.2 : 0.3;
+      float maxVoltage = isLargeMove ? 0.5 : 0.7;
+      float limitProtection = minVoltage + (proximityFactor * (maxVoltage - minVoltage));
       totalVoltage *= limitProtection;
     }
   }
@@ -1282,7 +1371,12 @@ void runMotionControl() {
           float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
           
           // Ensure minimum is at least 2.0V to overcome friction
+          // BUT: For lane 4 positions, use much higher minimum (3.5V) to overcome extra friction
           float minFrictionVoltage = max(baseFrictionVoltage, 2.0f);
+          if (currentPosition < -1200) {
+            // Lane 4 area: Use much higher minimum voltage to overcome extra friction
+            minFrictionVoltage = max(minFrictionVoltage, 3.5f);
+          }
           
           // Calculate how long we've been stuck
           unsigned long stuckDuration = currentTime - stuckStartTime;
@@ -1339,6 +1433,11 @@ void runMotionControl() {
     bool movingRight = (error < 0);
     float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);  // At least 1.5V to overcome friction
+    
+    // For lane 4 positions, use much higher minimum voltage
+    if (currentPosition < -1200) {
+      minFrictionVoltage = max(minFrictionVoltage, 3.0f);  // At least 3.0V for lane 4
+    }
     
     // If PID voltage is less than friction voltage, boost to friction voltage
     // Preserve PID direction and use max to ensure PID is respected when sufficient
