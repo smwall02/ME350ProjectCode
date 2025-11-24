@@ -649,8 +649,8 @@ void runStateMachine() {
       
       long error = desiredPosition - currentPos;
       
-      // Safety check
-      if (!lane4LimitSwitchMode && currentPos < UPPER_BOUND - 50) {
+      // Safety check - disabled during auto mode (right limit needed for Lane 4)
+      if (!autoMode && !lane4LimitSwitchMode && currentPos < UPPER_BOUND - 50) {
         Serial.println(F("Near right limit"));
         currentState = CHOOSE_ACTIVE_TARGET;
         break;
@@ -1196,14 +1196,17 @@ void runMotionControl() {
         return;
       }
     }
-    int rightSlowdownDistance = isLargeMove ? 200 : 100;
-    if (error < 0 && currentPosition < (UPPER_BOUND + rightSlowdownDistance)) {
-      float distanceFromLimit = currentPosition - UPPER_BOUND;
-      float proximityFactor = (distanceFromLimit + rightSlowdownDistance) / rightSlowdownDistance;
-      proximityFactor = constrain(proximityFactor, 0.0, 1.0);
-      float minVoltage = isLargeMove ? 0.2 : 0.3;
-      float maxVoltage = isLargeMove ? 0.5 : 0.7;
-      totalVoltage *= (minVoltage + (proximityFactor * (maxVoltage - minVoltage)));
+    // Right limit slowdown disabled during Lane 4 limit switch mode (need to reach limit)
+    if (!lane4LimitSwitchMode) {
+      int rightSlowdownDistance = isLargeMove ? 200 : 100;
+      if (error < 0 && currentPosition < (UPPER_BOUND + rightSlowdownDistance)) {
+        float distanceFromLimit = currentPosition - UPPER_BOUND;
+        float proximityFactor = (distanceFromLimit + rightSlowdownDistance) / rightSlowdownDistance;
+        proximityFactor = constrain(proximityFactor, 0.0, 1.0);
+        float minVoltage = isLargeMove ? 0.2 : 0.3;
+        float maxVoltage = isLargeMove ? 0.5 : 0.7;
+        totalVoltage *= (minVoltage + (proximityFactor * (maxVoltage - minVoltage)));
+      }
     }
   }
 
@@ -1312,7 +1315,8 @@ void setMotor(float voltage) {
     voltage = 0;
     pwm = 0;
   }
-  if (digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
+  // Right limit switch disabled during auto mode (needed for Lane 4 positioning)
+  if (!autoMode && digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
     voltage = 0;
     pwm = 0;
   }
