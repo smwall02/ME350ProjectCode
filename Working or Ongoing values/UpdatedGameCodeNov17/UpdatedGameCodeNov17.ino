@@ -182,7 +182,7 @@ float lastError = 0;
 float motorVelocity = 0;
 float filteredPosition = 0;
 bool positionFilterInitialized = false;
-float filteredDerivative = 0;
+float lastDerivative = 0;  // For derivative filtering (internal to filteredDerivative function)
 int previousMotorPosition = 0;
 long previousVelCompTime = 0;
 long lastStuckCheckPos = 0;
@@ -975,7 +975,6 @@ void runStateMachine() {
 
 // FILTERING (like PIDAutoTune)
 float filteredDerivative(float rawDerivative) {
-  static float lastDerivative = 0;
   lastDerivative = DERIVATIVE_FILTER_ALPHA * rawDerivative + (1.0 - DERIVATIVE_FILTER_ALPHA) * lastDerivative;
   return lastDerivative;
 }
@@ -1142,7 +1141,7 @@ void runMotionControl() {
   if (abs(error) > 100 && abs(error) < 800 && !adaptiveLearning && !adaptiveLearned) {
     adaptiveLearning = true;
           adaptiveFrictionVoltage = 1.5;
-    lastAdaptivePosition = currentPosition;
+    lastAdaptivePosition = currentPos;
     adaptiveStartTime = millis();
     
     // Direction
@@ -1151,7 +1150,7 @@ void runMotionControl() {
   
   if (adaptiveLearning) {
     // Check movement
-    long positionChange = abs(currentPosition - lastAdaptivePosition);
+    long positionChange = abs(currentPos - lastAdaptivePosition);
     unsigned long elapsed = millis() - adaptiveStartTime;
     
       if (positionChange >= 5) {
@@ -1178,7 +1177,7 @@ void runMotionControl() {
       if (elapsed >= 150) {
         adaptiveFrictionVoltage += 0.3;
         adaptiveStartTime = millis();
-        lastAdaptivePosition = currentPosition;
+        lastAdaptivePosition = currentPos;
       if (adaptiveFrictionVoltage > 4.5) {
         adaptiveFrictionVoltage = 2.5;
         adaptiveLearning = false;
@@ -1209,14 +1208,6 @@ void runMotionControl() {
     setMotor((error < 0) ? -adaptiveFrictionVoltage : adaptiveFrictionVoltage);
     return;
   }
-  
-  // Use simplified PID update (like PIDAutoTune)
-  float voltage = updatePID(desiredPosition);
-  
-  // Get current error for additional logic
-  long currentPos = (long)filteredPosition;
-  float error = desiredPosition - currentPos;
-  long absErr = abs((long)error);
   
   // Apply integral decay on zero crossing (like PIDAutoTune)
   if ((error != 0) && (error * lastError < 0)) {
