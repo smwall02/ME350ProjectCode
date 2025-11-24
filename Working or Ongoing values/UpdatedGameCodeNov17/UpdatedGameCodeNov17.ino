@@ -622,8 +622,9 @@ void runStateMachine() {
         previousTargetIndex = activeTargetIndex;
         targetHitTime = 0;
         // Initialize retreat check when starting to move to target
-        lastRetreatCheckDistance = zombieDistances[activeTargetIndex];
-        lastRetreatCheckTime = millis();
+        // Reset to 0 so it gets initialized when we arrive at target
+        lastRetreatCheckDistance = 0.0;
+        lastRetreatCheckTime = 0;
         
       } else {
         activeTargetPosition = WAIT_POSITION;
@@ -770,6 +771,13 @@ void runStateMachine() {
         // Only switch if target has moved away significantly
         if (targetDirection == BACKWARD) {
           float currentDistance = zombieDistances[activeTargetIndex];
+          
+          // Initialize retreat check if not set
+          if (lastRetreatCheckDistance == 0.0) {
+            lastRetreatCheckDistance = currentDistance;
+            lastRetreatCheckTime = millis();
+          }
+          
           float distanceIncrease = currentDistance - lastRetreatCheckDistance;
           
           // Update retreat check if distance is increasing
@@ -781,12 +789,14 @@ void runStateMachine() {
           // Only switch if distance has increased significantly (target moving away)
           if (distanceIncrease > RETREAT_DISTANCE_THRESHOLD && 
               millis() - arrivalTime > MIN_WAIT_AT_TARGET) {
+            lastRetreatCheckDistance = 0.0;  // Reset for next target
             currentState = CHOOSE_ACTIVE_TARGET;
             break;
           }
           
           // Also switch if retreated very far (safety check)
           if (currentDistance > 0.85) {
+            lastRetreatCheckDistance = 0.0;  // Reset for next target
             currentState = CHOOSE_ACTIVE_TARGET;
             break;
           }
@@ -929,12 +939,20 @@ void runStateMachine() {
               // Only switch if we've waited long enough and distance is clearly increasing
               unsigned long timeAtTarget = millis() - arrivalTime;
               float currentDistance = zombieDistances[activeTargetIndex];
+              
+              // Initialize retreat check if not set
+              if (lastRetreatCheckDistance == 0.0) {
+                lastRetreatCheckDistance = currentDistance;
+                lastRetreatCheckTime = millis();
+              }
+              
               float distanceIncrease = currentDistance - lastRetreatCheckDistance;
               
               // Update retreat check distance if enough time has passed
               if (timeAtTarget > MIN_WAIT_AT_TARGET) {
                 if (distanceIncrease > RETREAT_DISTANCE_THRESHOLD) {
                   // Target is clearly moving away - switch to next target
+                  lastRetreatCheckDistance = 0.0;  // Reset for next target
                   currentState = CHOOSE_ACTIVE_TARGET;
                 } else if (currentDistance > lastRetreatCheckDistance) {
                   // Distance is increasing but not enough yet - update check point
@@ -1103,19 +1121,19 @@ float updatePID(long targetPosition) {
   return voltage;
 }
 
-// VOLTAGE CAPPING (like PIDAutoTune) - reduced speeds for better target registration
+// VOLTAGE CAPPING (like PIDAutoTune) - significantly reduced speeds for better target registration
 float cappedVoltageForError(float voltage, long error) {
   long absErr = abs(error);
   float cap;
-  // Reduced voltage caps to slow down movement and allow more time at targets
-  if (absErr > 1000) cap = 7.5f;  // Reduced from 9.0
-  else if (absErr > 800) cap = 7.0f;  // Reduced from 8.5
-  else if (absErr > 500) cap = 6.5f;  // Reduced from 8.0
-  else if (absErr > 300) cap = 6.0f;  // Reduced from 7.5
-  else if (absErr > 100) cap = 5.5f;  // Reduced from 7.0
-  else if (absErr > 50) cap = 5.0f;  // Reduced from 6.0
-  else cap = 4.5f;  // Reduced from 5.0
-  cap = min(cap, 8.0f);  // Reduced max from 9.5
+  // Much lower voltage caps to slow down movement significantly
+  if (absErr > 1000) cap = 5.5f;  // Much slower for large moves
+  else if (absErr > 800) cap = 5.0f;
+  else if (absErr > 500) cap = 4.5f;
+  else if (absErr > 300) cap = 4.0f;
+  else if (absErr > 100) cap = 3.5f;
+  else if (absErr > 50) cap = 3.0f;
+  else cap = 2.5f;  // Very slow for fine positioning
+  cap = min(cap, 6.0f);  // Absolute max reduced significantly
   return constrain(voltage, -cap, cap);
 }
 
@@ -1317,14 +1335,14 @@ void runMotionControl() {
   // Apply voltage capping based on error (like PIDAutoTune)
   float totalVoltage = cappedVoltageForError(voltage, (long)error);
   
-  // Retry multiplier for stuck conditions
+  // Retry multiplier for stuck conditions - but keep speeds reasonable
   float retryMultiplier = 1.0;
   if (voltageRampedForRetry && retryStartTime > 0) {
     unsigned long retryDuration = millis() - retryStartTime;
-    if (retryDuration > 1000) retryMultiplier = 1.3;
-    else retryMultiplier = 1.15;
+    if (retryDuration > 1000) retryMultiplier = 1.2;  // Reduced from 1.3
+    else retryMultiplier = 1.1;  // Reduced from 1.15
     totalVoltage *= retryMultiplier;
-    totalVoltage = constrain(totalVoltage, -9.5, 9.5);
+    totalVoltage = constrain(totalVoltage, -6.0, 6.0);  // Reduced max from 9.5
   }
   if (currentState == MOVE_TO_TARGET && autoMode) {
     bool isLargeMove = (absErr > 1000);
@@ -1376,10 +1394,10 @@ void runMotionControl() {
           }
           unsigned long stuckDuration = currentTime - stuckStartTime;
           float rampVoltage = minFrictionVoltage;
-          if (stuckDuration > 1200) rampVoltage = minFrictionVoltage + 1.5f;
-          else if (stuckDuration > 800) rampVoltage = minFrictionVoltage + 1.0f;
-          else if (stuckDuration > 400) rampVoltage = minFrictionVoltage + 0.5f;
-          rampVoltage = min(rampVoltage, 9.5f);
+          if (stuckDuration > 1200) rampVoltage = minFrictionVoltage + 1.0f;  // Reduced from 1.5
+          else if (stuckDuration > 800) rampVoltage = minFrictionVoltage + 0.7f;  // Reduced from 1.0
+          else if (stuckDuration > 400) rampVoltage = minFrictionVoltage + 0.4f;  // Reduced from 0.5
+          rampVoltage = min(rampVoltage, 6.0f);  // Reduced max from 9.5
           if (abs(totalVoltage) < rampVoltage) {
             float pidMagnitude = abs(totalVoltage);
             float finalVoltage = max(pidMagnitude, rampVoltage);
