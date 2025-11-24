@@ -126,6 +126,10 @@ bool fineAdjustmentActive = false;
 long fineAdjustmentTarget = 0;
 const int FINE_ADJUSTMENT_AMOUNT = 2;
 float previousZombieDistance = 1.0;
+float lastRetreatCheckDistance = 0.0;
+unsigned long lastRetreatCheckTime = 0;
+const unsigned long MIN_WAIT_AT_TARGET = 500;  // Minimum time to wait at target before checking retreat
+const float RETREAT_DISTANCE_THRESHOLD = 0.10;  // Distance must increase by this much to confirm retreat
 int fineAdjustmentCount = 0;
 const int MAX_FINE_ADJUSTMENTS = 5;
 unsigned long lastFineAdjustmentTime = 0;
@@ -617,6 +621,10 @@ void runStateMachine() {
         
         previousTargetIndex = activeTargetIndex;
         targetHitTime = 0;
+        // Initialize retreat check when starting to move to target
+        // Reset to 0 so it gets initialized when we arrive at target
+        lastRetreatCheckDistance = 0.0;
+        lastRetreatCheckTime = 0;
         
       } else {
         activeTargetPosition = WAIT_POSITION;
@@ -759,19 +767,39 @@ void runStateMachine() {
           targetHitTime = 0;  // Reset if not consistently backward
         }
         
-        // Switch on velocity change
-        if (prevDirection == FORWARD && 
-            (targetDirection == BACKWARD || targetDirection == STOPPED)) {
-          // Switch immediately
-          currentState = CHOOSE_ACTIVE_TARGET;
-          break;
-        }
-        
-        // Switch if retreated far
-        if (targetDirection == BACKWARD &&
-            zombieDistances[activeTargetIndex] > 0.80) {
-          currentState = CHOOSE_ACTIVE_TARGET;
-          break;
+        // Wait for retreat confirmation - don't switch immediately
+        // Only switch if target has moved away significantly
+        if (targetDirection == BACKWARD) {
+          float currentDistance = zombieDistances[activeTargetIndex];
+          
+          // Initialize retreat check if not set
+          if (lastRetreatCheckDistance == 0.0) {
+            lastRetreatCheckDistance = currentDistance;
+            lastRetreatCheckTime = millis();
+          }
+          
+          float distanceIncrease = currentDistance - lastRetreatCheckDistance;
+          
+          // Update retreat check if distance is increasing
+          if (distanceIncrease > 0) {
+            lastRetreatCheckDistance = currentDistance;
+            lastRetreatCheckTime = millis();
+          }
+          
+          // Only switch if distance has increased significantly (target moving away)
+          if (distanceIncrease > RETREAT_DISTANCE_THRESHOLD && 
+              millis() - arrivalTime > MIN_WAIT_AT_TARGET) {
+            lastRetreatCheckDistance = 0.0;  // Reset for next target
+            currentState = CHOOSE_ACTIVE_TARGET;
+            break;
+          }
+          
+          // Also switch if retreated very far (safety check)
+          if (currentDistance > 0.85) {
+            lastRetreatCheckDistance = 0.0;  // Reset for next target
+            currentState = CHOOSE_ACTIVE_TARGET;
+            break;
+          }
         }
 
         // Check for closer threat
@@ -906,9 +934,36 @@ void runStateMachine() {
               ProxSensors[activeTargetIndex].hitTime = 0;
               currentState = CHOOSE_ACTIVE_TARGET;
             }
-            // Check retreat
+            // Check retreat - wait until target starts moving away (distance increasing)
             else if (ProxSensors[activeTargetIndex].direction == BACKWARD) {
-              currentState = CHOOSE_ACTIVE_TARGET;
+              // Only switch if we've waited long enough and distance is clearly increasing
+              unsigned long timeAtTarget = millis() - arrivalTime;
+              float currentDistance = zombieDistances[activeTargetIndex];
+              
+              // Initialize retreat check if not set
+              if (lastRetreatCheckDistance == 0.0) {
+                lastRetreatCheckDistance = currentDistance;
+                lastRetreatCheckTime = millis();
+              }
+              
+              float distanceIncrease = currentDistance - lastRetreatCheckDistance;
+              
+              // Update retreat check distance if enough time has passed
+              if (timeAtTarget > MIN_WAIT_AT_TARGET) {
+                if (distanceIncrease > RETREAT_DISTANCE_THRESHOLD) {
+                  // Target is clearly moving away - switch to next target
+                  lastRetreatCheckDistance = 0.0;  // Reset for next target
+                  currentState = CHOOSE_ACTIVE_TARGET;
+                } else if (currentDistance > lastRetreatCheckDistance) {
+                  // Distance is increasing but not enough yet - update check point
+                  lastRetreatCheckDistance = currentDistance;
+                  lastRetreatCheckTime = millis();
+                } else if (millis() - lastRetreatCheckTime > 200) {
+                  // Update check point periodically even if distance not increasing
+                  lastRetreatCheckDistance = currentDistance;
+                  lastRetreatCheckTime = millis();
+                }
+              }
             }
             // Fine positioning - DISABLED for Lane 4 to prevent oscillation
             else if (activeTargetIndex != 3 &&
@@ -958,6 +1013,14 @@ void runStateMachine() {
             }
             if (activeTargetIndex >= 0) {
               previousZombieDistance = zombieDistances[activeTargetIndex];
+              // Update retreat check distance when at target
+              if (abs(errorToCurrentTarget) <= TARGET_BAND) {
+                float currentDistance = zombieDistances[activeTargetIndex];
+                if (currentDistance != lastRetreatCheckDistance) {
+                  lastRetreatCheckDistance = currentDistance;
+                  lastRetreatCheckTime = millis();
+                }
+              }
             }
           }
         }
@@ -994,15 +1057,11 @@ float updatePID(long targetPosition) {
   // Calculate error
   float error = targetPosition - currentPosition;
   
-  // Apply deadband (like PIDAutoTune)
+  // Apply deadband (like PIDAutoTune) - if within deadband, set error to 0
   if (abs(error) < DEADBAND) {
     error = 0;
-    // Conditional integral reset
-    if (abs(errorIntegral) < 10.0) {
-      errorIntegral = 0;
-    } else {
-      errorIntegral *= 0.9;  // Gradual decay
-    }
+    // Reset integral when in deadband to prevent windup
+    errorIntegral = 0;
   } else {
     // Calculate integral with anti-windup
     float dt = CONTROL_PERIOD / 1000.0;
@@ -1034,13 +1093,12 @@ float updatePID(long targetPosition) {
   }
   
   // Prevent crossing bounds - don't apply voltage that would cross limits
-  // But allow reaching the target if it's at the bound
   if (currentPosition > LOWER_BOUND) {
     // Past lower bound - block all leftward movement
     frictionComp = 0;
     if (pidOutput > 0) pidOutput = 0;
-  } else if (currentPosition == LOWER_BOUND && targetPosition > LOWER_BOUND) {
-    // At lower bound but target is beyond it - block leftward movement
+  } else if (currentPosition == LOWER_BOUND && error > DEADBAND && targetPosition > LOWER_BOUND) {
+    // At lower bound, error is significant, and target is beyond it - block leftward movement
     frictionComp = 0;
     if (pidOutput > 0) pidOutput = 0;
   }
@@ -1048,8 +1106,8 @@ float updatePID(long targetPosition) {
     // Past upper bound - block all rightward movement
     frictionComp = 0;
     if (pidOutput < 0) pidOutput = 0;
-  } else if (currentPosition == UPPER_BOUND && targetPosition < UPPER_BOUND) {
-    // At upper bound but target is beyond it - block rightward movement
+  } else if (currentPosition == UPPER_BOUND && error < -DEADBAND && targetPosition < UPPER_BOUND) {
+    // At upper bound, error is significant, and target is beyond it - block rightward movement
     frictionComp = 0;
     if (pidOutput < 0) pidOutput = 0;
   }
@@ -1063,18 +1121,19 @@ float updatePID(long targetPosition) {
   return voltage;
 }
 
-// VOLTAGE CAPPING (like PIDAutoTune)
+// VOLTAGE CAPPING (like PIDAutoTune) - significantly reduced speeds for better target registration
 float cappedVoltageForError(float voltage, long error) {
   long absErr = abs(error);
   float cap;
-  if (absErr > 1000) cap = 9.0f;
-  else if (absErr > 800) cap = 8.5f;
-  else if (absErr > 500) cap = 8.0f;
-  else if (absErr > 300) cap = 7.5f;
-  else if (absErr > 100) cap = 7.0f;
-  else if (absErr > 50) cap = 6.0f;
-  else cap = 5.0f;
-  cap = min(cap, 9.5f);
+  // Much lower voltage caps to slow down movement significantly
+  if (absErr > 1000) cap = 5.5f;  // Much slower for large moves
+  else if (absErr > 800) cap = 5.0f;
+  else if (absErr > 500) cap = 4.5f;
+  else if (absErr > 300) cap = 4.0f;
+  else if (absErr > 100) cap = 3.5f;
+  else if (absErr > 50) cap = 3.0f;
+  else cap = 2.5f;  // Very slow for fine positioning
+  cap = min(cap, 6.0f);  // Absolute max reduced significantly
   return constrain(voltage, -cap, cap);
 }
 
@@ -1138,41 +1197,41 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
-  // Prevent crossing bounds, but allow reaching the target if it's at the bound
-  // Only block if we're past the bound OR if target is not at the bound
+  // Prevent crossing bounds - block if past bounds
   if (currentPos > LOWER_BOUND) {
-    // Already past lower bound - stop and clamp
     stopMotor();
     encoder.write(LOWER_BOUND);
     lastError = 0;
     return;
   }
   if (currentPos < UPPER_BOUND) {
-    // Already past upper bound - stop and clamp
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
     return;
   }
-  // If at LOWER_BOUND and trying to move leftward, only block if target is not at LOWER_BOUND
-  if (currentPos == LOWER_BOUND && error > 0 && desiredPosition > LOWER_BOUND) {
-    stopMotor();
-    lastError = 0;
-    return;
-  }
-  // If at UPPER_BOUND and trying to move rightward, only block if target is not at UPPER_BOUND
-  if (currentPos == UPPER_BOUND && error < 0 && desiredPosition < UPPER_BOUND) {
-    stopMotor();
-    lastError = 0;
-    return;
-  }
   
   // Deadband is now handled in updatePID(), but check if we're at target
+  // If within deadband, stop regardless of position
   if (abs(error) <= DEADBAND) {
     stopMotor();
+    errorIntegral = 0;
+    lastError = 0;
     if (!targetReached) {
       targetReached = true;
     }
+    return;
+  }
+  
+  // If at a bound and trying to move past it, block (unless error is very small, handled by deadband above)
+  if (currentPos == LOWER_BOUND && error > DEADBAND && desiredPosition > LOWER_BOUND) {
+    stopMotor();
+    lastError = 0;
+    return;
+  }
+  if (currentPos == UPPER_BOUND && error < -DEADBAND && desiredPosition < UPPER_BOUND) {
+    stopMotor();
+    lastError = 0;
     return;
   }
   
@@ -1276,14 +1335,14 @@ void runMotionControl() {
   // Apply voltage capping based on error (like PIDAutoTune)
   float totalVoltage = cappedVoltageForError(voltage, (long)error);
   
-  // Retry multiplier for stuck conditions
+  // Retry multiplier for stuck conditions - but keep speeds reasonable
   float retryMultiplier = 1.0;
   if (voltageRampedForRetry && retryStartTime > 0) {
     unsigned long retryDuration = millis() - retryStartTime;
-    if (retryDuration > 1000) retryMultiplier = 1.3;
-    else retryMultiplier = 1.15;
+    if (retryDuration > 1000) retryMultiplier = 1.2;  // Reduced from 1.3
+    else retryMultiplier = 1.1;  // Reduced from 1.15
     totalVoltage *= retryMultiplier;
-    totalVoltage = constrain(totalVoltage, -9.5, 9.5);
+    totalVoltage = constrain(totalVoltage, -6.0, 6.0);  // Reduced max from 9.5
   }
   if (currentState == MOVE_TO_TARGET && autoMode) {
     bool isLargeMove = (absErr > 1000);
@@ -1335,10 +1394,10 @@ void runMotionControl() {
           }
           unsigned long stuckDuration = currentTime - stuckStartTime;
           float rampVoltage = minFrictionVoltage;
-          if (stuckDuration > 1200) rampVoltage = minFrictionVoltage + 1.5f;
-          else if (stuckDuration > 800) rampVoltage = minFrictionVoltage + 1.0f;
-          else if (stuckDuration > 400) rampVoltage = minFrictionVoltage + 0.5f;
-          rampVoltage = min(rampVoltage, 9.5f);
+          if (stuckDuration > 1200) rampVoltage = minFrictionVoltage + 1.0f;  // Reduced from 1.5
+          else if (stuckDuration > 800) rampVoltage = minFrictionVoltage + 0.7f;  // Reduced from 1.0
+          else if (stuckDuration > 400) rampVoltage = minFrictionVoltage + 0.4f;  // Reduced from 0.5
+          rampVoltage = min(rampVoltage, 6.0f);  // Reduced max from 9.5
           if (abs(totalVoltage) < rampVoltage) {
             float pidMagnitude = abs(totalVoltage);
             float finalVoltage = max(pidMagnitude, rampVoltage);
@@ -1387,7 +1446,7 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
-  // Only block if we're past the bounds, not if we're at them
+  // Block if past bounds
   if (currentPos < UPPER_BOUND) {
     stopMotor();
     encoder.write(UPPER_BOUND);
@@ -1400,13 +1459,14 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
-  // If at bounds, only block if trying to move away from target
-  if (currentPos == LOWER_BOUND && totalVoltage > 0 && desiredPosition > LOWER_BOUND) {
+  // If at bounds and error is significant, block movement past bound
+  // Small errors within deadband are already handled above
+  if (currentPos == LOWER_BOUND && totalVoltage > 0 && abs(error) > DEADBAND && desiredPosition > LOWER_BOUND) {
     stopMotor();
     lastError = 0;
     return;
   }
-  if (currentPos == UPPER_BOUND && totalVoltage < 0 && desiredPosition < UPPER_BOUND) {
+  if (currentPos == UPPER_BOUND && totalVoltage < 0 && abs(error) > DEADBAND && desiredPosition < UPPER_BOUND) {
     stopMotor();
     lastError = 0;
     return;
@@ -1648,19 +1708,24 @@ bool rightPressed() {
 }
 
 // HOMING
+const float HOMING_EXTRA_VOLTAGE = 0.6;     // Added on top of friction during homing
+const unsigned long HOMING_HOLD_TIME = 500; // ms to hold on switch before zeroing
+const int HOMING_STABLE_TICKS = 5;          // Require this many consecutive stable readings
+
 bool homeToLeftLimit() {
   // CRITICAL: Lane positions are NEVER modified during homing
   // They remain as loaded from EEPROM
   
   if (leftPressed()) {
-    // Hold at limit
+    // Already at limit - hold and debounce
     long lastPos = encoder.read();
     unsigned long holdStart = millis();
     int stableTicks = 0;
-    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+    float holdVoltage = max(FRICTION_RIGHT + 0.1, 2.5);  // Hold against switch
 
-    while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
-      setMotor(holdVoltage);
+    // Hold on the switch with debounce - ensure it settles
+    while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
+      setMotor(holdVoltage);  // Keep holding against switch
       delay(10);
       long pos = encoder.read();
       if (abs(pos - lastPos) <= 1) {
@@ -1672,7 +1737,7 @@ bool homeToLeftLimit() {
     }
 
     stopMotor();
-    delay(100);
+    delay(200);  // Brief pause before zeroing
 
     // Multiple zeroing attempts to ensure encoder is properly reset
     encoder.write(0);
@@ -1698,62 +1763,80 @@ bool homeToLeftLimit() {
     return true;
   }
 
-  // Approach limit
+  // Approach limit switch
   unsigned long startTime = millis();
-  float driveVoltage = max(FRICTION_RIGHT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+  long lastPosition = encoder.read();
+  unsigned long lastMoveTime = millis();
+  float driveVoltage = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotor(driveVoltage);
 
-  while (!leftPressed() && (millis() - startTime) < 15000) {
+  // Move toward limit switch with stuck detection
+  while (!leftPressed() && (millis() - startTime) < 12000) {
     delay(10);
-  }
-
-  if (leftPressed()) {
-
-    // Hold at limit
-    long currentPos = encoder.read();
-    long lastPos = currentPos;
-    unsigned long holdStart = millis();
-    int stableTicks = 0;
-    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
-
-    while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
-      setMotor(holdVoltage);
-      delay(10);
-      long pos = encoder.read();
-      if (abs(pos - lastPos) <= 1) {
-        stableTicks++;
-      } else {
-        stableTicks = 0;
-        lastPos = pos;
-      }
-    }
-
-    stopMotor();
-    delay(100);
-
-    // Multiple zeroing attempts to ensure encoder is properly reset
-    encoder.write(0);
-    delay(50);
-    if (encoder.read() != 0) {
-      encoder.write(0);
-      delay(50);
-    }
-    encoder.write(0);
-    delay(50);
     
-    // Verify encoder is actually zeroed
-    long finalPos = encoder.read();
-    if (abs(finalPos) > 2) {
-      encoder.write(0);  // Try one more time
-      delay(50);
+    // Check for stuck condition
+    long currentPos = encoder.read();
+    if (abs(currentPos - lastPosition) > 2) {
+      lastMoveTime = millis();
+      lastPosition = currentPos;
+    } else if (millis() - lastMoveTime > 3000) {
+      // Stuck - increase voltage
+      driveVoltage = min(driveVoltage + 0.5, 8.0);
+      setMotor(driveVoltage);
+      lastMoveTime = millis();
     }
-
-    return true;
-  } else {
+  }
+  
+  if (!leftPressed()) {
+    // Timeout - didn't reach limit switch
     stopMotor();
-    Serial.println(F("Timeout"));
     return false;
   }
+  
+  // Reached limit switch - now hold and debounce (same as above)
+  long lastPos = encoder.read();
+  unsigned long holdStart = millis();
+  int stableTicks = 0;
+  float holdVoltage = max(FRICTION_RIGHT + 0.1, 2.5);  // Hold against switch
+
+  // Hold on the switch with debounce - ensure it settles
+  while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
+    setMotor(holdVoltage);  // Keep holding against switch
+    delay(10);
+    long pos = encoder.read();
+    if (abs(pos - lastPos) <= 1) {
+      stableTicks++;
+    } else {
+      stableTicks = 0;
+      lastPos = pos;
+    }
+  }
+
+  stopMotor();
+  delay(200);  // Brief pause before zeroing
+
+  // Multiple zeroing attempts to ensure encoder is properly reset
+  encoder.write(0);
+  delay(50);
+  if (encoder.read() != 0) {
+    encoder.write(0);
+    delay(50);
+  }
+  encoder.write(0);
+  delay(50);
+  
+  // Verify encoder is actually zeroed
+  long finalPos = encoder.read();
+  if (abs(finalPos) > 2) {
+    encoder.write(0);
+    delay(50);
+  }
+
+  // CRITICAL: Reload lane positions from EEPROM after homing
+  // This ensures they're never modified
+  loadCalibrationFromEEPROM();
+  
+  return true;
 }
 
 
