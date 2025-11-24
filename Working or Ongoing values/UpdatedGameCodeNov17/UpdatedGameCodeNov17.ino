@@ -200,9 +200,13 @@ unsigned long lastPrintTime = 0;
 unsigned long moveStartTime = 0;
 bool targetReached = false;
 unsigned long lastDriftCheckTime = 0;
-const unsigned long DRIFT_CHECK_INTERVAL = 5000;  // Check drift every 5 seconds
+const unsigned long DRIFT_CHECK_INTERVAL = 2000;  // Check drift every 2 seconds (more frequent)
+const unsigned long DRIFT_CHECK_DURING_MOVE = 1000;  // Check drift every 1 second during movement
 long lastDriftCheckPosition = 0;
-const long MAX_DRIFT_THRESHOLD = 20;  // Maximum allowed drift before correction
+const long MAX_DRIFT_THRESHOLD = 15;  // Reduced threshold for earlier detection
+long lastKnownGoodPosition = 0;
+unsigned long lastPositionValidationTime = 0;
+const unsigned long POSITION_VALIDATION_INTERVAL = 500;  // Validate position every 500ms
 
 const float CALIBRATION_VOLTAGE = 4.0;
 const float HOMING_VOLTAGE = 4.0;
@@ -307,10 +311,19 @@ void loop() {
       }
     }
     
-    // Drift mitigation - check periodically during auto mode
-    if (autoMode && !dynamicCalibrationActive && (currentTime - lastDriftCheckTime >= DRIFT_CHECK_INTERVAL)) {
+    // Drift mitigation - check more frequently during auto mode
+    bool isMoving = (currentState == MOVE_TO_TARGET && abs(motorVelocity) > 5);
+    unsigned long driftInterval = isMoving ? DRIFT_CHECK_DURING_MOVE : DRIFT_CHECK_INTERVAL;
+    
+    if (autoMode && !dynamicCalibrationActive && (currentTime - lastDriftCheckTime >= driftInterval)) {
       mitigateDrift();
       lastDriftCheckTime = currentTime;
+    }
+    
+    // Continuous position validation - runs very frequently
+    if (autoMode && !dynamicCalibrationActive && (currentTime - lastPositionValidationTime >= POSITION_VALIDATION_INTERVAL)) {
+      validatePosition();
+      lastPositionValidationTime = currentTime;
     }
   }
   
@@ -614,6 +627,20 @@ void runStateMachine() {
       break;
     
     case CHOOSE_ACTIVE_TARGET:
+      // Validate position before choosing target
+      if (autoMode) {
+        long pos = encoder.read();
+        if (pos < UPPER_BOUND) {
+          encoder.write(UPPER_BOUND);
+          pos = UPPER_BOUND;
+        }
+        if (pos > LOWER_BOUND) {
+          encoder.write(LOWER_BOUND);
+          pos = LOWER_BOUND;
+        }
+        lastKnownGoodPosition = pos;
+      }
+      
       activeTargetIndex = -1;
       closestZombieDist = 2.0;
 
@@ -690,14 +717,31 @@ void runStateMachine() {
     case MOVE_TO_TARGET:
       long currentPos = encoder.read();
       
+      // Validate and correct position before movement
+      if (autoMode) {
+        // Check for drift before starting movement
+        if (lastKnownGoodPosition != 0) {
+          long drift = abs(currentPos - lastKnownGoodPosition);
+          if (drift > 30 && abs(motorVelocity) < 5) {
+            Serial.print(F("Pre-move drift: "));
+            Serial.print(drift);
+            Serial.println(F(" - correcting"));
+            encoder.write(lastKnownGoodPosition);
+            currentPos = lastKnownGoodPosition;
+          }
+        }
+      }
+      
       // Clamp encoder at bounds - prevent reading beyond UPPER_BOUND or LOWER_BOUND
       if (currentPos < UPPER_BOUND) {
         encoder.write(UPPER_BOUND);
         currentPos = UPPER_BOUND;
+        lastKnownGoodPosition = UPPER_BOUND;
       }
       if (currentPos > LOWER_BOUND) {
         encoder.write(LOWER_BOUND);
         currentPos = LOWER_BOUND;
+        lastKnownGoodPosition = LOWER_BOUND;
       }
       
       // Lane 4: limit switch approach - ensure we actually move right
@@ -998,17 +1042,29 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
-  // Clamp encoder reading at bounds - prevent reading beyond UPPER_BOUND or LOWER_BOUND
-  // This prevents the encoder from counting beyond the physical limits
+  // Continuous bounds checking and drift correction
   if (currentPosition < UPPER_BOUND) {
-    // Clamp to UPPER_BOUND if beyond (more negative)
     encoder.write(UPPER_BOUND);
     currentPosition = UPPER_BOUND;
+    lastKnownGoodPosition = UPPER_BOUND;
   }
   if (currentPosition > LOWER_BOUND) {
-    // Clamp to LOWER_BOUND if beyond (less negative/positive)
     encoder.write(LOWER_BOUND);
     currentPosition = LOWER_BOUND;
+    lastKnownGoodPosition = LOWER_BOUND;
+  }
+  
+  // Quick drift check during motion control - detect sudden jumps
+  if (autoMode && lastKnownGoodPosition != 0) {
+    long positionChange = abs(currentPosition - lastKnownGoodPosition);
+    // If position changed unexpectedly when we should be stationary, correct it
+    if (positionChange > 50 && abs(motorVelocity) < 10 && currentState != MOVE_TO_TARGET) {
+      Serial.print(F("Unexpected position change: "));
+      Serial.print(positionChange);
+      Serial.println(F(" - correcting"));
+      encoder.write(lastKnownGoodPosition);
+      currentPosition = lastKnownGoodPosition;
+    }
   }
   
   long adjustedDesiredPosition = desiredPosition;
@@ -1386,16 +1442,16 @@ void runMotionControl() {
   // Total voltage
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
-  // Voltage capping - 9V nominal, limit large moves to prevent slamming
-  float voltageLimit = 9.0;
+  // Voltage capping - Higher voltages for better error correction
+  float voltageLimit = 9.5;  // Increased from 9.0
   long absErr = abs(error);
-  if (absErr > 1000) voltageLimit = 7.0;
-  else if (absErr > 800) voltageLimit = 7.5;
-  else if (absErr > 500) voltageLimit = 8.0;
-  else if (absErr > 300) voltageLimit = 7.5;
-  else if (absErr > 100) voltageLimit = 7.0;
-  else if (absErr > 50) voltageLimit = 6.0;
-  else voltageLimit = 5.0;
+  if (absErr > 1000) voltageLimit = 9.0;  // Increased from 7.0
+  else if (absErr > 800) voltageLimit = 9.0;  // Increased from 7.5
+  else if (absErr > 500) voltageLimit = 9.0;  // Increased from 8.0
+  else if (absErr > 300) voltageLimit = 8.5;  // Increased from 7.5
+  else if (absErr > 100) voltageLimit = 8.0;  // Increased from 7.0
+  else if (absErr > 50) voltageLimit = 7.5;  // Increased from 6.0
+  else voltageLimit = 7.0;  // Increased from 5.0
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
 
@@ -1575,67 +1631,101 @@ void stopMotor() {
   analogWrite(MOTOR_ENA, 0);
 }
 
-// DRIFT MITIGATION
+// DRIFT MITIGATION - Enhanced with continuous checking
 void mitigateDrift() {
   if (!autoMode || dynamicCalibrationActive) return;
   
   long currentPos = encoder.read();
   
-  // Check if position is beyond physical bounds
+  // Always check bounds - critical safety check
   if (currentPos < UPPER_BOUND) {
-    // Beyond right limit - clamp to UPPER_BOUND
     encoder.write(UPPER_BOUND);
     Serial.println(F("Drift: clamped to UPPER_BOUND"));
     lastDriftCheckPosition = UPPER_BOUND;
+    lastKnownGoodPosition = UPPER_BOUND;
     return;
   }
   if (currentPos > LOWER_BOUND) {
-    // Beyond left limit - clamp to LOWER_BOUND
     encoder.write(LOWER_BOUND);
     Serial.println(F("Drift: clamped to LOWER_BOUND"));
     lastDriftCheckPosition = LOWER_BOUND;
+    lastKnownGoodPosition = LOWER_BOUND;
     return;
   }
   
-  // Check for gradual drift when not moving
-  if (currentState == CHOOSE_ACTIVE_TARGET || (currentState == MOVE_TO_TARGET && abs(motorVelocity) < 5)) {
-    // Only check drift when stationary or choosing target
-    if (lastDriftCheckPosition != 0) {
-      long driftAmount = abs(currentPos - lastDriftCheckPosition);
+  // Check for gradual drift - both when stationary and moving
+  bool isStationary = (currentState == CHOOSE_ACTIVE_TARGET || abs(motorVelocity) < 5);
+  
+  if (lastDriftCheckPosition != 0) {
+    long driftAmount = abs(currentPos - lastDriftCheckPosition);
+    
+    // More aggressive drift detection
+    if (driftAmount > MAX_DRIFT_THRESHOLD) {
+      Serial.print(F("Drift: "));
+      Serial.print(driftAmount);
+      Serial.print(F(" from "));
+      Serial.print(lastDriftCheckPosition);
+      Serial.print(F(" to "));
+      Serial.println(currentPos);
       
-      if (driftAmount > MAX_DRIFT_THRESHOLD) {
-        // Significant drift detected
-        Serial.print(F("Drift detected: "));
-        Serial.print(driftAmount);
-        Serial.print(F(" counts from "));
-        Serial.print(lastDriftCheckPosition);
-        Serial.print(F(" to "));
-        Serial.println(currentPos);
-        
-        // If drift is very large, consider re-homing
-        if (driftAmount > 100 || currentPos > 50) {
-          Serial.println(F("Large drift - rehoming..."));
-          if (homeToLeftLimit()) {
-            Serial.println(F("Rehomed after drift"));
-            lastDriftCheckPosition = 0;  // Reset after rehome
-            return;
-          }
-        } else {
-          // Small drift - correct encoder value back
-          encoder.write(lastDriftCheckPosition);
-          Serial.print(F("Corrected drift to "));
-          Serial.println(lastDriftCheckPosition);
-          currentPos = lastDriftCheckPosition;
+      // Large drift - rehome
+      if (driftAmount > 100 || currentPos > 50 || currentPos < UPPER_BOUND - 50) {
+        Serial.println(F("Large drift - rehoming..."));
+        if (homeToLeftLimit()) {
+          Serial.println(F("Rehomed"));
+          lastDriftCheckPosition = 0;
+          lastKnownGoodPosition = 0;
+          return;
         }
+      } else {
+        // Small drift - correct immediately
+        encoder.write(lastDriftCheckPosition);
+        currentPos = lastDriftCheckPosition;
       }
     }
-    
-    // Update last known good position
-    lastDriftCheckPosition = currentPos;
-  } else {
-    // Moving - update reference position
-    lastDriftCheckPosition = currentPos;
   }
+  
+  // Update reference positions
+  if (isStationary || abs(motorVelocity) < 10) {
+    lastDriftCheckPosition = currentPos;
+    lastKnownGoodPosition = currentPos;
+  } else {
+    // During movement, update less frequently but still track
+    lastKnownGoodPosition = currentPos;
+  }
+}
+
+// CONTINUOUS POSITION VALIDATION - runs more frequently
+void validatePosition() {
+  if (!autoMode || dynamicCalibrationActive) return;
+  
+  long currentPos = encoder.read();
+  
+  // Always enforce bounds
+  if (currentPos < UPPER_BOUND) {
+    encoder.write(UPPER_BOUND);
+    currentPos = UPPER_BOUND;
+  }
+  if (currentPos > LOWER_BOUND) {
+    encoder.write(LOWER_BOUND);
+    currentPos = LOWER_BOUND;
+  }
+  
+  // Check for unexpected position jumps (encoder glitches)
+  if (lastKnownGoodPosition != 0) {
+    long positionJump = abs(currentPos - lastKnownGoodPosition);
+    
+    // If position jumped more than expected in short time, likely encoder error
+    if (positionJump > 100 && abs(motorVelocity) < 20) {
+      Serial.print(F("Position jump: "));
+      Serial.print(positionJump);
+      Serial.println(F(" - correcting"));
+      encoder.write(lastKnownGoodPosition);
+      currentPos = lastKnownGoodPosition;
+    }
+  }
+  
+  lastKnownGoodPosition = currentPos;
 }
 
 // LIMIT SWITCHES
@@ -2211,7 +2301,9 @@ void processCommand() {
           dynamicCalibrationActive = false;
           // Initialize drift check
           lastDriftCheckPosition = encoder.read();
+          lastKnownGoodPosition = encoder.read();
           lastDriftCheckTime = millis();
+          lastPositionValidationTime = millis();
           
           currentState = CALIBRATE;
           errorIntegral = 0;
