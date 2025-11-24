@@ -228,6 +228,11 @@ void processCommand(char cmd) {
       manualLaneMove();
       break;
 
+    case 'X':
+      if (!ensureRangeAndFrictionReady()) return;
+      testLaneTransitions();
+      break;
+
     case 'H':
       if (!ensureRangeAndFrictionReady()) return;
       homeToLeft();
@@ -1741,6 +1746,196 @@ void manualMoveTo(long targetPosition) {
 }
 
 // ============================================================================
+// LANE TRANSITION TEST
+// ============================================================================
+
+void testLaneTransitions() {
+  Serial.println(F("\n=== LANE TRANSITION TEST ==="));
+  Serial.println(F("Tests all lane-to-lane transitions"));
+  Serial.println(F("Press any key to stop early\n"));
+
+  if (!isCalibrated) {
+    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    return;
+  }
+
+  // Verify all lane positions are set
+  bool allLanesSet = true;
+  for (int i = 0; i < 4; i++) {
+    if (LANE_POSITIONS[i] == 0 && i != 0) {
+      allLanesSet = false;
+    }
+  }
+  if (!allLanesSet) {
+    Serial.println(F("ERROR: Set all lane positions first (commands 1-4)"));
+    return;
+  }
+
+  Serial.println(F("Current PID gains:"));
+  Serial.print(F("Kp="));
+  Serial.print(KP, 4);
+  Serial.print(F(" Ki="));
+  Serial.print(KI, 4);
+  Serial.print(F(" Kd="));
+  Serial.println(KD, 4);
+  Serial.println();
+
+  // Home first
+  homeToLeft();
+  delay(500);
+  positionFilterInitialized = false;
+
+  // Test all transitions: 1->2, 1->3, 1->4, 2->1, 2->3, 2->4, 3->1, 3->2, 3->4, 4->1, 4->2, 4->3
+  int transitions[12][2] = {
+    {1, 2}, {1, 3}, {1, 4},
+    {2, 1}, {2, 3}, {2, 4},
+    {3, 1}, {3, 2}, {3, 4},
+    {4, 1}, {4, 2}, {4, 3}
+  };
+
+  Serial.println(F("From,To,Time(s),Overshoot,FinalErr,Settled"));
+  Serial.println(F("----------------------------------------"));
+
+  for (int t = 0; t < 12; t++) {
+    int fromLane = transitions[t][0];
+    int toLane = transitions[t][1];
+    
+    long startPos = LANE_POSITIONS[fromLane - 1];
+    long targetPos = LANE_POSITIONS[toLane - 1];
+    
+    // Move to starting lane
+    Serial.print(F("Moving to L"));
+    Serial.print(fromLane);
+    Serial.print(F("..."));
+    manualMoveToPosition(startPos, 3000);
+    delay(500);
+    
+    // Reset PID state
+    error = 0;
+    lastError = 0;
+    integral = 0;
+    derivative = 0;
+    lastDerivative = 0;
+    positionFilterInitialized = false;
+    
+    // Perform transition
+    unsigned long transStart = millis();
+    unsigned long settledTime = 0;
+    bool hasSettled = false;
+    long maxOvershoot = 0;
+    long initialError = abs(targetPos - motorEncoder.read());
+    long maxError = initialError;
+    
+    unsigned long timeout = 8000;  // 8 second max per transition
+    bool earlyStop = false;
+    
+    while (millis() - transStart < timeout) {
+      float voltage = updatePID(targetPos);
+      
+      // Anti-windup
+      if ((error != 0) && (error * lastError < 0)) {
+        integral *= INTEGRAL_DECAY_CROSS;
+      }
+      if (abs(error) > 600) {
+        integral *= INTEGRAL_DECAY_FAR;
+      }
+      
+      float applied = cappedVoltageForError(voltage, error);
+      setMotorVoltage(applied);
+      
+      // Track overshoot
+      long currentError = abs(error);
+      if (currentError > maxError) {
+        maxError = currentError;
+      }
+      if (currentError > maxOvershoot && initialError > 0) {
+        maxOvershoot = currentError;
+      }
+      
+      // Check settled
+      if (abs(error) < DEADBAND && !hasSettled) {
+        settledTime = millis();
+        hasSettled = true;
+      }
+      
+      // Check for early stop
+      if (Serial.available()) {
+        Serial.read();
+        earlyStop = true;
+        break;
+      }
+      
+      delay(CONTROL_PERIOD);
+    }
+    
+    setMotorVoltage(0);
+    
+    float transTime = (millis() - transStart) / 1000.0;
+    long finalError = abs(targetPos - motorEncoder.read());
+    float settleTime = hasSettled ? (settledTime - transStart) / 1000.0 : -1.0;
+    long overshoot = maxOvershoot > initialError ? (maxOvershoot - initialError) : 0;
+    
+    Serial.print(fromLane);
+    Serial.print(F(","));
+    Serial.print(toLane);
+    Serial.print(F(","));
+    Serial.print(transTime, 2);
+    Serial.print(F(","));
+    Serial.print(overshoot);
+    Serial.print(F(","));
+    Serial.print(finalError);
+    Serial.print(F(","));
+    if (hasSettled) {
+      Serial.print(settleTime, 2);
+    } else {
+      Serial.print(F("NO"));
+    }
+    Serial.println();
+    
+    delay(500);
+    
+    if (earlyStop) {
+      Serial.println(F("\nTest stopped by user"));
+      break;
+    }
+  }
+  
+  Serial.println(F("\n=== TEST COMPLETE ==="));
+  setMotorVoltage(0);
+}
+
+void manualMoveToPosition(long targetPosition, unsigned long maxTime) {
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < maxTime) {
+    float voltage = updatePID(targetPosition);
+    
+    if ((error != 0) && (error * lastError < 0)) {
+      integral *= INTEGRAL_DECAY_CROSS;
+    }
+    if (abs(error) > 600) {
+      integral *= INTEGRAL_DECAY_FAR;
+    }
+    
+    float applied = cappedVoltageForError(voltage, error);
+    setMotorVoltage(applied);
+    
+    if (abs(error) < DEADBAND) {
+      break;
+    }
+    
+    if (Serial.available()) {
+      Serial.read();
+      break;
+    }
+    
+    delay(CONTROL_PERIOD);
+  }
+  
+  setMotorVoltage(0);
+}
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
@@ -1844,6 +2039,7 @@ void printHelp() {
   Serial.println(F("S - Step Response"));
   Serial.println(F("T - Manual Position Test"));
   Serial.println(F("M - Manual lane move"));
+  Serial.println(F("X - Lane Transition Test (all transitions)"));
   Serial.println(F("H - Home"));
   Serial.println(F("P - Print Status"));
   Serial.println(F("C - Clear Calibration"));

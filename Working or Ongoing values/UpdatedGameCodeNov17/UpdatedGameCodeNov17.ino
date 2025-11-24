@@ -775,12 +775,14 @@ void runStateMachine() {
       }
       bool notStuckAtLane4 = !(currentPos < -1200 && !positionChanged && abs(errorToOriginalTarget) > 3);
       
-      if (activeTargetIndex >= 0 && !WAIT_POS && !fineAdjustmentActive &&
+      // Early fine adjustment - DISABLED for Lane 4 to prevent oscillation
+      if (activeTargetIndex >= 0 && activeTargetIndex != 3 &&
+          !WAIT_POS && !fineAdjustmentActive &&
           fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
           (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-                     abs(motorVelocity) < 30 &&
+          abs(motorVelocity) < 30 &&
           abs(errorToOriginalTarget) <= 8 &&
-          abs(errorToOriginalTarget) > 3 &&
+          abs(errorToOriginalTarget) > 5 &&
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           !ProxSensors[activeTargetIndex].hitDetected &&
           zombieDistances[activeTargetIndex] < 0.30 &&
@@ -827,15 +829,16 @@ void runStateMachine() {
               Serial.println(F("Target retreating"));
               currentState = CHOOSE_ACTIVE_TARGET;
             }
-            // Fine positioning
-            else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
+            // Fine positioning - DISABLED for Lane 4 to prevent oscillation
+            else if (activeTargetIndex != 3 &&
+                     ProxSensors[activeTargetIndex].direction == FORWARD && 
                      !fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-                     abs(motorVelocity) < 30 &&  // Increased threshold to trigger earlier
-                     abs(errorToOriginalTarget) > 3 &&
+                     abs(motorVelocity) < 30 &&
+                     abs(errorToOriginalTarget) > 5 &&
                      abs(errorToOriginalTarget) <= 7 &&
-                     !ProxSensors[activeTargetIndex].hitDetected) {  // Not yet hit
+                     !ProxSensors[activeTargetIndex].hitDetected) {
               
               if (abs(errorToOriginalTarget) > 0) {
                 fineAdjustmentTarget = activeTargetPosition;
@@ -854,15 +857,16 @@ void runStateMachine() {
               }
             }
             
-            // Continuous fine adjustment
-            else if (ProxSensors[activeTargetIndex].direction == FORWARD && 
+            // Continuous fine adjustment - DISABLED for Lane 4 to prevent oscillation
+            else if (activeTargetIndex != 3 &&
+                     ProxSensors[activeTargetIndex].direction == FORWARD && 
                      fineAdjustmentActive &&
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
-                     abs(motorVelocity) < 25 &&  // Increased threshold to trigger earlier
-                     abs(errorToCurrentTarget) > 3 &&  // Skip if within +/- 3 counts (deadband)
-                     !ProxSensors[activeTargetIndex].hitDetected &&  // Not yet hit
-                     (millis() - arrivalTime) >= 100) {  // Reduced delay for faster continuous correction
+                     abs(motorVelocity) < 25 &&
+                     abs(errorToCurrentTarget) > 5 &&
+                     !ProxSensors[activeTargetIndex].hitDetected &&
+                     (millis() - arrivalTime) >= 100) {
               
               fineAdjustmentTarget = activeTargetPosition;
               
@@ -950,7 +954,27 @@ void runMotionControl() {
   
   float originalError = desiredPosition - currentPosition;
   
-  // Deadband with hysteresis: stop if within +/- 3 counts, only resume if error > 5 counts
+  // Enhanced deadband for Lane 4 to prevent oscillation
+  // Lane 4 is more prone to oscillation, so use larger deadband
+  bool isLane4 = (activeTargetIndex == 3);
+  int deadbandSize = isLane4 ? 5 : 3;  // Larger deadband for Lane 4
+  int hysteresisThreshold = isLane4 ? 8 : 5;  // Larger hysteresis for Lane 4
+  
+  // For Lane 4, if we're at the target position, completely stop all corrections
+  if (isLane4 && abs(originalError) <= deadbandSize) {
+    stopMotor();
+    errorIntegral = 0;
+    adaptiveLearning = false;
+    lastError = 0;
+    stuckCounter = 0;
+    stuckStartTime = 0;
+    voltageRamping = false;
+    if (!targetReached) {
+      targetReached = true;
+    }
+    return;
+  }
+  
   static bool inDeadband = false;
   static unsigned long lastMoveStart = 0;
   
@@ -960,7 +984,7 @@ void runMotionControl() {
     lastMoveStart = moveStartTime;
   }
   
-  if (abs(originalError) <= 3) {
+  if (abs(originalError) <= deadbandSize) {
     inDeadband = true;
     stopMotor();
     errorIntegral = 0;
@@ -971,8 +995,8 @@ void runMotionControl() {
     }
     return;
   }
-  // Hysteresis: only resume correction if error exceeds 5 counts
-  if (inDeadband && abs(originalError) > 5) {
+  // Hysteresis: only resume correction if error exceeds threshold
+  if (inDeadband && abs(originalError) > hysteresisThreshold) {
     inDeadband = false;
   }
   if (inDeadband) {
@@ -998,8 +1022,9 @@ void runMotionControl() {
 
   targetReached = false;
 
-  // Retry logic - skip if within +/- 3 counts (deadband)
-  if (abs(originalError) > 3 && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
+  // Retry logic - skip if within deadband (larger for Lane 4)
+  int deadbandSize = isLane4 ? 5 : 3;
+  if (abs(originalError) > deadbandSize && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
     // Check if stuck
     if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
@@ -1096,8 +1121,9 @@ void runMotionControl() {
     return;
   }
   
-  // Skip PID correction if error is within +/- 3 counts (deadband)
-  if (abs(error) <= 3) {
+  // Skip PID correction if error is within deadband (larger for Lane 4)
+  int deadbandSize = isLane4 ? 5 : 3;
+  if (abs(error) <= deadbandSize) {
     stopMotor();
     lastError = 0;  // Reset to prevent derivative spikes
     return;
@@ -1107,7 +1133,7 @@ void runMotionControl() {
   
   // PID CONTROL - uses EEPROM values
   
-  // Adaptive PID gains - reduce aggressiveness when close to target
+  // Adaptive PID gains - reduce aggressiveness when close to target, especially for Lane 4
   if (abs(error) > 1000) {
     KP_active = KP * 3.5;
     KI_active = 0;
@@ -1129,16 +1155,29 @@ void runMotionControl() {
     KD_active = KD * 1.2;
   } else if (abs(error) > 10) {
     // Reduced gains when close to target to prevent oscillation
-    KP_active = KP * 1.0;
-    KI_active = KI * 0.5;
-    KD_active = KD * 1.5;  // Higher damping when close
+    if (isLane4) {
+      // Lane 4: even more conservative gains
+      KP_active = KP * 0.5;
+      KI_active = KI * 0.2;
+      KD_active = KD * 2.0;  // Very high damping for Lane 4
+    } else {
+      KP_active = KP * 1.0;
+      KI_active = KI * 0.5;
+      KD_active = KD * 1.5;
+    }
     errorIntegral += error * dt;
     errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
   } else {
-    // Very close - minimal gains
-    KP_active = KP * 0.5;
-    KI_active = 0;  // Disable integral when very close
-    KD_active = KD * 2.0;  // High damping
+    // Very close - minimal gains, especially for Lane 4
+    if (isLane4) {
+      KP_active = KP * 0.2;  // Very low for Lane 4
+      KI_active = 0;
+      KD_active = KD * 3.0;  // Very high damping
+    } else {
+      KP_active = KP * 0.5;
+      KI_active = 0;
+      KD_active = KD * 2.0;
+    }
     errorIntegral = 0;  // Reset integral
   }
   
@@ -1148,9 +1187,12 @@ void runMotionControl() {
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
   
-  // Momentum compensation - disabled when very close to target
+  // Momentum compensation - disabled when very close to target, especially for Lane 4
   float momentumCompensation = 1.0;
-  if (abs(error) <= 10) {
+  if (isLane4 && abs(error) <= 20) {
+    // Lane 4: disable momentum compensation when close to prevent oscillation
+    momentumCompensation = 1.0;
+  } else if (abs(error) <= 10) {
     // Disable momentum compensation when very close to prevent oscillation
     momentumCompensation = 1.0;
   } else if (abs(error) > 200) {
@@ -1168,9 +1210,10 @@ void runMotionControl() {
   pidVoltage *= momentumCompensation;
 
   // FRICTION COMPENSATION - higher on right side (lane 4)
-  // Skip friction compensation if within +/- 3 counts (deadband)
+  // Skip friction compensation if within deadband (larger for Lane 4)
+  int deadbandSize = isLane4 ? 5 : 3;
   float frictionComp = 0;
-  if (abs(error) > 3) {
+  if (abs(error) > deadbandSize) {
     bool movingTowardMoreNegative = (error < 0);
     float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float positionFrictionBoost = 1.0;
@@ -1216,9 +1259,9 @@ void runMotionControl() {
   }
 
   float velocityFF = 0;
-  // Fine adjustment boost - disabled when very close
+  // Fine adjustment boost - disabled when very close, especially for Lane 4
   float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && abs(error) > 3 && abs(error) <= 5 && abs(motorVelocity) < 15) {
+  if (fineAdjustmentActive && !isLane4 && abs(error) > 3 && abs(error) <= 5 && abs(motorVelocity) < 15) {
     float boostMultiplier = 1.2;
     fineAdjustmentBoost = error * boostMultiplier;
     fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);
@@ -1275,9 +1318,10 @@ void runMotionControl() {
   }
 
   // Stuck detection with voltage ramping
-  // Skip stuck detection if within +/- 3 counts (deadband)
+  // Skip stuck detection if within deadband (larger for Lane 4)
+  int deadbandSize = isLane4 ? 5 : 3;
   unsigned long currentTime = millis();
-  if (abs(originalError) > 3) {
+  if (abs(originalError) > deadbandSize) {
     if (currentTime - lastStuckCheckTime >= 150) {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
         stuckCounter++;
@@ -1320,8 +1364,9 @@ void runMotionControl() {
   }
 
   // Ensure minimum voltage for error correction
-  // Skip if within +/- 3 counts (deadband)
-  if (abs(originalError) > 3 && !voltageRamping) {
+  // Skip if within deadband (larger for Lane 4)
+  int deadbandSize = isLane4 ? 5 : 3;
+  if (abs(originalError) > deadbandSize && !voltageRamping) {
     bool movingRight = (error < 0);
     float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);
