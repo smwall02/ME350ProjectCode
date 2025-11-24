@@ -75,7 +75,7 @@ const float POSITION_FILTER_ALPHA = 0.85;   // Low-pass filter for position read
 // Control parameters
 const long DEADBAND = 5;  // Encoder counts
 const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz)
-const float TEST_MAX_VOLTAGE = 6.0;  // Base max drive during manual tests
+const float TEST_MAX_VOLTAGE = 9.0;  // Base max drive during manual tests (9V nominal as per UpdatedGameCodeNov17.ino)
 const unsigned long LOG_INTERVAL_MS = 30; // Logging cadence for manual tests/moves
 
 // Anti-windup parameters
@@ -820,13 +820,13 @@ void autoTuneZieglerNichols() {
 
   positionFilterInitialized = false;
   
-  // Enhanced staged approach
+  // Enhanced staged approach - using 9V nominal voltage
   unsigned long moveStart = millis();
   // Stage 1: coarse approach
   while (abs(motorEncoder.read() - centerPosition) > 30 && millis() - moveStart < 10000) {
     long currentPos = motorEncoder.read();
     long err = centerPosition - currentPos;
-    float voltage = constrain(err * 0.012, -6.5, 6.5);
+    float voltage = constrain(err * 0.012, -9.0, 9.0);  // Updated to 9V max
     setMotorVoltage(voltage);
     delay(10);
   }
@@ -836,7 +836,7 @@ void autoTuneZieglerNichols() {
   while (abs(motorEncoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
     long currentPos = motorEncoder.read();
     long err = centerPosition - currentPos;
-    float voltage = constrain(err * 0.008, -4.5, 4.5);
+    float voltage = constrain(err * 0.008, -8.0, 8.0);  // Updated to 8V max
     setMotorVoltage(voltage);
     delay(10);
   }
@@ -846,11 +846,11 @@ void autoTuneZieglerNichols() {
   while (abs(motorEncoder.read() - centerPosition) > 5 && millis() - moveStart < 4000) {
     long currentPos = motorEncoder.read();
     long err = centerPosition - currentPos;
-    float voltage = constrain(err * 0.005, -3.0, 3.0);
+    float voltage = constrain(err * 0.005, -7.0, 7.0);  // Updated to 7V max
     setMotorVoltage(voltage);
     delay(10);
   }
-
+  
   // Final PID-based centering
   error = lastError = integral = derivative = lastDerivative = 0;
   unsigned long pidStart = millis();
@@ -860,7 +860,7 @@ void autoTuneZieglerNichols() {
   
   while (millis() - pidStart < 4000) {
     float pidVoltage = updatePID(centerPosition);
-    float applied = constrain(pidVoltage, -4.0, 4.0);
+    float applied = constrain(pidVoltage, -7.0, 7.0);  // Updated to 7V max
     setMotorVoltage(applied);
 
     if (abs(error) <= CENTER_TOL) {
@@ -882,8 +882,8 @@ void autoTuneZieglerNichols() {
     Serial.println(F("Warning: Not well centered; results may be less accurate."));
   }
 
-  // Enhanced relay parameters
-  const float TEST_VOLTAGE = 5.0;  // Relay amplitude
+  // Enhanced relay parameters - using 9V nominal voltage
+  const float TEST_VOLTAGE = 9.0;  // Relay amplitude (9V as per UpdatedGameCodeNov17.ino)
   const long HYSTERESIS = TOTAL_RANGE / 8;  // Slightly smaller hysteresis for better oscillation
   const int TARGET_PEAKS = 30;       // Increased for better accuracy
   const int MIN_PEAKS = 20;          // Minimum acceptable (increased)
@@ -1396,7 +1396,7 @@ void stepResponse() {
   homeToLeft();
   delay(1000);
 
-  Serial.println(F("\nApplying step voltage of 5.0V..."));
+  Serial.println(F("\nApplying step voltage of 9.0V..."));
   Serial.println(F("Time(ms),Position(counts),Velocity(counts/s)"));
 
   unsigned long startTime = millis();
@@ -1410,7 +1410,7 @@ void stepResponse() {
   long positions[MAX_SAMPLES];
   int sampleCount = 0;
 
-  setMotorVoltage(5.0);
+  setMotorVoltage(9.0);  // Updated to 9V as per UpdatedGameCodeNov17.ino
 
   // Record for 3 seconds or until right limit
   while (millis() - startTime < 3000 && digitalRead(LIMIT_RIGHT) == LOW && sampleCount < MAX_SAMPLES) {
@@ -1937,11 +1937,14 @@ void clearCalibration() {
 float cappedVoltageForError(float voltage, long error) {
   long absErr = abs(error);
   float cap;
-  if (absErr > 800) cap = 4.0f;
-  else if (absErr > 600) cap = 3.6f;
-  else if (absErr > 400) cap = 3.3f;
-  else if (absErr > 200) cap = 3.1f;
-  else cap = 3.0f;
+  // Updated voltage caps to match 9V nominal (as per UpdatedGameCodeNov17.ino)
+  if (absErr > 1000) cap = 9.0f;  // Very large moves - use full 9V
+  else if (absErr > 800) cap = 8.5f;  // Large moves - high speed
+  else if (absErr > 500) cap = 8.0f;  // Medium-large moves
+  else if (absErr > 300) cap = 7.5f;  // Medium moves
+  else if (absErr > 100) cap = 7.0f;  // Small-medium moves
+  else if (absErr > 50) cap = 6.0f;  // Small moves
+  else cap = 5.0f;  // Fine positioning
   cap = min(cap, TEST_MAX_VOLTAGE);
   return constrain(voltage, -cap, cap);
 }
