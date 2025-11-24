@@ -1100,8 +1100,9 @@ void runMotionControl() {
   // ============================================
   // PID CONTROL CALCULATION (Primary control method)
   // ============================================
-  // NOTE: PID values (KP, KI, KD) are ALWAYS used as the base for motor control
-  // The following sections may add boosts or minimums, but PID is always the foundation
+  // NOTE: PID values (KP, KI, KD) are ALWAYS loaded from EEPROM and used as the base for motor control
+  // These values are loaded in setup() via loadCalibrationFromEEPROM() and used throughout operation
+  // The following sections scale these EEPROM values based on error magnitude, but always use EEPROM as base
   // Adaptive friction learning (above) temporarily bypasses PID only during initial learning phase
   
   // Adaptive PID gains - increased for faster error correction
@@ -1162,22 +1163,51 @@ void runMotionControl() {
   
   pidVoltage *= momentumCompensation;
 
-  // FRICTION COMPENSATION DISABLED - was causing overshoot
+  // FRICTION COMPENSATION - Position-based with higher compensation on right side
   float frictionComp = 0;
-  // Disabled until proper tuning can be done
-  // if (abs(error) > TARGET_BAND) {
-  //   bool movingTowardMoreNegative = (error < 0);
-  //   float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
-  //   float frictionScale = 1.0;
-  //   float absError = abs(error);
-  //   if (absError < 3) frictionScale = 0.05;
-  //   else if (absError < 10) frictionScale = 0.15;
-  //   else if (absError < 30) frictionScale = 0.4;
-  //   else if (absError < 100) frictionScale = 0.7;
-  //   if (abs(motorVelocity) > 5) frictionScale *= 0.5;
-  //   if (error < 0) frictionComp = -baseFriction * frictionScale;
-  //   else frictionComp = baseFriction * frictionScale;
-  // }
+  if (abs(error) > TARGET_BAND) {
+    bool movingTowardMoreNegative = (error < 0);
+    float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
+    
+    // Position-based friction boost: Higher friction compensation on right side (more negative positions)
+    // When position is < -1000 (right side), increase friction compensation significantly
+    float positionFrictionBoost = 1.0;
+    if (currentPosition < -1000) {
+      // Right side (lower encoder values): Apply significant boost
+      // Scale from 1.0 at -1000 to 2.5 at -1424 (right limit)
+      float rightSideFactor = (currentPosition + 1000) / -424.0;  // -1000 to -1424 range
+      rightSideFactor = constrain(rightSideFactor, 0.0, 1.0);
+      positionFrictionBoost = 1.0 + (rightSideFactor * 1.5);  // 1.0x to 2.5x boost
+    } else if (currentPosition < -500) {
+      // Medium-right side: Moderate boost
+      float mediumRightFactor = (currentPosition + 500) / -500.0;
+      mediumRightFactor = constrain(mediumRightFactor, 0.0, 1.0);
+      positionFrictionBoost = 1.0 + (mediumRightFactor * 0.5);  // 1.0x to 1.5x boost
+    }
+    
+    // Error-based scaling (reduced scaling when close to target)
+    float frictionScale = 1.0;
+    float absError = abs(error);
+    if (absError < 3) frictionScale = 0.1;
+    else if (absError < 10) frictionScale = 0.3;
+    else if (absError < 30) frictionScale = 0.6;
+    else if (absError < 100) frictionScale = 0.85;
+    // For larger errors, use full friction
+    
+    // Reduce friction when moving (velocity-based scaling)
+    if (abs(motorVelocity) > 10) {
+      float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
+      frictionScale *= (1.0 - velocityFactor * 0.4);  // Reduce by up to 40% when moving
+    }
+    
+    // Apply friction compensation with position boost
+    float totalFriction = baseFriction * positionFrictionBoost * frictionScale;
+    if (error < 0) {
+      frictionComp = -totalFriction;  // Moving right (toward more negative)
+    } else {
+      frictionComp = totalFriction;   // Moving left (toward less negative)
+    }
+  }
 
   // Velocity feedforward - DISABLED to prevent overshoot
   float velocityFF = 0;
@@ -1200,24 +1230,24 @@ void runMotionControl() {
   // totalVoltage = PID (primary) + friction compensation + velocity feedforward + fine adjustment boost
   float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
 
-  // Voltage capping based on error magnitude - increased for faster error correction
+  // Voltage capping based on error magnitude - using 9V as nominal voltage
   // Higher limits for very large errors (lane-to-lane moves) to prevent slow movement
-  float voltageLimit = 7.5;  // Maximum voltage cap (increased for faster large moves)
+  float voltageLimit = 9.0;  // Nominal voltage cap (9V as requested)
   long absErr = abs(error);
   if (absErr > 1000) {
-    voltageLimit = 7.5;  // Very large moves (lane 4 to lane 1) - maximum speed
+    voltageLimit = 9.0;  // Very large moves (lane 4 to lane 1) - use full 9V
   } else if (absErr > 800) {
-    voltageLimit = 7.0;  // Large moves - high speed
+    voltageLimit = 8.5;  // Large moves - high speed
   } else if (absErr > 500) {
-    voltageLimit = 6.5;  // Medium-large moves
+    voltageLimit = 8.0;  // Medium-large moves
   } else if (absErr > 300) {
-    voltageLimit = 6.0;  // Medium moves
+    voltageLimit = 7.5;  // Medium moves
   } else if (absErr > 100) {
-    voltageLimit = 5.0;  // Small-medium moves
+    voltageLimit = 7.0;  // Small-medium moves
   } else if (absErr > 50) {
-    voltageLimit = 4.5;  // Small moves
+    voltageLimit = 6.0;  // Small moves
   } else {
-    voltageLimit = 3.5;  // Fine positioning
+    voltageLimit = 5.0;  // Fine positioning
   }
 
   totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
