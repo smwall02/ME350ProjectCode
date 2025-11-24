@@ -126,6 +126,10 @@ bool fineAdjustmentActive = false;
 long fineAdjustmentTarget = 0;
 const int FINE_ADJUSTMENT_AMOUNT = 2;
 float previousZombieDistance = 1.0;
+float lastRetreatCheckDistance = 0.0;
+unsigned long lastRetreatCheckTime = 0;
+const unsigned long MIN_WAIT_AT_TARGET = 500;  // Minimum time to wait at target before checking retreat
+const float RETREAT_DISTANCE_THRESHOLD = 0.10;  // Distance must increase by this much to confirm retreat
 int fineAdjustmentCount = 0;
 const int MAX_FINE_ADJUSTMENTS = 5;
 unsigned long lastFineAdjustmentTime = 0;
@@ -617,6 +621,9 @@ void runStateMachine() {
         
         previousTargetIndex = activeTargetIndex;
         targetHitTime = 0;
+        // Initialize retreat check when starting to move to target
+        lastRetreatCheckDistance = zombieDistances[activeTargetIndex];
+        lastRetreatCheckTime = millis();
         
       } else {
         activeTargetPosition = WAIT_POSITION;
@@ -759,19 +766,30 @@ void runStateMachine() {
           targetHitTime = 0;  // Reset if not consistently backward
         }
         
-        // Switch on velocity change
-        if (prevDirection == FORWARD && 
-            (targetDirection == BACKWARD || targetDirection == STOPPED)) {
-          // Switch immediately
-          currentState = CHOOSE_ACTIVE_TARGET;
-          break;
-        }
-        
-        // Switch if retreated far
-        if (targetDirection == BACKWARD &&
-            zombieDistances[activeTargetIndex] > 0.80) {
-          currentState = CHOOSE_ACTIVE_TARGET;
-          break;
+        // Wait for retreat confirmation - don't switch immediately
+        // Only switch if target has moved away significantly
+        if (targetDirection == BACKWARD) {
+          float currentDistance = zombieDistances[activeTargetIndex];
+          float distanceIncrease = currentDistance - lastRetreatCheckDistance;
+          
+          // Update retreat check if distance is increasing
+          if (distanceIncrease > 0) {
+            lastRetreatCheckDistance = currentDistance;
+            lastRetreatCheckTime = millis();
+          }
+          
+          // Only switch if distance has increased significantly (target moving away)
+          if (distanceIncrease > RETREAT_DISTANCE_THRESHOLD && 
+              millis() - arrivalTime > MIN_WAIT_AT_TARGET) {
+            currentState = CHOOSE_ACTIVE_TARGET;
+            break;
+          }
+          
+          // Also switch if retreated very far (safety check)
+          if (currentDistance > 0.85) {
+            currentState = CHOOSE_ACTIVE_TARGET;
+            break;
+          }
         }
 
         // Check for closer threat
@@ -906,9 +924,28 @@ void runStateMachine() {
               ProxSensors[activeTargetIndex].hitTime = 0;
               currentState = CHOOSE_ACTIVE_TARGET;
             }
-            // Check retreat
+            // Check retreat - wait until target starts moving away (distance increasing)
             else if (ProxSensors[activeTargetIndex].direction == BACKWARD) {
-              currentState = CHOOSE_ACTIVE_TARGET;
+              // Only switch if we've waited long enough and distance is clearly increasing
+              unsigned long timeAtTarget = millis() - arrivalTime;
+              float currentDistance = zombieDistances[activeTargetIndex];
+              float distanceIncrease = currentDistance - lastRetreatCheckDistance;
+              
+              // Update retreat check distance if enough time has passed
+              if (timeAtTarget > MIN_WAIT_AT_TARGET) {
+                if (distanceIncrease > RETREAT_DISTANCE_THRESHOLD) {
+                  // Target is clearly moving away - switch to next target
+                  currentState = CHOOSE_ACTIVE_TARGET;
+                } else if (currentDistance > lastRetreatCheckDistance) {
+                  // Distance is increasing but not enough yet - update check point
+                  lastRetreatCheckDistance = currentDistance;
+                  lastRetreatCheckTime = millis();
+                } else if (millis() - lastRetreatCheckTime > 200) {
+                  // Update check point periodically even if distance not increasing
+                  lastRetreatCheckDistance = currentDistance;
+                  lastRetreatCheckTime = millis();
+                }
+              }
             }
             // Fine positioning - DISABLED for Lane 4 to prevent oscillation
             else if (activeTargetIndex != 3 &&
@@ -958,6 +995,14 @@ void runStateMachine() {
             }
             if (activeTargetIndex >= 0) {
               previousZombieDistance = zombieDistances[activeTargetIndex];
+              // Update retreat check distance when at target
+              if (abs(errorToCurrentTarget) <= TARGET_BAND) {
+                float currentDistance = zombieDistances[activeTargetIndex];
+                if (currentDistance != lastRetreatCheckDistance) {
+                  lastRetreatCheckDistance = currentDistance;
+                  lastRetreatCheckTime = millis();
+                }
+              }
             }
           }
         }
@@ -1058,18 +1103,19 @@ float updatePID(long targetPosition) {
   return voltage;
 }
 
-// VOLTAGE CAPPING (like PIDAutoTune)
+// VOLTAGE CAPPING (like PIDAutoTune) - reduced speeds for better target registration
 float cappedVoltageForError(float voltage, long error) {
   long absErr = abs(error);
   float cap;
-  if (absErr > 1000) cap = 9.0f;
-  else if (absErr > 800) cap = 8.5f;
-  else if (absErr > 500) cap = 8.0f;
-  else if (absErr > 300) cap = 7.5f;
-  else if (absErr > 100) cap = 7.0f;
-  else if (absErr > 50) cap = 6.0f;
-  else cap = 5.0f;
-  cap = min(cap, 9.5f);
+  // Reduced voltage caps to slow down movement and allow more time at targets
+  if (absErr > 1000) cap = 7.5f;  // Reduced from 9.0
+  else if (absErr > 800) cap = 7.0f;  // Reduced from 8.5
+  else if (absErr > 500) cap = 6.5f;  // Reduced from 8.0
+  else if (absErr > 300) cap = 6.0f;  // Reduced from 7.5
+  else if (absErr > 100) cap = 5.5f;  // Reduced from 7.0
+  else if (absErr > 50) cap = 5.0f;  // Reduced from 6.0
+  else cap = 4.5f;  // Reduced from 5.0
+  cap = min(cap, 8.0f);  // Reduced max from 9.5
   return constrain(voltage, -cap, cap);
 }
 
