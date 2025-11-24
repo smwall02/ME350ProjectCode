@@ -203,7 +203,7 @@ bool voltageRampedForRetry = false;
 unsigned long retryStartTime = 0;
 const unsigned long RETRY_TIME_THRESHOLD = 2000;  // 2 seconds
 const unsigned long TARGET_SWITCH_TIME = 4000;  // 4 seconds
-const long RETRY_ERROR_THRESHOLD = 50;  // Error threshold for retry
+const long RETRY_LARGE_ERROR_THRESHOLD = 50;  // Error threshold for retry
 unsigned long lastDriftCheckTime = 0;
 const unsigned long DRIFT_CHECK_INTERVAL = 2000;  // Check drift every 2 seconds (more frequent)
 const unsigned long DRIFT_CHECK_DURING_MOVE = 1000;  // Check drift every 1 second during movement
@@ -804,20 +804,20 @@ void runStateMachine() {
       
       // Retry logic: After 2 seconds, increase voltage if error is too large
       unsigned long moveDuration = millis() - moveStartTime;
-      if (moveDuration >= RETRY_TIME_THRESHOLD && abs(errorToOriginalTarget) > RETRY_ERROR_THRESHOLD) {
+      if (moveDuration >= RETRY_TIME_THRESHOLD && abs(errorToOriginalTarget) > RETRY_LARGE_ERROR_THRESHOLD) {
         if (!voltageRampedForRetry) {
           voltageRampedForRetry = true;
           retryStartTime = millis();
             Serial.print(F("Retry:"));
             Serial.println(abs(errorToOriginalTarget));
         }
-      } else if (abs(errorToOriginalTarget) <= RETRY_ERROR_THRESHOLD) {
+      } else if (abs(errorToOriginalTarget) <= RETRY_LARGE_ERROR_THRESHOLD) {
         voltageRampedForRetry = false;
         retryStartTime = 0;
       }
       
       // After 4 seconds, switch to next closest target if still too far
-      if (moveDuration >= TARGET_SWITCH_TIME && abs(errorToOriginalTarget) > RETRY_ERROR_THRESHOLD) {
+      if (moveDuration >= TARGET_SWITCH_TIME && abs(errorToOriginalTarget) > RETRY_LARGE_ERROR_THRESHOLD) {
         Serial.println(F("Switch"));
         // Find next closest forward zombie
         int nextTarget = -1;
