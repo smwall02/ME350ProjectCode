@@ -271,6 +271,11 @@ void setup() {
   delay(500);
 
   loadCalibrationFromEEPROM();
+  if (EEPROM.read(EEPROM_FLAG) == 0xAA) {
+    Serial.println(F("EEPROM OK"));
+  } else {
+    Serial.println(F("EEPROM empty"));
+  }
 
   printWelcome();
   printHelp();
@@ -498,6 +503,9 @@ void printCalibrationProgress() {
 }
 
 void findRangeAndSetBounds() {
+  // CRITICAL: Lane positions are NEVER modified during range finding
+  // They remain as loaded from EEPROM
+  
   if (!homeToLeftLimit()) return;
   LOWER_BOUND = encoder.read();
   unsigned long startTime = millis();
@@ -520,6 +528,10 @@ void findRangeAndSetBounds() {
     delay(100);
     UPPER_BOUND = encoder.read();
     rangeFindingComplete = true;
+    
+    // CRITICAL: Reload lane positions from EEPROM after range finding
+    // This ensures they're never modified
+    loadCalibrationFromEEPROM();
   } else {
     stopMotor();
   }
@@ -627,9 +639,11 @@ void runStateMachine() {
     case MOVE_TO_TARGET:
       long currentPos = encoder.read();
       
+      // Immediate drift/jump detection before movement
       if (autoMode && lastKnownGoodPosition != 0) {
-        long drift = abs(currentPos - lastKnownGoodPosition);
-        if (drift > 30 && abs(motorVelocity) < 5) {
+        long jump = abs(currentPos - lastKnownGoodPosition);
+        // Lower threshold for immediate correction
+        if (jump > 20 && abs(motorVelocity) < 5) {
           encoder.write(lastKnownGoodPosition);
           currentPos = lastKnownGoodPosition;
         }
@@ -992,15 +1006,25 @@ void runMotionControl() {
     return;
   }
   
-  if (currentState == MOVE_TO_TARGET && autoMode) {
-    if (currentPosition > 50) {
-      // Try to correct by moving back
-      desiredPosition = LOWER_BOUND;
-      return;
-    }
-    if (currentPosition < UPPER_BOUND) {
-      encoder.write(UPPER_BOUND);
-      currentPosition = UPPER_BOUND;
+  // Immediate bounds enforcement - catch encoder glitches early
+  if (currentPosition < UPPER_BOUND) {
+    encoder.write(UPPER_BOUND);
+    currentPosition = UPPER_BOUND;
+    lastKnownGoodPosition = UPPER_BOUND;
+  }
+  if (currentPosition > LOWER_BOUND) {
+    encoder.write(LOWER_BOUND);
+    currentPosition = LOWER_BOUND;
+    lastKnownGoodPosition = LOWER_BOUND;
+  }
+  
+  // Detect large jumps in runMotionControl - immediate correction
+  if (autoMode && lastKnownGoodPosition != 0) {
+    long jump = abs(currentPosition - lastKnownGoodPosition);
+    // Lower threshold to catch encoder glitches earlier
+    if (jump > 50 && abs(motorVelocity) < 10 && currentState != MOVE_TO_TARGET) {
+      encoder.write(lastKnownGoodPosition);
+      currentPosition = lastKnownGoodPosition;
     }
   }
   
@@ -1496,6 +1520,7 @@ void mitigateDrift() {
   
   long currentPos = encoder.read();
   
+  // Immediate bounds check - catch extreme encoder glitches
   if (currentPos < UPPER_BOUND) {
     encoder.write(UPPER_BOUND);
     lastDriftCheckPosition = UPPER_BOUND;
@@ -1508,17 +1533,35 @@ void mitigateDrift() {
     lastKnownGoodPosition = LOWER_BOUND;
     return;
   }
+  
+  // Check for large jumps (encoder glitches) - immediate correction
+  if (lastKnownGoodPosition != 0) {
+    long jump = abs(currentPos - lastKnownGoodPosition);
+    // Large jump when stationary = encoder glitch, correct immediately
+    // Lower threshold to catch smaller glitches (like -542 to 0)
+    if (jump > 100 && abs(motorVelocity) < 10) {
+      encoder.write(lastKnownGoodPosition);
+      currentPos = lastKnownGoodPosition;
+      return;
+    }
+  }
+  
   bool isStationary = (currentState == CHOOSE_ACTIVE_TARGET || abs(motorVelocity) < 5);
   if (lastDriftCheckPosition != 0) {
     long driftAmount = abs(currentPos - lastDriftCheckPosition);
     if (driftAmount > MAX_DRIFT_THRESHOLD) {
-      if (driftAmount > 100 || currentPos > 50 || currentPos < UPPER_BOUND - 50) {
+      // Only rehome for extreme cases - otherwise just correct encoder
+      if (driftAmount > 500 || currentPos > 100 || currentPos < UPPER_BOUND - 100) {
+        // Extreme drift - rehome but preserve lane positions
         if (homeToLeftLimit()) {
+          // Reload lane positions from EEPROM to ensure they're never modified
+          loadCalibrationFromEEPROM();
           lastDriftCheckPosition = 0;
           lastKnownGoodPosition = 0;
           return;
         }
       } else {
+        // Small drift - just correct encoder value
         encoder.write(lastDriftCheckPosition);
         currentPos = lastDriftCheckPosition;
       }
@@ -1542,15 +1585,21 @@ void validatePosition() {
   if (currentPos < UPPER_BOUND) {
     encoder.write(UPPER_BOUND);
     currentPos = UPPER_BOUND;
+    lastKnownGoodPosition = UPPER_BOUND;
+    return;
   }
   if (currentPos > LOWER_BOUND) {
     encoder.write(LOWER_BOUND);
     currentPos = LOWER_BOUND;
+    lastKnownGoodPosition = LOWER_BOUND;
+    return;
   }
   
+  // Detect large jumps (encoder glitches) - more aggressive threshold
   if (lastKnownGoodPosition != 0) {
     long positionJump = abs(currentPos - lastKnownGoodPosition);
-    if (positionJump > 100 && abs(motorVelocity) < 20) {
+    // Lower threshold for immediate correction of encoder glitches
+    if (positionJump > 50 && abs(motorVelocity) < 15) {
       encoder.write(lastKnownGoodPosition);
       currentPos = lastKnownGoodPosition;
     }
@@ -1615,9 +1664,10 @@ bool rightPressed() {
 
 // HOMING
 bool homeToLeftLimit() {
-
+  // CRITICAL: Lane positions are NEVER modified during homing
+  // They remain as loaded from EEPROM
+  
   if (leftPressed()) {
-
     // Hold at limit
     long lastPos = encoder.read();
     unsigned long holdStart = millis();
@@ -1652,10 +1702,14 @@ bool homeToLeftLimit() {
     // Verify encoder is actually zeroed
     long finalPos = encoder.read();
     if (abs(finalPos) > 2) {
-      encoder.write(0);  // Try one more time
+      encoder.write(0);
       delay(50);
     }
 
+    // CRITICAL: Reload lane positions from EEPROM after homing
+    // This ensures they're never modified
+    loadCalibrationFromEEPROM();
+    
     return true;
   }
 
@@ -1897,16 +1951,17 @@ void characterizeFriction() {
   Serial.print(F(" "));
   Serial.println(FRICTION_RIGHT, 1);
   
-  // Return home
+  // Return home - lane positions preserved via loadCalibrationFromEEPROM in homeToLeftLimit
   homeToLeftLimit();
 }
 
 // EEPROM
 void loadCalibrationFromEEPROM() {
+  // CRITICAL: This function preserves lane positions from EEPROM
+  // It should be called after any homing or range finding operation
   byte flag = EEPROM.read(EEPROM_FLAG);
   if (flag != 0xAA) {
-    Serial.println(F("EEPROM empty"));
-    return;
+    return;  // Don't print during auto operations
   }
 
   EEPROM.get(EEPROM_KP, KP);
@@ -1918,6 +1973,8 @@ void loadCalibrationFromEEPROM() {
   adaptiveFrictionLeft = FRICTION_LEFT;
   adaptiveFrictionRight = FRICTION_RIGHT;
 
+  // CRITICAL: Always reload lane positions from EEPROM
+  // This ensures they're never modified by homing or range finding
   for (int i = 0; i < 4; i++) {
     long v;
     EEPROM.get(EEPROM_LANES_BASE + i * sizeof(long), v);
@@ -1929,8 +1986,6 @@ void loadCalibrationFromEEPROM() {
   TARGET_3_POSITION = targetPositions[2];
   TARGET_4_POSITION = targetPositions[3];
   WAIT_POSITION = TARGET_3_POSITION;
-
-  Serial.println(F("EEPROM OK"));
 }
 
 void saveTargetsToEEPROM() {
