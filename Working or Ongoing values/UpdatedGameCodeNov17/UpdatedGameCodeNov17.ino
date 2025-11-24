@@ -730,6 +730,28 @@ void runStateMachine() {
     case MOVE_TO_TARGET:
       long currentPos = encoder.read();
       
+      // INSTANT limit switch correction in auto mode - no delays, no velocity checks
+      if (autoMode) {
+        if (leftPressed()) {
+          // Left limit switch hit - instantly set encoder to 0 (home position)
+          encoder.write(0);
+          currentPos = 0;
+          lastKnownGoodPosition = 0;
+          lastDriftCheckPosition = 0;
+          errorIntegral = 0;
+          lastError = 0;
+        }
+        if (rightPressed() && !lane4LimitSwitchMode) {
+          // Right limit switch hit - instantly set encoder to UPPER_BOUND
+          encoder.write(UPPER_BOUND);
+          currentPos = UPPER_BOUND;
+          lastKnownGoodPosition = UPPER_BOUND;
+          lastDriftCheckPosition = UPPER_BOUND;
+          errorIntegral = 0;
+          lastError = 0;
+        }
+      }
+      
       // Check for large jumps before movement - only if truly stationary
       // Don't over-correct during leftward movement preparation
       if (autoMode && lastKnownGoodPosition != 0 && abs(motorVelocity) < 3) {
@@ -801,11 +823,23 @@ void runStateMachine() {
       if (rightPressed() && error < 0) {
         stopMotor();
         encoder.write(UPPER_BOUND);
+        if (autoMode) {
+          lastKnownGoodPosition = UPPER_BOUND;
+          lastDriftCheckPosition = UPPER_BOUND;
+          errorIntegral = 0;
+          lastError = 0;
+        }
         return;
       }
       if (activeTargetIndex == 3 && currentPos < UPPER_BOUND) {
         stopMotor();
         encoder.write(UPPER_BOUND);
+        if (autoMode) {
+          lastKnownGoodPosition = UPPER_BOUND;
+          lastDriftCheckPosition = UPPER_BOUND;
+          errorIntegral = 0;
+          lastError = 0;
+        }
         return;
       }
       
@@ -1233,6 +1267,32 @@ float cappedVoltageForError(float voltage, long error) {
 void runMotionControl() {
   long rawPosition = encoder.read();
   
+  // INSTANT limit switch correction in auto mode - no delays, no velocity checks
+  if (autoMode) {
+    if (leftPressed()) {
+      // Left limit switch hit - instantly set encoder to 0 (home position)
+      encoder.write(0);
+      rawPosition = 0;
+      lastKnownGoodPosition = 0;
+      lastDriftCheckPosition = 0;
+      positionFilterInitialized = false;  // Reset filter
+      errorIntegral = 0;
+      lastError = 0;
+      filteredPosition = 0.0;
+    }
+    if (rightPressed() && !lane4LimitSwitchMode) {
+      // Right limit switch hit - instantly set encoder to UPPER_BOUND
+      encoder.write(UPPER_BOUND);
+      rawPosition = UPPER_BOUND;
+      lastKnownGoodPosition = UPPER_BOUND;
+      lastDriftCheckPosition = UPPER_BOUND;
+      positionFilterInitialized = false;  // Reset filter
+      errorIntegral = 0;
+      lastError = 0;
+      filteredPosition = (float)UPPER_BOUND;
+    }
+  }
+  
   // Bounds checking and drift detection (before filtering)
   if (rawPosition < UPPER_BOUND) {
     encoder.write(UPPER_BOUND);
@@ -1285,7 +1345,14 @@ void runMotionControl() {
   }
   if (leftPressed() && error > 0) {
     stopMotor();
-    encoder.write(LOWER_BOUND);
+    // Left limit switch is home position (0)
+    encoder.write(0);
+    if (autoMode) {
+      lastKnownGoodPosition = 0;
+      lastDriftCheckPosition = 0;
+      filteredPosition = 0.0;
+      positionFilterInitialized = false;
+    }
     lastError = 0;
     return;
   }
@@ -1747,6 +1814,36 @@ void validatePosition() {
 
 // LIMIT SWITCHES
 void checkLimitSwitches() {
+  // In auto mode, limit switch correction is handled instantly in runMotionControl()
+  // This function handles non-auto mode cases and additional safety checks
+  
+  if (autoMode) {
+    // Instant correction already handled in runMotionControl()
+    // Just ensure encoder is correct if limit switch is pressed
+    if (leftPressed()) {
+      long currentPos = encoder.read();
+      if (currentPos != 0) {
+        encoder.write(0);
+        lastKnownGoodPosition = 0;
+        lastDriftCheckPosition = 0;
+        errorIntegral = 0;
+        lastError = 0;
+      }
+    }
+    if (rightPressed() && !lane4LimitSwitchMode) {
+      long currentPos = encoder.read();
+      if (currentPos < UPPER_BOUND) {
+        encoder.write(UPPER_BOUND);
+        lastKnownGoodPosition = UPPER_BOUND;
+        lastDriftCheckPosition = UPPER_BOUND;
+        errorIntegral = 0;
+        lastError = 0;
+      }
+    }
+    return;  // Skip the rest for auto mode
+  }
+  
+  // Non-auto mode handling (with delays and velocity checks)
   if (digitalRead(LIMIT_LEFT) == HIGH && 
       currentState != CALIBRATE && 
       currentState != FIND_RANGE &&
