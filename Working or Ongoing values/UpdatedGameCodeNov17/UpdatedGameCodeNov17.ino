@@ -166,13 +166,23 @@ const int TARGET_BAND = 2;
 const float MAX_INTEGRAL = 1200.0;
 const unsigned long CONTROL_PERIOD = 10;
 
-  // Momentum compensation (removed drift offsets - they caused systematic errors)
+// Filtering constants (like PIDAutoTune)
+const float DERIVATIVE_FILTER_ALPHA = 0.7;  // Low-pass filter for derivative
+const float POSITION_FILTER_ALPHA = 0.85;   // Low-pass filter for position
+const long DEADBAND = 5;  // Encoder counts (like PIDAutoTune)
+
+// Anti-windup parameters (like PIDAutoTune)
+const float INTEGRAL_DECAY_FAR = 0.95;  // Decay rate when far from target
+const float INTEGRAL_DECAY_CROSS = 0.5;  // Decay on zero crossing
 
 // MOTION CONTROL
 long desiredPosition = 0;
 float errorIntegral = 0;
 float lastError = 0;
 float motorVelocity = 0;
+float filteredPosition = 0;
+bool positionFilterInitialized = false;
+float filteredDerivative = 0;
 int previousMotorPosition = 0;
 long previousVelCompTime = 0;
 long lastStuckCheckPos = 0;
@@ -963,69 +973,122 @@ void runStateMachine() {
   }
 }
 
-// MOTION CONTROL
-void runMotionControl() {
-  long currentPosition = encoder.read();
-  
-  if (currentPosition < UPPER_BOUND) {
-    encoder.write(UPPER_BOUND);
-    currentPosition = UPPER_BOUND;
-    lastKnownGoodPosition = UPPER_BOUND;
+// FILTERING (like PIDAutoTune)
+float filteredDerivative(float rawDerivative) {
+  static float lastDerivative = 0;
+  lastDerivative = DERIVATIVE_FILTER_ALPHA * rawDerivative + (1.0 - DERIVATIVE_FILTER_ALPHA) * lastDerivative;
+  return lastDerivative;
+}
+
+// SIMPLIFIED PID UPDATE (like PIDAutoTune)
+float updatePID(long targetPosition) {
+  // Read and filter position
+  long rawPosition = encoder.read();
+  if (!positionFilterInitialized) {
+    filteredPosition = (float)rawPosition;
+    positionFilterInitialized = true;
+  } else {
+    filteredPosition = POSITION_FILTER_ALPHA * (float)rawPosition + (1.0 - POSITION_FILTER_ALPHA) * filteredPosition;
   }
-  if (currentPosition > LOWER_BOUND) {
-    encoder.write(LOWER_BOUND);
-    currentPosition = LOWER_BOUND;
-    lastKnownGoodPosition = LOWER_BOUND;
-  }
+  long currentPosition = (long)filteredPosition;
   
-  // Quick drift check - only when truly stationary, not during movement
-  // During leftward movement, encoder readings can vary - don't interfere
-  if (autoMode && lastKnownGoodPosition != 0 && abs(motorVelocity) < 3 && currentState != MOVE_TO_TARGET) {
-    long positionChange = abs(currentPosition - lastKnownGoodPosition);
-    // Only correct large unexpected changes when truly stationary
-    if (positionChange > 100) {
-      encoder.write(lastKnownGoodPosition);
-      currentPosition = lastKnownGoodPosition;
+  // Calculate error
+  float error = targetPosition - currentPosition;
+  
+  // Apply deadband (like PIDAutoTune)
+  if (abs(error) < DEADBAND) {
+    error = 0;
+    // Conditional integral reset
+    if (abs(errorIntegral) < 10.0) {
+      errorIntegral = 0;
+    } else {
+      errorIntegral *= 0.9;  // Gradual decay
+    }
+  } else {
+    // Calculate integral with anti-windup
+    float dt = CONTROL_PERIOD / 1000.0;
+    float integralTerm = error * dt;
+    
+    // Conditional integration - don't accumulate if output would saturate
+    float testIntegral = errorIntegral + integralTerm;
+    if (abs(testIntegral) < MAX_INTEGRAL) {
+      errorIntegral = testIntegral;
     }
   }
   
-  // Remove drift offsets - they were causing systematic errors
-  // Drift is now handled by dedicated drift detection functions
-  float error = desiredPosition - currentPosition;
+  // Calculate derivative with filtering
+  float dt = CONTROL_PERIOD / 1000.0;
+  float rawDerivative = (error - lastError) / dt;
+  float derivative = filteredDerivative(rawDerivative);
   
-  if (rightPressed() && error < 0) {
-    stopMotor();
-    encoder.write(UPPER_BOUND);
-    return;
+  // Calculate PID output
+  float pidOutput = KP * error + KI * errorIntegral + KD * derivative;
+  
+  // Add friction compensation (simple, like PIDAutoTune)
+  float frictionComp = 0;
+  if (error < -DEADBAND) {
+    // Moving RIGHT (negative direction)
+    frictionComp = -FRICTION_LEFT;
+  } else if (error > DEADBAND) {
+    // Moving LEFT (positive direction)
+    frictionComp = FRICTION_RIGHT;
   }
   
-  // Immediate bounds enforcement - catch encoder glitches early
-  if (currentPosition < UPPER_BOUND) {
+  // Calculate total voltage
+  float voltage = pidOutput + frictionComp;
+  
+  // Store for next iteration
+  lastError = error;
+  
+  return voltage;
+}
+
+// VOLTAGE CAPPING (like PIDAutoTune)
+float cappedVoltageForError(float voltage, long error) {
+  long absErr = abs(error);
+  float cap;
+  if (absErr > 1000) cap = 9.0f;
+  else if (absErr > 800) cap = 8.5f;
+  else if (absErr > 500) cap = 8.0f;
+  else if (absErr > 300) cap = 7.5f;
+  else if (absErr > 100) cap = 7.0f;
+  else if (absErr > 50) cap = 6.0f;
+  else cap = 5.0f;
+  cap = min(cap, 9.5f);
+  return constrain(voltage, -cap, cap);
+}
+
+// MOTION CONTROL
+void runMotionControl() {
+  long rawPosition = encoder.read();
+  
+  // Bounds checking and drift detection (before filtering)
+  if (rawPosition < UPPER_BOUND) {
     encoder.write(UPPER_BOUND);
-    currentPosition = UPPER_BOUND;
+    rawPosition = UPPER_BOUND;
     lastKnownGoodPosition = UPPER_BOUND;
+    positionFilterInitialized = false;  // Reset filter
   }
-  if (currentPosition > LOWER_BOUND) {
+  if (rawPosition > LOWER_BOUND) {
     encoder.write(LOWER_BOUND);
-    currentPosition = LOWER_BOUND;
+    rawPosition = LOWER_BOUND;
     lastKnownGoodPosition = LOWER_BOUND;
+    positionFilterInitialized = false;  // Reset filter
   }
   
-  // Detect large jumps - only when truly stationary, not during movement
-  // During leftward movement, encoder readings can vary slightly - don't over-correct
-  if (autoMode && lastKnownGoodPosition != 0) {
-    long jump = abs(currentPosition - lastKnownGoodPosition);
-    // Only correct if truly stationary and jump is very large (likely encoder glitch)
-    // Don't correct during active movement to avoid interfering with leftward motion
-    if (jump > 100 && abs(motorVelocity) < 5 && currentState != MOVE_TO_TARGET) {
+  // Quick drift check - only when truly stationary
+  if (autoMode && lastKnownGoodPosition != 0 && abs(motorVelocity) < 3 && currentState != MOVE_TO_TARGET) {
+    long positionChange = abs(rawPosition - lastKnownGoodPosition);
+    if (positionChange > 100) {
       encoder.write(lastKnownGoodPosition);
-      currentPosition = lastKnownGoodPosition;
+      rawPosition = lastKnownGoodPosition;
+      positionFilterInitialized = false;  // Reset filter
     }
   }
   
   if (dynamicCalibrationActive) {
     desiredPosition = LOWER_BOUND;
-    error = desiredPosition - currentPosition;
+    float error = desiredPosition - rawPosition;
     if (abs(error) > 10) {
       setMotor(constrain(error * 0.05, -2.0, 2.0));
     } else {
@@ -1034,56 +1097,33 @@ void runMotionControl() {
     return;
   }
   
-  float originalError = desiredPosition - currentPosition;
+  // Use simplified PID update (like PIDAutoTune) - this handles filtering internally
+  float voltage = updatePID(desiredPosition);
   
-  bool isLane4 = (activeTargetIndex == 3);
-  int deadbandSize = isLane4 ? 5 : 3;
-  int hysteresisThreshold = isLane4 ? 8 : 5;
+  // Get current error and position from filtered values
+  long currentPos = (long)filteredPosition;
+  float error = desiredPosition - currentPos;
+  long absErr = abs((long)error);
   
-  static bool inDeadband = false;
-  static unsigned long lastMoveStart = 0;
-  
-  // Reset deadband flag when starting a new move
-  if (moveStartTime != lastMoveStart) {
-    inDeadband = false;
-    lastMoveStart = moveStartTime;
+  if (rightPressed() && error < 0) {
+    stopMotor();
+    encoder.write(UPPER_BOUND);
+    lastError = 0;
+    return;
   }
   
-  if (abs(originalError) <= deadbandSize) {
-    inDeadband = true;
+  // Deadband is now handled in updatePID(), but check if we're at target
+  if (abs(error) <= DEADBAND) {
     stopMotor();
-    errorIntegral = 0;
-    adaptiveLearning = false;
-    lastError = 0;  // Reset lastError to prevent derivative spikes
     if (!targetReached) {
       targetReached = true;
     }
     return;
   }
-  // Hysteresis: only resume correction if error exceeds threshold
-  if (inDeadband && abs(originalError) > hysteresisThreshold) {
-    inDeadband = false;
-  }
-  if (inDeadband) {
-    stopMotor();
-    return;
-  }
   
-  bool atTarget = fineAdjustmentActive ? (abs(originalError) <= 1) : (abs(originalError) <= TARGET_BAND);
-  
-  if (atTarget) {
-    stopMotor();
-    errorIntegral = 0;
-    adaptiveLearning = false;
-    if (!targetReached) {
-      targetReached = true;
-    }
-    return;
-  }
-
   targetReached = false;
 
-  if (abs(originalError) > 3 && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
+  if (abs(error) > 3 && abs(error) > RETRY_ERROR_THRESHOLD && abs(error) < 50) {
     if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
 
@@ -1170,198 +1210,52 @@ void runMotionControl() {
     return;
   }
   
-  if (abs(error) <= 3) {
-    stopMotor();
-    lastError = 0;  // Reset to prevent derivative spikes
-    return;
+  // Use simplified PID update (like PIDAutoTune)
+  float voltage = updatePID(desiredPosition);
+  
+  // Get current error for additional logic
+  long currentPos = (long)filteredPosition;
+  float error = desiredPosition - currentPos;
+  long absErr = abs((long)error);
+  
+  // Apply integral decay on zero crossing (like PIDAutoTune)
+  if ((error != 0) && (error * lastError < 0)) {
+    errorIntegral *= INTEGRAL_DECAY_CROSS;
+  }
+  if (abs(error) > 600) {
+    errorIntegral *= INTEGRAL_DECAY_FAR;
   }
   
-  float dt = CONTROL_PERIOD / 1000.0;
+  // Apply voltage capping based on error (like PIDAutoTune)
+  float totalVoltage = cappedVoltageForError(voltage, (long)error);
   
-  if (abs(error) > 1000) {
-    if (isLane4) {
-      KP_active = KP * 2.0;  // More conservative for Lane 4
-      KI_active = 0;
-      KD_active = KD * 1.0;
-    } else {
-      KP_active = KP * 3.5;
-      KI_active = 0;
-      KD_active = KD * 0.8;
-    }
-    errorIntegral = 0;
-  } else if (abs(error) > 500) {
-    if (isLane4) {
-      KP_active = KP * 1.5;
-      KI_active = 0;
-      KD_active = KD * 1.2;
-    } else {
-      KP_active = KP * 3.0;
-      KI_active = 0;
-      KD_active = KD * 0.75;
-    }
-    errorIntegral = 0;
-  } else if (abs(error) > 300) {
-    if (isLane4) {
-      KP_active = KP * 1.2;
-      KI_active = 0;
-      KD_active = KD * 1.5;
-    } else {
-      KP_active = KP * 2.5;
-      KI_active = 0;
-      KD_active = KD * 0.7;
-    }
-    errorIntegral = 0;
-  } else if (abs(error) > 50) {
-    if (isLane4) {
-      KP_active = KP * 1.0;
-      KI_active = KI * 0.3;
-      KD_active = KD * 1.8;
-    } else {
-      KP_active = KP * 2.0;
-      KI_active = KI * 0.8;
-      KD_active = KD * 1.2;
-    }
-  } else if (abs(error) > 10) {
-    if (isLane4) {
-      KP_active = KP * 0.5;  // Very conservative for Lane 4
-      KI_active = KI * 0.2;
-      KD_active = KD * 2.0;  // High damping
-    } else {
-      KP_active = KP * 1.0;
-      KI_active = KI * 0.5;
-      KD_active = KD * 1.5;
-    }
-    errorIntegral += error * dt;
-    errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
-    } else {
-      if (isLane4) {
-      KP_active = KP * 0.2;  // Very low for Lane 4
-      KI_active = 0;
-      KD_active = KD * 3.0;  // Very high damping
-    } else {
-      KP_active = KP * 0.5;
-      KI_active = 0;
-      KD_active = KD * 2.0;
-    }
-    errorIntegral = 0;
-  }
-  float errorDerivative = (error - lastError) / dt;
-  float pidVoltage = (KP_active * error) + (KI_active * errorIntegral) + (KD_active * errorDerivative);
-  float momentumCompensation = 1.0;
-  if (isLane4 && abs(error) <= 20) {
-    momentumCompensation = 1.0;
-  } else if (abs(error) <= 10) {
-    momentumCompensation = 1.0;
-  } else if (abs(error) > 200) {
-    momentumCompensation = 1.0;
-  } else if (abs(error) < 100 && abs(motorVelocity) > 50) {
-    float velocityFactor = constrain(abs(motorVelocity) / 200.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.4);
-    momentumCompensation = max(momentumCompensation, 0.6);
-  } else if (abs(error) < 50 && abs(motorVelocity) > 30) {
-    float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
-    momentumCompensation = 1.0 - (velocityFactor * 0.5);
-    momentumCompensation = max(momentumCompensation, 0.5);
-  }
-  
-  pidVoltage *= momentumCompensation;
-  float frictionComp = 0;
-  if (abs(error) > 3) {
-    bool movingTowardMoreNegative = (error < 0);
-    float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
-    float positionFrictionBoost = 1.0;
-    
-    if (isLane4 && abs(error) > 200) {
-      positionFrictionBoost = 3.0;
-    } else if (currentPosition < -1200) {
-      float lane4Factor = (currentPosition + 1200) / -224.0;
-      lane4Factor = constrain(lane4Factor, 0.0, 1.0);
-      positionFrictionBoost = 2.0 + (lane4Factor * 2.0);
-    } else if (currentPosition < -1000) {
-      float rightSideFactor = (currentPosition + 1000) / -200.0;
-      rightSideFactor = constrain(rightSideFactor, 0.0, 1.0);
-      positionFrictionBoost = 1.5 + (rightSideFactor * 0.5);
-    } else if (currentPosition < -500) {
-      float mediumRightFactor = (currentPosition + 500) / -500.0;
-      mediumRightFactor = constrain(mediumRightFactor, 0.0, 1.0);
-      positionFrictionBoost = 1.0 + (mediumRightFactor * 0.5);
-    }
-    
-    float frictionScale = 1.0;
-    float absError = abs(error);
-    if (currentPosition < -1200) {
-      if (absError < 3) frictionScale = 0.3;
-      else if (absError < 10) frictionScale = 0.6;
-      else if (absError < 30) frictionScale = 0.85;
-      else if (absError < 100) frictionScale = 0.95;
-    } else {
-      if (absError < 3) frictionScale = 0.1;
-      else if (absError < 10) frictionScale = 0.3;
-      else if (absError < 30) frictionScale = 0.6;
-      else if (absError < 100) frictionScale = 0.85;
-    }
-    
-    if (abs(motorVelocity) > 10) {
-      float velocityFactor = constrain(abs(motorVelocity) / 100.0, 0.0, 1.0);
-      if (currentPosition < -1200) {
-        frictionScale *= (1.0 - velocityFactor * 0.2);
-      } else {
-        frictionScale *= (1.0 - velocityFactor * 0.4);
-      }
-    }
-    
-    float totalFriction = baseFriction * positionFrictionBoost * frictionScale;
-    frictionComp = (error < 0) ? -totalFriction : totalFriction;
-  }
-
-  float velocityFF = 0;
-  float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && abs(error) > 3 && abs(error) <= 5 && abs(motorVelocity) < 15) {
-    float boostMultiplier = 1.2;
-    fineAdjustmentBoost = error * boostMultiplier;
-    fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);
-  }
-
-  float totalVoltage = pidVoltage + frictionComp + velocityFF + fineAdjustmentBoost;
-  float voltageLimit = 9.5;
-  long absErr = abs(error);
-  
+  // Retry multiplier for stuck conditions
   float retryMultiplier = 1.0;
   if (voltageRampedForRetry && retryStartTime > 0) {
     unsigned long retryDuration = millis() - retryStartTime;
     if (retryDuration > 1000) retryMultiplier = 1.3;
     else retryMultiplier = 1.15;
+    totalVoltage *= retryMultiplier;
+    totalVoltage = constrain(totalVoltage, -9.5, 9.5);
   }
-  
-  if (absErr > 1000) voltageLimit = 9.0;
-  else if (absErr > 800) voltageLimit = 9.0;
-  else if (absErr > 500) voltageLimit = 9.0;
-  else if (absErr > 300) voltageLimit = 8.5;
-  else if (absErr > 100) voltageLimit = 8.0;
-  else if (absErr > 50) voltageLimit = 7.5;
-  else voltageLimit = 7.0;
-  
-  voltageLimit *= retryMultiplier;
-  voltageLimit = min(voltageLimit, 9.5);
-  totalVoltage = constrain(totalVoltage, -voltageLimit, voltageLimit);
   if (currentState == MOVE_TO_TARGET && autoMode) {
     bool isLargeMove = (absErr > 1000);
     int leftSlowdownDistance = isLargeMove ? 200 : 100;
-    if (error > 0 && currentPosition > -leftSlowdownDistance) {
-      float proximityFactor = (currentPosition + leftSlowdownDistance) / leftSlowdownDistance;
+    if (error > 0 && currentPos > -leftSlowdownDistance) {
+      float proximityFactor = (currentPos + leftSlowdownDistance) / leftSlowdownDistance;
       proximityFactor = constrain(proximityFactor, 0.0, 1.0);
       float minVoltage = isLargeMove ? 0.2 : 0.3;
       float maxVoltage = isLargeMove ? 0.5 : 0.7;
       totalVoltage *= (minVoltage + (proximityFactor * (maxVoltage - minVoltage)));
-      if (currentPosition > 0) {
+      if (currentPos > 0) {
         stopMotor();
         return;
       }
     }
     if (!lane4LimitSwitchMode) {
       int rightSlowdownDistance = isLargeMove ? 200 : 100;
-      if (error < 0 && currentPosition < (UPPER_BOUND + rightSlowdownDistance)) {
-        float distanceFromLimit = currentPosition - UPPER_BOUND;
+      if (error < 0 && currentPos < (UPPER_BOUND + rightSlowdownDistance)) {
+        float distanceFromLimit = currentPos - UPPER_BOUND;
         float proximityFactor = (distanceFromLimit + rightSlowdownDistance) / rightSlowdownDistance;
         proximityFactor = constrain(proximityFactor, 0.0, 1.0);
         float minVoltage = isLargeMove ? 0.2 : 0.3;
@@ -1371,14 +1265,11 @@ void runMotionControl() {
     }
   }
 
-  if ((error != 0) && (error * lastError < 0)) {
-    errorIntegral *= 0.5;
-  }
 
   unsigned long currentTime = millis();
-  if (abs(originalError) > 3) {
+  if (abs(error) > 3) {
     if (currentTime - lastStuckCheckTime >= 150) {
-      if (abs(currentPosition - lastStuckCheckPos) < 2) {
+      if (abs(currentPos - lastStuckCheckPos) < 2) {
         stuckCounter++;
         if (stuckCounter == 1) {
           stuckStartTime = currentTime;
@@ -1387,9 +1278,9 @@ void runMotionControl() {
         if (stuckCounter >= 2) {
           voltageRamping = true;
           bool movingRight = (error < 0);
-          float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
+          float baseFrictionVoltage = movingRight ? FRICTION_LEFT : FRICTION_RIGHT;
           float minFrictionVoltage = max(baseFrictionVoltage, 2.0f);
-          if (currentPosition < -1200) {
+          if (currentPos < -1200) {
             minFrictionVoltage = max(minFrictionVoltage, 3.5f);
           }
           unsigned long stuckDuration = currentTime - stuckStartTime;
@@ -1397,7 +1288,7 @@ void runMotionControl() {
           if (stuckDuration > 1200) rampVoltage = minFrictionVoltage + 1.5f;
           else if (stuckDuration > 800) rampVoltage = minFrictionVoltage + 1.0f;
           else if (stuckDuration > 400) rampVoltage = minFrictionVoltage + 0.5f;
-          rampVoltage = min(rampVoltage, voltageLimit);
+          rampVoltage = min(rampVoltage, 9.5f);
           if (abs(totalVoltage) < rampVoltage) {
             float pidMagnitude = abs(totalVoltage);
             float finalVoltage = max(pidMagnitude, rampVoltage);
@@ -1409,7 +1300,7 @@ void runMotionControl() {
         stuckStartTime = 0;
         voltageRamping = false;
       }
-      lastStuckCheckPos = currentPosition;
+      lastStuckCheckPos = currentPos;
       lastStuckCheckTime = currentTime;
     }
   } else {
@@ -1418,11 +1309,12 @@ void runMotionControl() {
     voltageRamping = false;
   }
 
-  if (abs(originalError) > 3 && !voltageRamping) {
+  // Minimum voltage to overcome friction (only if PID output is too low)
+  if (abs(error) > 3 && !voltageRamping) {
     bool movingRight = (error < 0);
-    float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
+    float baseFrictionVoltage = movingRight ? FRICTION_LEFT : FRICTION_RIGHT;
     float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);
-    if (currentPosition < -1200) {
+    if (currentPos < -1200) {
       minFrictionVoltage = max(minFrictionVoltage, 3.0f);
     }
     if (abs(totalVoltage) < minFrictionVoltage) {
@@ -1438,7 +1330,7 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
-  if (currentPosition < UPPER_BOUND) {
+  if (currentPos < UPPER_BOUND) {
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
