@@ -1052,8 +1052,8 @@ void runMotionControl() {
   }
   
   // For other lanes, use normal deadband
-  int deadbandSize = 3;
-  int hysteresisThreshold = 5;
+  const int deadbandSize = 3;
+  const int hysteresisThreshold = 5;
   
   static bool inDeadband = false;
   static unsigned long lastMoveStart = 0;
@@ -1442,15 +1442,15 @@ void runMotionControl() {
   }
 
   // Final check: prevent moving right (more negative) when at right limit
-  // Also prevent Lane 4 from exceeding UPPER_BOUND
+  // Also prevent exceeding UPPER_BOUND (Lane 4 already handled with early return above)
   if (rightPressed() && totalVoltage < 0) {
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
     return;
   }
-  // Lane 4: Never exceed UPPER_BOUND (which is more negative than LOWER_BOUND)
-  if (isLane4 && currentPosition < UPPER_BOUND) {
+  // Prevent exceeding UPPER_BOUND
+  if (currentPosition < UPPER_BOUND) {
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
