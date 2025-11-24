@@ -120,10 +120,10 @@ float closestZombieDist = 2.0;
 float zombieDistances[4];
 bool WAIT_POS = true;
 unsigned long targetCommitTime = 0;  // Time when target was committed to
-const unsigned long MIN_TARGET_COMMIT_TIME = 800;  // Minimum time to stay at target (ms)
+const unsigned long MIN_TARGET_COMMIT_TIME = 600;  // Minimum time to stay at target (ms) - reduced for responsiveness
 const float TARGET_SWITCH_HYSTERESIS = 0.15;  // Must be this much closer to switch
-const float MIN_COMMIT_DISTANCE = 0.25;  // If closer than this, commit to target
-const float CLOSER_THREAT_THRESHOLD = 0.25;  // Must be this much closer to interrupt
+const float MIN_COMMIT_DISTANCE = 0.20;  // If closer than this, commit to target (reduced from 0.25)
+const float CLOSER_THREAT_THRESHOLD = 0.20;  // Must be this much closer to interrupt (reduced from 0.25)
 
 // Fine positioning
 long previousMoveStartPosition = 0;
@@ -588,10 +588,13 @@ void runStateMachine() {
       }
       
       // Check if we should stay committed to current target
+      // Only check this if we already have an active target
       bool shouldStayCommitted = false;
       if (activeTargetIndex >= 0 && 
+          activeTargetIndex < 4 &&
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           zombieDistances[activeTargetIndex] < MIN_COMMIT_DISTANCE &&
+          targetCommitTime > 0 &&
           (millis() - targetCommitTime) < MIN_TARGET_COMMIT_TIME) {
         // Very close to target and within commit time - stay committed
         shouldStayCommitted = true;
@@ -627,29 +630,40 @@ void runStateMachine() {
       previousMoveStartPosition = encoder.read();
 
       // Find closest forward zombie
+      int newTargetIndex = -1;
+      float newClosestDist = 2.0;
       for (int i = 0; i < 4; i++) {
         // Only target forward zombies
         if (ProxSensors[i].direction == FORWARD &&
-            zombieDistances[i] < closestZombieDist) {
-          closestZombieDist = zombieDistances[i];
-          activeTargetIndex = i;
+            zombieDistances[i] < newClosestDist) {
+          newClosestDist = zombieDistances[i];
+          newTargetIndex = i;
         }
       }
       
-      // If we had a previous target, apply hysteresis
+      // Apply hysteresis only if we have both a previous target AND a new target candidate
+      // AND the previous target is still valid (forward and close)
       if (previousTargetIndex >= 0 && 
           previousTargetIndex < 4 &&
+          newTargetIndex >= 0 &&
           ProxSensors[previousTargetIndex].direction == FORWARD &&
           zombieDistances[previousTargetIndex] < MIN_COMMIT_DISTANCE) {
-        // Previous target is still close - only switch if new target is significantly closer
-        if (activeTargetIndex >= 0 && 
-            zombieDistances[activeTargetIndex] < (zombieDistances[previousTargetIndex] - CLOSER_THREAT_THRESHOLD)) {
-          // New target is significantly closer - switch
+        // Previous target is still close and forward - only switch if new target is significantly closer
+        if (zombieDistances[newTargetIndex] < (zombieDistances[previousTargetIndex] - CLOSER_THREAT_THRESHOLD)) {
+          // New target is significantly closer - switch to it
+          activeTargetIndex = newTargetIndex;
+          closestZombieDist = newClosestDist;
         } else {
           // Stay with previous target
           activeTargetIndex = previousTargetIndex;
           closestZombieDist = zombieDistances[activeTargetIndex];
         }
+      } else {
+        // No previous target, or previous target is no longer valid (not forward or too far), or no new target found
+        // Use the new target if found, otherwise no target
+        // This ensures we always select a target if one is available, even if we had a previous target
+        activeTargetIndex = newTargetIndex;
+        closestZombieDist = newClosestDist;
       }
       
       if (activeTargetIndex >= 0) {
