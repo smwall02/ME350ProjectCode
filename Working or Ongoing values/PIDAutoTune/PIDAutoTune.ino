@@ -75,7 +75,7 @@ const float POSITION_FILTER_ALPHA = 0.85;   // Low-pass filter for position read
 // Control parameters
 const long DEADBAND = 5;  // Encoder counts
 const unsigned long CONTROL_PERIOD = 10;  // ms (100 Hz)
-const float TEST_MAX_VOLTAGE = 6.0;  // Base max drive during manual tests
+const float TEST_MAX_VOLTAGE = 9.0;  // Base max drive during manual tests (9V nominal as per UpdatedGameCodeNov17.ino)
 const unsigned long LOG_INTERVAL_MS = 30; // Logging cadence for manual tests/moves
 
 // Anti-windup parameters
@@ -226,6 +226,11 @@ void processCommand(char cmd) {
     case 'M':
       if (!ensureRangeAndFrictionReady()) return;
       manualLaneMove();
+      break;
+
+    case 'X':
+      if (!ensureRangeAndFrictionReady()) return;
+      testLaneTransitions();
       break;
 
     case 'H':
@@ -820,13 +825,13 @@ void autoTuneZieglerNichols() {
 
   positionFilterInitialized = false;
   
-  // Enhanced staged approach
+  // Enhanced staged approach - using 9V nominal voltage
   unsigned long moveStart = millis();
   // Stage 1: coarse approach
   while (abs(motorEncoder.read() - centerPosition) > 30 && millis() - moveStart < 10000) {
     long currentPos = motorEncoder.read();
     long err = centerPosition - currentPos;
-    float voltage = constrain(err * 0.012, -6.5, 6.5);
+    float voltage = constrain(err * 0.012, -9.0, 9.0);  // Updated to 9V max
     setMotorVoltage(voltage);
     delay(10);
   }
@@ -836,7 +841,7 @@ void autoTuneZieglerNichols() {
   while (abs(motorEncoder.read() - centerPosition) > 10 && millis() - moveStart < 5000) {
     long currentPos = motorEncoder.read();
     long err = centerPosition - currentPos;
-    float voltage = constrain(err * 0.008, -4.5, 4.5);
+    float voltage = constrain(err * 0.008, -8.0, 8.0);  // Updated to 8V max
     setMotorVoltage(voltage);
     delay(10);
   }
@@ -846,11 +851,11 @@ void autoTuneZieglerNichols() {
   while (abs(motorEncoder.read() - centerPosition) > 5 && millis() - moveStart < 4000) {
     long currentPos = motorEncoder.read();
     long err = centerPosition - currentPos;
-    float voltage = constrain(err * 0.005, -3.0, 3.0);
+    float voltage = constrain(err * 0.005, -7.0, 7.0);  // Updated to 7V max
     setMotorVoltage(voltage);
     delay(10);
   }
-
+  
   // Final PID-based centering
   error = lastError = integral = derivative = lastDerivative = 0;
   unsigned long pidStart = millis();
@@ -860,7 +865,7 @@ void autoTuneZieglerNichols() {
   
   while (millis() - pidStart < 4000) {
     float pidVoltage = updatePID(centerPosition);
-    float applied = constrain(pidVoltage, -4.0, 4.0);
+    float applied = constrain(pidVoltage, -7.0, 7.0);  // Updated to 7V max
     setMotorVoltage(applied);
 
     if (abs(error) <= CENTER_TOL) {
@@ -882,8 +887,8 @@ void autoTuneZieglerNichols() {
     Serial.println(F("Warning: Not well centered; results may be less accurate."));
   }
 
-  // Enhanced relay parameters
-  const float TEST_VOLTAGE = 5.0;  // Relay amplitude
+  // Enhanced relay parameters - using 9V nominal voltage
+  const float TEST_VOLTAGE = 9.0;  // Relay amplitude (9V as per UpdatedGameCodeNov17.ino)
   const long HYSTERESIS = TOTAL_RANGE / 8;  // Slightly smaller hysteresis for better oscillation
   const int TARGET_PEAKS = 30;       // Increased for better accuracy
   const int MIN_PEAKS = 20;          // Minimum acceptable (increased)
@@ -1396,7 +1401,7 @@ void stepResponse() {
   homeToLeft();
   delay(1000);
 
-  Serial.println(F("\nApplying step voltage of 5.0V..."));
+  Serial.println(F("\nApplying step voltage of 9.0V..."));
   Serial.println(F("Time(ms),Position(counts),Velocity(counts/s)"));
 
   unsigned long startTime = millis();
@@ -1410,7 +1415,7 @@ void stepResponse() {
   long positions[MAX_SAMPLES];
   int sampleCount = 0;
 
-  setMotorVoltage(5.0);
+  setMotorVoltage(9.0);  // Updated to 9V as per UpdatedGameCodeNov17.ino
 
   // Record for 3 seconds or until right limit
   while (millis() - startTime < 3000 && digitalRead(LIMIT_RIGHT) == LOW && sampleCount < MAX_SAMPLES) {
@@ -1741,6 +1746,196 @@ void manualMoveTo(long targetPosition) {
 }
 
 // ============================================================================
+// LANE TRANSITION TEST
+// ============================================================================
+
+void testLaneTransitions() {
+  Serial.println(F("\n=== LANE TRANSITION TEST ==="));
+  Serial.println(F("Tests all lane-to-lane transitions"));
+  Serial.println(F("Press any key to stop early\n"));
+
+  if (!isCalibrated) {
+    Serial.println(F("ERROR: Must calibrate range first (command 'R')"));
+    return;
+  }
+
+  // Verify all lane positions are set
+  bool allLanesSet = true;
+  for (int i = 0; i < 4; i++) {
+    if (LANE_POSITIONS[i] == 0 && i != 0) {
+      allLanesSet = false;
+    }
+  }
+  if (!allLanesSet) {
+    Serial.println(F("ERROR: Set all lane positions first (commands 1-4)"));
+    return;
+  }
+
+  Serial.println(F("Current PID gains:"));
+  Serial.print(F("Kp="));
+  Serial.print(KP, 4);
+  Serial.print(F(" Ki="));
+  Serial.print(KI, 4);
+  Serial.print(F(" Kd="));
+  Serial.println(KD, 4);
+  Serial.println();
+
+  // Home first
+  homeToLeft();
+  delay(500);
+  positionFilterInitialized = false;
+
+  // Test all transitions: 1->2, 1->3, 1->4, 2->1, 2->3, 2->4, 3->1, 3->2, 3->4, 4->1, 4->2, 4->3
+  int transitions[12][2] = {
+    {1, 2}, {1, 3}, {1, 4},
+    {2, 1}, {2, 3}, {2, 4},
+    {3, 1}, {3, 2}, {3, 4},
+    {4, 1}, {4, 2}, {4, 3}
+  };
+
+  Serial.println(F("From,To,Time(s),Overshoot,FinalErr,Settled"));
+  Serial.println(F("----------------------------------------"));
+
+  for (int t = 0; t < 12; t++) {
+    int fromLane = transitions[t][0];
+    int toLane = transitions[t][1];
+    
+    long startPos = LANE_POSITIONS[fromLane - 1];
+    long targetPos = LANE_POSITIONS[toLane - 1];
+    
+    // Move to starting lane
+    Serial.print(F("Moving to L"));
+    Serial.print(fromLane);
+    Serial.print(F("..."));
+    manualMoveToPosition(startPos, 3000);
+    delay(500);
+    
+    // Reset PID state
+    error = 0;
+    lastError = 0;
+    integral = 0;
+    derivative = 0;
+    lastDerivative = 0;
+    positionFilterInitialized = false;
+    
+    // Perform transition
+    unsigned long transStart = millis();
+    unsigned long settledTime = 0;
+    bool hasSettled = false;
+    long maxOvershoot = 0;
+    long initialError = abs(targetPos - motorEncoder.read());
+    long maxError = initialError;
+    
+    unsigned long timeout = 8000;  // 8 second max per transition
+    bool earlyStop = false;
+    
+    while (millis() - transStart < timeout) {
+      float voltage = updatePID(targetPos);
+      
+      // Anti-windup
+      if ((error != 0) && (error * lastError < 0)) {
+        integral *= INTEGRAL_DECAY_CROSS;
+      }
+      if (abs(error) > 600) {
+        integral *= INTEGRAL_DECAY_FAR;
+      }
+      
+      float applied = cappedVoltageForError(voltage, error);
+      setMotorVoltage(applied);
+      
+      // Track overshoot
+      long currentError = abs(error);
+      if (currentError > maxError) {
+        maxError = currentError;
+      }
+      if (currentError > maxOvershoot && initialError > 0) {
+        maxOvershoot = currentError;
+      }
+      
+      // Check settled
+      if (abs(error) < DEADBAND && !hasSettled) {
+        settledTime = millis();
+        hasSettled = true;
+      }
+      
+      // Check for early stop
+      if (Serial.available()) {
+        Serial.read();
+        earlyStop = true;
+        break;
+      }
+      
+      delay(CONTROL_PERIOD);
+    }
+    
+    setMotorVoltage(0);
+    
+    float transTime = (millis() - transStart) / 1000.0;
+    long finalError = abs(targetPos - motorEncoder.read());
+    float settleTime = hasSettled ? (settledTime - transStart) / 1000.0 : -1.0;
+    long overshoot = maxOvershoot > initialError ? (maxOvershoot - initialError) : 0;
+    
+    Serial.print(fromLane);
+    Serial.print(F(","));
+    Serial.print(toLane);
+    Serial.print(F(","));
+    Serial.print(transTime, 2);
+    Serial.print(F(","));
+    Serial.print(overshoot);
+    Serial.print(F(","));
+    Serial.print(finalError);
+    Serial.print(F(","));
+    if (hasSettled) {
+      Serial.print(settleTime, 2);
+    } else {
+      Serial.print(F("NO"));
+    }
+    Serial.println();
+    
+    delay(500);
+    
+    if (earlyStop) {
+      Serial.println(F("\nTest stopped by user"));
+      break;
+    }
+  }
+  
+  Serial.println(F("\n=== TEST COMPLETE ==="));
+  setMotorVoltage(0);
+}
+
+void manualMoveToPosition(long targetPosition, unsigned long maxTime) {
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < maxTime) {
+    float voltage = updatePID(targetPosition);
+    
+    if ((error != 0) && (error * lastError < 0)) {
+      integral *= INTEGRAL_DECAY_CROSS;
+    }
+    if (abs(error) > 600) {
+      integral *= INTEGRAL_DECAY_FAR;
+    }
+    
+    float applied = cappedVoltageForError(voltage, error);
+    setMotorVoltage(applied);
+    
+    if (abs(error) < DEADBAND) {
+      break;
+    }
+    
+    if (Serial.available()) {
+      Serial.read();
+      break;
+    }
+    
+    delay(CONTROL_PERIOD);
+  }
+  
+  setMotorVoltage(0);
+}
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
@@ -1844,6 +2039,7 @@ void printHelp() {
   Serial.println(F("S - Step Response"));
   Serial.println(F("T - Manual Position Test"));
   Serial.println(F("M - Manual lane move"));
+  Serial.println(F("X - Lane Transition Test (all transitions)"));
   Serial.println(F("H - Home"));
   Serial.println(F("P - Print Status"));
   Serial.println(F("C - Clear Calibration"));
@@ -1937,11 +2133,14 @@ void clearCalibration() {
 float cappedVoltageForError(float voltage, long error) {
   long absErr = abs(error);
   float cap;
-  if (absErr > 800) cap = 4.0f;
-  else if (absErr > 600) cap = 3.6f;
-  else if (absErr > 400) cap = 3.3f;
-  else if (absErr > 200) cap = 3.1f;
-  else cap = 3.0f;
+  // Updated voltage caps to match 9V nominal (as per UpdatedGameCodeNov17.ino)
+  if (absErr > 1000) cap = 9.0f;  // Very large moves - use full 9V
+  else if (absErr > 800) cap = 8.5f;  // Large moves - high speed
+  else if (absErr > 500) cap = 8.0f;  // Medium-large moves
+  else if (absErr > 300) cap = 7.5f;  // Medium moves
+  else if (absErr > 100) cap = 7.0f;  // Small-medium moves
+  else if (absErr > 50) cap = 6.0f;  // Small moves
+  else cap = 5.0f;  // Fine positioning
   cap = min(cap, TEST_MAX_VOLTAGE);
   return constrain(voltage, -cap, cap);
 }
