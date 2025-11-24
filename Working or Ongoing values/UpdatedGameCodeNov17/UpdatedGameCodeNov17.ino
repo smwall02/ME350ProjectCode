@@ -764,7 +764,7 @@ void runStateMachine() {
           (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
                      abs(motorVelocity) < 30 &&
           abs(errorToOriginalTarget) <= 8 &&
-          abs(errorToOriginalTarget) > TARGET_BAND &&
+          abs(errorToOriginalTarget) > 2 &&
           ProxSensors[activeTargetIndex].direction == FORWARD &&
           !ProxSensors[activeTargetIndex].hitDetected &&
           zombieDistances[activeTargetIndex] < 0.30 &&
@@ -817,7 +817,8 @@ void runStateMachine() {
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
                      abs(motorVelocity) < 30 &&  // Increased threshold to trigger earlier
-                     abs(errorToOriginalTarget) <= TARGET_BAND + 5 &&  // Increased tolerance to trigger earlier
+                     abs(errorToOriginalTarget) > 2 &&
+                     abs(errorToOriginalTarget) <= 7 &&
                      !ProxSensors[activeTargetIndex].hitDetected) {  // Not yet hit
               
               if (abs(errorToOriginalTarget) > 0) {
@@ -843,7 +844,7 @@ void runStateMachine() {
                      fineAdjustmentCount < MAX_FINE_ADJUSTMENTS &&
                      (millis() - lastFineAdjustmentTime) >= MIN_FINE_ADJUSTMENT_INTERVAL &&
                      abs(motorVelocity) < 25 &&  // Increased threshold to trigger earlier
-                     abs(errorToCurrentTarget) > 1 &&  // Still have error (not at exactly 0, allow 1 count tolerance)
+                     abs(errorToCurrentTarget) > 2 &&  // Skip if within +/- 2 counts
                      !ProxSensors[activeTargetIndex].hitDetected &&  // Not yet hit
                      (millis() - arrivalTime) >= 100) {  // Reduced delay for faster continuous correction
               
@@ -914,16 +915,30 @@ void runMotionControl() {
   }
   
   float originalError = desiredPosition - currentPosition;
+  
+  // Skip all correction if within +/- 2 counts to prevent oscillation
+  if (abs(originalError) <= 2) {
+    stopMotor();
+    errorIntegral = 0;
+    adaptiveLearning = false;
+    if (!targetReached) {
+      targetReached = true;
+      Serial.print(F("At "));
+      Serial.print(currentPosition);
+      Serial.print(F(" err="));
+      Serial.println(originalError);
+    }
+    return;
+  }
+  
   bool atTarget = fineAdjustmentActive ? (abs(originalError) <= 1) : (abs(originalError) <= TARGET_BAND);
   
   if (atTarget) {
     stopMotor();
     errorIntegral = 0;
     adaptiveLearning = false;
-
     if (!targetReached) {
       targetReached = true;
-      unsigned long settleTime = millis() - moveStartTime;
       Serial.print(F("At "));
       Serial.print(currentPosition);
       Serial.print(F(" err="));
@@ -934,8 +949,8 @@ void runMotionControl() {
 
   targetReached = false;
 
-  // Retry logic
-  if (abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
+  // Retry logic - skip if within +/- 2 counts
+  if (abs(originalError) > 2 && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
     // Check if stuck
     if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
@@ -1032,6 +1047,12 @@ void runMotionControl() {
     return;
   }
   
+  // Skip PID correction if error is within +/- 2 counts
+  if (abs(error) <= 2) {
+    stopMotor();
+    return;
+  }
+  
   float dt = CONTROL_PERIOD / 1000.0;
   
   // PID CONTROL - uses EEPROM values
@@ -1088,8 +1109,9 @@ void runMotionControl() {
   pidVoltage *= momentumCompensation;
 
   // FRICTION COMPENSATION - higher on right side (lane 4)
+  // Skip friction compensation if within +/- 2 counts
   float frictionComp = 0;
-  if (abs(error) > TARGET_BAND) {
+  if (abs(error) > 2) {
     bool movingTowardMoreNegative = (error < 0);
     float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float positionFrictionBoost = 1.0;
@@ -1191,8 +1213,9 @@ void runMotionControl() {
   }
 
   // Stuck detection with voltage ramping
+  // Skip stuck detection if within +/- 2 counts
   unsigned long currentTime = millis();
-  if (abs(originalError) > TARGET_BAND) {
+  if (abs(originalError) > 2) {
     if (currentTime - lastStuckCheckTime >= 150) {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
         stuckCounter++;
@@ -1235,7 +1258,8 @@ void runMotionControl() {
   }
 
   // Ensure minimum voltage for error correction
-  if (abs(originalError) > TARGET_BAND && !voltageRamping) {
+  // Skip if within +/- 2 counts
+  if (abs(originalError) > 2 && !voltageRamping) {
     bool movingRight = (error < 0);
     float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);
