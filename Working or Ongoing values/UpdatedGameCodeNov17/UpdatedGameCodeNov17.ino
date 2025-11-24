@@ -119,6 +119,11 @@ long activeTargetPosition = WAIT_POSITION;
 float closestZombieDist = 2.0;
 float zombieDistances[4];
 bool WAIT_POS = true;
+unsigned long targetCommitTime = 0;  // Time when target was committed to
+const unsigned long MIN_TARGET_COMMIT_TIME = 600;  // Minimum time to stay at target (ms) - reduced for responsiveness
+const float TARGET_SWITCH_HYSTERESIS = 0.15;  // Must be this much closer to switch
+const float MIN_COMMIT_DISTANCE = 0.20;  // If closer than this, commit to target (reduced from 0.25)
+const float CLOSER_THREAT_THRESHOLD = 0.20;  // Must be this much closer to interrupt (reduced from 0.25)
 
 // Fine positioning
 long previousMoveStartPosition = 0;
@@ -129,7 +134,7 @@ float previousZombieDistance = 1.0;
 float lastRetreatCheckDistance = 0.0;
 unsigned long lastRetreatCheckTime = 0;
 const unsigned long MIN_WAIT_AT_TARGET = 500;  // Minimum time to wait at target before checking retreat
-const float RETREAT_DISTANCE_THRESHOLD = 0.10;  // Distance must increase by this much to confirm retreat
+const float RETREAT_DISTANCE_THRESHOLD = 0.20;  // Distance must increase by this much to confirm retreat (increased for stricter detection)
 int fineAdjustmentCount = 0;
 const int MAX_FINE_ADJUSTMENTS = 5;
 unsigned long lastFineAdjustmentTime = 0;
@@ -582,19 +587,83 @@ void runStateMachine() {
         lastKnownGoodPosition = pos;
       }
       
+      // Check if we should stay committed to current target
+      // Only check this if we already have an active target
+      bool shouldStayCommitted = false;
+      if (activeTargetIndex >= 0 && 
+          activeTargetIndex < 4 &&
+          ProxSensors[activeTargetIndex].direction == FORWARD &&
+          zombieDistances[activeTargetIndex] < MIN_COMMIT_DISTANCE &&
+          targetCommitTime > 0 &&
+          (millis() - targetCommitTime) < MIN_TARGET_COMMIT_TIME) {
+        // Very close to target and within commit time - stay committed
+        shouldStayCommitted = true;
+      }
+      
+      // If committed, only switch if target is clearly retreating or hit
+      if (shouldStayCommitted) {
+        if (ProxSensors[activeTargetIndex].hitDetected ||
+            (ProxSensors[activeTargetIndex].direction == BACKWARD && 
+             zombieDistances[activeTargetIndex] > 0.70)) {
+          // Target hit or retreated far - allow switch
+          shouldStayCommitted = false;
+        } else {
+          // Stay with current target
+          activeTargetPosition = targetPositions[activeTargetIndex];
+          WAIT_POS = false;
+          if (lane4LimitSwitchMode) {
+            desiredPosition = UPPER_BOUND;
+          } else {
+            desiredPosition = activeTargetPosition;
+          }
+          moveStartTime = millis();
+          arrivalTime = millis();
+          currentState = MOVE_TO_TARGET;
+          break;
+        }
+      }
+      
       activeTargetIndex = -1;
       closestZombieDist = 2.0;
 
       // Track position
       previousMoveStartPosition = encoder.read();
 
+      // Find closest forward zombie
+      int newTargetIndex = -1;
+      float newClosestDist = 2.0;
       for (int i = 0; i < 4; i++) {
         // Only target forward zombies
         if (ProxSensors[i].direction == FORWARD &&
-            zombieDistances[i] < closestZombieDist) {
-          closestZombieDist = zombieDistances[i];
-          activeTargetIndex = i;
+            zombieDistances[i] < newClosestDist) {
+          newClosestDist = zombieDistances[i];
+          newTargetIndex = i;
         }
+      }
+      
+      // Apply hysteresis only if we have both a previous target AND a new target candidate
+      // AND the previous target is still valid (forward and close)
+      if (previousTargetIndex >= 0 && 
+          previousTargetIndex < 4 &&
+          newTargetIndex >= 0 &&
+          ProxSensors[previousTargetIndex].direction == FORWARD &&
+          zombieDistances[previousTargetIndex] < MIN_COMMIT_DISTANCE) {
+        // Previous target is still close and forward - only switch if new target is significantly closer
+        if (zombieDistances[newTargetIndex] < (zombieDistances[previousTargetIndex] - CLOSER_THREAT_THRESHOLD)) {
+          // New target is significantly closer - switch to it
+          activeTargetIndex = newTargetIndex;
+          closestZombieDist = newClosestDist;
+        } else {
+          // Stay with previous target
+          activeTargetIndex = previousTargetIndex;
+          closestZombieDist = zombieDistances[activeTargetIndex];
+        }
+      } else {
+        // No previous target, or previous target is no longer valid (not forward or too far), or no new target found
+        // Use the new target if found, otherwise no target
+        // This ensures we always select a target if one is available, even if we had a previous target
+        activeTargetIndex = newTargetIndex;
+        closestZombieDist = newClosestDist;
       }
       
       if (activeTargetIndex >= 0) {
@@ -619,6 +688,11 @@ void runStateMachine() {
         if (activeTargetIndex != 3) {
         }
         
+        // Only update commit time if target actually changed
+        if (previousTargetIndex != activeTargetIndex) {
+          targetCommitTime = millis();
+        }
+        
         previousTargetIndex = activeTargetIndex;
         targetHitTime = 0;
         // Initialize retreat check when starting to move to target
@@ -634,6 +708,7 @@ void runStateMachine() {
         lastFineAdjustmentTime = 0;
         lane4LimitSwitchMode = false;
         lane4AtLimit = false;
+        targetCommitTime = 0;
       }
       
       if (lane4LimitSwitchMode) {
@@ -684,6 +759,7 @@ void runStateMachine() {
             lane4LimitTime = millis();
             encoder.write(UPPER_BOUND);
             currentPos = UPPER_BOUND;
+            lastKnownGoodPosition = UPPER_BOUND;
           }
           // Force movement to right limit
           desiredPosition = UPPER_BOUND;
@@ -694,14 +770,21 @@ void runStateMachine() {
           if (rightPressed() || currentPos < UPPER_BOUND) {
             encoder.write(UPPER_BOUND);
             currentPos = UPPER_BOUND;
+            lastKnownGoodPosition = UPPER_BOUND;
           }
         }
         else if (currentPos < (UPPER_BOUND + LANE4_BACKOFF_DISTANCE)) {
+          // Back off from limit switch
           desiredPosition = UPPER_BOUND + LANE4_BACKOFF_DISTANCE;
         }
         else {
+          // Now move to actual target position
           desiredPosition = activeTargetPosition;
-          lane4LimitSwitchMode = false;
+          // Only disable limit switch mode once we're close to target
+          long errorToTarget = abs(activeTargetPosition - currentPos);
+          if (errorToTarget <= TARGET_BAND * 2) {
+            lane4LimitSwitchMode = false;
+          }
         }
       }
       // Normal mode
@@ -787,28 +870,35 @@ void runStateMachine() {
           }
           
           // Only switch if distance has increased significantly (target moving away)
+          // AND we've been at target for minimum time
           if (distanceIncrease > RETREAT_DISTANCE_THRESHOLD && 
-              millis() - arrivalTime > MIN_WAIT_AT_TARGET) {
+              millis() - arrivalTime > MIN_WAIT_AT_TARGET &&
+              (millis() - targetCommitTime) >= MIN_TARGET_COMMIT_TIME) {
             lastRetreatCheckDistance = 0.0;  // Reset for next target
             currentState = CHOOSE_ACTIVE_TARGET;
             break;
           }
           
-          // Also switch if retreated very far (safety check)
-          if (currentDistance > 0.85) {
+          // Also switch if retreated very far (safety check) - but still require commit time
+          if (currentDistance > 0.85 && 
+              (millis() - targetCommitTime) >= MIN_TARGET_COMMIT_TIME) {
             lastRetreatCheckDistance = 0.0;  // Reset for next target
             currentState = CHOOSE_ACTIVE_TARGET;
             break;
           }
         }
 
-        // Check for closer threat
-        for (int i = 0; i < 4; i++) {
-          if (i != activeTargetIndex &&
-              ProxSensors[i].direction == FORWARD &&
-              zombieDistances[i] < zombieDistances[activeTargetIndex] - 0.20) {
-            currentState = CHOOSE_ACTIVE_TARGET;
-            break;
+        // Check for closer threat - only if significantly closer and we're not too close to current target
+        if (zombieDistances[activeTargetIndex] > MIN_COMMIT_DISTANCE) {
+          // Only check for closer threats if we're not very close to current target
+          for (int i = 0; i < 4; i++) {
+            if (i != activeTargetIndex &&
+                ProxSensors[i].direction == FORWARD &&
+                zombieDistances[i] < (zombieDistances[activeTargetIndex] - CLOSER_THREAT_THRESHOLD)) {
+              // Much closer threat - switch
+              currentState = CHOOSE_ACTIVE_TARGET;
+              break;
+            }
           }
         }
       }
@@ -949,7 +1039,9 @@ void runStateMachine() {
               float distanceIncrease = currentDistance - lastRetreatCheckDistance;
               
               // Update retreat check distance if enough time has passed
-              if (timeAtTarget > MIN_WAIT_AT_TARGET) {
+              // Also require minimum commit time before allowing switch
+              if (timeAtTarget > MIN_WAIT_AT_TARGET && 
+                  (millis() - targetCommitTime) >= MIN_TARGET_COMMIT_TIME) {
                 if (distanceIncrease > RETREAT_DISTANCE_THRESHOLD) {
                   // Target is clearly moving away - switch to next target
                   lastRetreatCheckDistance = 0.0;  // Reset for next target
@@ -2216,6 +2308,7 @@ void processCommand() {
           previousTargetIndex = -1;
           WAIT_POS = true;
           previousZombieDistance = 1.0;
+          targetCommitTime = 0;
           for (int i = 0; i < 4; i++) {
             ProxSensors[i].hitDetected = false;
             ProxSensors[i].hitTime = 0;
