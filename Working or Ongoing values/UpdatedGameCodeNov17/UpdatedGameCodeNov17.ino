@@ -1033,6 +1033,18 @@ float updatePID(long targetPosition) {
     frictionComp = FRICTION_RIGHT;
   }
   
+  // Prevent crossing bounds - don't apply voltage that would cross limits
+  if (currentPosition >= LOWER_BOUND && (pidOutput + frictionComp) > 0) {
+    // At or past lower bound, don't move leftward
+    frictionComp = 0;
+    if (pidOutput > 0) pidOutput = 0;
+  }
+  if (currentPosition <= UPPER_BOUND && (pidOutput + frictionComp) < 0) {
+    // At or past upper bound, don't move rightward
+    frictionComp = 0;
+    if (pidOutput < 0) pidOutput = 0;
+  }
+  
   // Calculate total voltage
   float voltage = pidOutput + frictionComp;
   
@@ -1104,7 +1116,27 @@ void runMotionControl() {
   float error = desiredPosition - currentPos;
   long absErr = abs((long)error);
   
+  // Prevent crossing limits
   if (rightPressed() && error < 0) {
+    stopMotor();
+    encoder.write(UPPER_BOUND);
+    lastError = 0;
+    return;
+  }
+  if (leftPressed() && error > 0) {
+    stopMotor();
+    encoder.write(LOWER_BOUND);
+    lastError = 0;
+    return;
+  }
+  // Also check if we're at or past the bounds
+  if (currentPos >= LOWER_BOUND && error > 0) {
+    stopMotor();
+    encoder.write(LOWER_BOUND);
+    lastError = 0;
+    return;
+  }
+  if (currentPos <= UPPER_BOUND && error < 0) {
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
@@ -1232,14 +1264,17 @@ void runMotionControl() {
   if (currentState == MOVE_TO_TARGET && autoMode) {
     bool isLargeMove = (absErr > 1000);
     int leftSlowdownDistance = isLargeMove ? 200 : 100;
-    if (error > 0 && currentPos > -leftSlowdownDistance) {
-      float proximityFactor = (currentPos + leftSlowdownDistance) / leftSlowdownDistance;
+    // Prevent crossing lower bound (zero) - stop before reaching it
+    if (error > 0 && currentPos > (LOWER_BOUND - leftSlowdownDistance)) {
+      float distanceFromLimit = LOWER_BOUND - currentPos;
+      float proximityFactor = (distanceFromLimit + leftSlowdownDistance) / leftSlowdownDistance;
       proximityFactor = constrain(proximityFactor, 0.0, 1.0);
       float minVoltage = isLargeMove ? 0.2 : 0.3;
       float maxVoltage = isLargeMove ? 0.5 : 0.7;
       totalVoltage *= (minVoltage + (proximityFactor * (maxVoltage - minVoltage)));
-      if (currentPos > 0) {
+      if (currentPos >= LOWER_BOUND) {
         stopMotor();
+        encoder.write(LOWER_BOUND);
         return;
       }
     }
@@ -1315,15 +1350,28 @@ void runMotionControl() {
     }
   }
 
+  // Prevent crossing limits before applying voltage
   if (rightPressed() && totalVoltage < 0) {
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
     return;
   }
+  if (leftPressed() && totalVoltage > 0) {
+    stopMotor();
+    encoder.write(LOWER_BOUND);
+    lastError = 0;
+    return;
+  }
   if (currentPos < UPPER_BOUND) {
     stopMotor();
     encoder.write(UPPER_BOUND);
+    lastError = 0;
+    return;
+  }
+  if (currentPos > LOWER_BOUND) {
+    stopMotor();
+    encoder.write(LOWER_BOUND);
     lastError = 0;
     return;
   }
@@ -1361,12 +1409,24 @@ void setMotor(float voltage) {
 
   voltage = constrain(voltage, -10.0, 10.0);
   int pwm = abs(voltage) * 25.5;
+  // Prevent crossing left limit (lower bound/zero)
   if (digitalRead(LIMIT_LEFT) == HIGH && voltage > 0) {
+    voltage = 0;
+    pwm = 0;
+  }
+  // Also check encoder position to prevent crossing LOWER_BOUND
+  long currentPos = encoder.read();
+  if (currentPos >= LOWER_BOUND && voltage > 0) {
     voltage = 0;
     pwm = 0;
   }
   // Right limit switch disabled during auto mode (needed for Lane 4 positioning)
   if (!autoMode && digitalRead(LIMIT_RIGHT) == HIGH && voltage < 0) {
+    voltage = 0;
+    pwm = 0;
+  }
+  // Also check encoder position to prevent crossing UPPER_BOUND
+  if (currentPos <= UPPER_BOUND && voltage < 0) {
     voltage = 0;
     pwm = 0;
   }
