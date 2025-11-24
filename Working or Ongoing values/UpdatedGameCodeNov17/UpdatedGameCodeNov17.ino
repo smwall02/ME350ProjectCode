@@ -1690,19 +1690,24 @@ bool rightPressed() {
 }
 
 // HOMING
+const float HOMING_EXTRA_VOLTAGE = 0.6;     // Added on top of friction during homing
+const unsigned long HOMING_HOLD_TIME = 500; // ms to hold on switch before zeroing
+const int HOMING_STABLE_TICKS = 5;          // Require this many consecutive stable readings
+
 bool homeToLeftLimit() {
   // CRITICAL: Lane positions are NEVER modified during homing
   // They remain as loaded from EEPROM
   
   if (leftPressed()) {
-    // Hold at limit
+    // Already at limit - hold and debounce
     long lastPos = encoder.read();
     unsigned long holdStart = millis();
     int stableTicks = 0;
-    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
+    float holdVoltage = max(FRICTION_RIGHT + 0.1, 2.5);  // Hold against switch
 
-    while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
-      setMotor(holdVoltage);
+    // Hold on the switch with debounce - ensure it settles
+    while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
+      setMotor(holdVoltage);  // Keep holding against switch
       delay(10);
       long pos = encoder.read();
       if (abs(pos - lastPos) <= 1) {
@@ -1714,7 +1719,7 @@ bool homeToLeftLimit() {
     }
 
     stopMotor();
-    delay(100);
+    delay(200);  // Brief pause before zeroing
 
     // Multiple zeroing attempts to ensure encoder is properly reset
     encoder.write(0);
@@ -1740,62 +1745,80 @@ bool homeToLeftLimit() {
     return true;
   }
 
-  // Approach limit
+  // Approach limit switch
   unsigned long startTime = millis();
-  float driveVoltage = max(FRICTION_RIGHT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+  long lastPosition = encoder.read();
+  unsigned long lastMoveTime = millis();
+  float driveVoltage = max(FRICTION_RIGHT + HOMING_EXTRA_VOLTAGE + 0.1, 3.0);
   setMotor(driveVoltage);
 
-  while (!leftPressed() && (millis() - startTime) < 15000) {
+  // Move toward limit switch with stuck detection
+  while (!leftPressed() && (millis() - startTime) < 12000) {
     delay(10);
-  }
-
-  if (leftPressed()) {
-
-    // Hold at limit
-    long currentPos = encoder.read();
-    long lastPos = currentPos;
-    unsigned long holdStart = millis();
-    int stableTicks = 0;
-    float holdVoltage = max(FRICTION_RIGHT, CALIBRATE_MIN_VOLTAGE - 0.5);
-
-    while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
-      setMotor(holdVoltage);
-      delay(10);
-      long pos = encoder.read();
-      if (abs(pos - lastPos) <= 1) {
-        stableTicks++;
-      } else {
-        stableTicks = 0;
-        lastPos = pos;
-      }
-    }
-
-    stopMotor();
-    delay(100);
-
-    // Multiple zeroing attempts to ensure encoder is properly reset
-    encoder.write(0);
-    delay(50);
-    if (encoder.read() != 0) {
-      encoder.write(0);
-      delay(50);
-    }
-    encoder.write(0);
-    delay(50);
     
-    // Verify encoder is actually zeroed
-    long finalPos = encoder.read();
-    if (abs(finalPos) > 2) {
-      encoder.write(0);  // Try one more time
-      delay(50);
+    // Check for stuck condition
+    long currentPos = encoder.read();
+    if (abs(currentPos - lastPosition) > 2) {
+      lastMoveTime = millis();
+      lastPosition = currentPos;
+    } else if (millis() - lastMoveTime > 3000) {
+      // Stuck - increase voltage
+      driveVoltage = min(driveVoltage + 0.5, 8.0);
+      setMotor(driveVoltage);
+      lastMoveTime = millis();
     }
-
-    return true;
-  } else {
+  }
+  
+  if (!leftPressed()) {
+    // Timeout - didn't reach limit switch
     stopMotor();
-    Serial.println(F("Timeout"));
     return false;
   }
+  
+  // Reached limit switch - now hold and debounce (same as above)
+  long lastPos = encoder.read();
+  unsigned long holdStart = millis();
+  int stableTicks = 0;
+  float holdVoltage = max(FRICTION_RIGHT + 0.1, 2.5);  // Hold against switch
+
+  // Hold on the switch with debounce - ensure it settles
+  while (millis() - holdStart < HOMING_HOLD_TIME || stableTicks < HOMING_STABLE_TICKS) {
+    setMotor(holdVoltage);  // Keep holding against switch
+    delay(10);
+    long pos = encoder.read();
+    if (abs(pos - lastPos) <= 1) {
+      stableTicks++;
+    } else {
+      stableTicks = 0;
+      lastPos = pos;
+    }
+  }
+
+  stopMotor();
+  delay(200);  // Brief pause before zeroing
+
+  // Multiple zeroing attempts to ensure encoder is properly reset
+  encoder.write(0);
+  delay(50);
+  if (encoder.read() != 0) {
+    encoder.write(0);
+    delay(50);
+  }
+  encoder.write(0);
+  delay(50);
+  
+  // Verify encoder is actually zeroed
+  long finalPos = encoder.read();
+  if (abs(finalPos) > 2) {
+    encoder.write(0);
+    delay(50);
+  }
+
+  // CRITICAL: Reload lane positions from EEPROM after homing
+  // This ensures they're never modified
+  loadCalibrationFromEEPROM();
+  
+  return true;
 }
 
 
