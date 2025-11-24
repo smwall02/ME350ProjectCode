@@ -54,8 +54,8 @@ long TARGET_4_POSITION = -1080;
 
 const long WAIT_POSITION_OFFSET = 2;
 long WAIT_POSITION = TARGET_3_POSITION;
-long LOWER_BOUND = 0;      // Fixed: Left limit position (home)
-long UPPER_BOUND = -1424;  // Fixed: Right limit position (from calibration)
+long LOWER_BOUND = 0;      // Will be set during range finding
+long UPPER_BOUND = -1384;  // Default: Right limit position (will be set during range finding)
 
 long targetPositions[4] = {
   TARGET_1_POSITION,
@@ -78,7 +78,7 @@ bool sensorCalibrated = false;
 bool dynamicCalibrationActive = false;
 bool rangeFindingComplete = false;
 unsigned long calibrationStartTime = 0;
-const unsigned long DYNAMIC_CALIBRATION_TIME = 10000;
+const unsigned long DYNAMIC_CALIBRATION_TIME = 5000;  // 5 seconds
 
 int dynamicMin[4];
 int dynamicMax[4];
@@ -415,7 +415,7 @@ void updateVelocity() {
 // ============================================
 void startDynamicCalibration() {
   Serial.println(F("\nSENSOR CALIBRATION"));
-  Serial.println(F("10 seconds...\n"));
+  Serial.println(F("5 seconds...\n"));
   
   dynamicCalibrationActive = true;
   calibrationStartTime = millis();
@@ -481,6 +481,8 @@ void finalizeDynamicCalibration() {
     Serial.println(F("Rehoming...\n"));
     if (homeToLeftLimit()) {
       Serial.println(F("Rehomed\n"));
+      // Find range and set bounds
+      findRangeAndSetBounds();
     } else {
       Serial.println(F("Rehome failed\n"));
     }
@@ -490,6 +492,8 @@ void finalizeDynamicCalibration() {
     sensorCalibrated = true;
     if (homeToLeftLimit()) {
       Serial.println(F("Rehomed\n"));
+      // Find range and set bounds
+      findRangeAndSetBounds();
     } else {
       Serial.println(F("Rehome failed\n"));
     }
@@ -512,6 +516,71 @@ void printCalibrationProgress() {
   Serial.println();
 }
 
+// RANGE FINDING - Find and set encoder bounds
+void findRangeAndSetBounds() {
+  Serial.println(F("Finding range..."));
+  
+  // Home to left limit first
+  if (!homeToLeftLimit()) {
+    Serial.println(F("Range find failed: homing failed"));
+    return;
+  }
+  
+  // Set LOWER_BOUND at left limit (should be 0 after homing)
+  LOWER_BOUND = encoder.read();
+  Serial.print(F("LOWER_BOUND set to: "));
+  Serial.println(LOWER_BOUND);
+  
+  // Move to right limit
+  Serial.println(F("Moving to right limit..."));
+  unsigned long startTime = millis();
+  float driveVoltage = max(FRICTION_LEFT + CALIBRATE_EXTRA_VOLTAGE, CALIBRATE_MIN_VOLTAGE);
+  setMotor(-driveVoltage);  // Negative voltage moves right (more negative)
+  
+  while (digitalRead(LIMIT_RIGHT) == LOW && (millis() - startTime) < 15000) {
+    delay(10);
+  }
+  
+  if (digitalRead(LIMIT_RIGHT) == HIGH) {
+    // Hold at limit
+    long currentPos = encoder.read();
+    long lastPos = currentPos;
+    unsigned long holdStart = millis();
+    int stableTicks = 0;
+    float holdVoltage = max(FRICTION_LEFT, CALIBRATE_MIN_VOLTAGE - 0.5);
+    
+    while (millis() - holdStart < CALIBRATE_HOLD_TIME || stableTicks < CALIBRATE_STABLE_TICKS) {
+      setMotor(-holdVoltage);
+      delay(10);
+      long pos = encoder.read();
+      if (abs(pos - lastPos) <= 1) {
+        stableTicks++;
+      } else {
+        stableTicks = 0;
+        lastPos = pos;
+      }
+    }
+    
+    stopMotor();
+    delay(100);
+    
+    // Set UPPER_BOUND at right limit
+    UPPER_BOUND = encoder.read();
+    Serial.print(F("UPPER_BOUND set to: "));
+    Serial.println(UPPER_BOUND);
+    Serial.print(F("Range: "));
+    Serial.print(LOWER_BOUND);
+    Serial.print(F(" to "));
+    Serial.println(UPPER_BOUND);
+    
+    // Mark range finding as complete
+    rangeFindingComplete = true;
+  } else {
+    stopMotor();
+    Serial.println(F("Range find failed: timeout"));
+  }
+}
+
 // STATE MACHINE
 void runStateMachine() {
   switch (currentState) {
@@ -525,9 +594,8 @@ void runStateMachine() {
         systemEnabled = true;
       }
       else if (!dynamicCalibrationActive && !sensorCalibrated) {
-        // Skip range finding - use fixed bounds, go directly to sensor calibration
+        // Go directly to sensor calibration (range will be found after calibration)
         Serial.println(F("State: SENSOR CAL\n"));
-        rangeFindingComplete = true;  // Mark as complete since we're using fixed values
         startDynamicCalibration();
         desiredPosition = LOWER_BOUND;
         systemEnabled = true;
@@ -611,12 +679,14 @@ void runStateMachine() {
     case MOVE_TO_TARGET:
       long currentPos = encoder.read();
       
-      // Clamp encoder at right limit - prevent reading beyond UPPER_BOUND
-      // Always clamp if reading beyond UPPER_BOUND to prevent drift
+      // Clamp encoder at bounds - prevent reading beyond UPPER_BOUND or LOWER_BOUND
       if (currentPos < UPPER_BOUND) {
-        // Always clamp if beyond limit - prevents encoder drift
         encoder.write(UPPER_BOUND);
         currentPos = UPPER_BOUND;
+      }
+      if (currentPos > LOWER_BOUND) {
+        encoder.write(LOWER_BOUND);
+        currentPos = LOWER_BOUND;
       }
       
       // Lane 4: limit switch approach
@@ -660,6 +730,12 @@ void runStateMachine() {
       
       // Prevent corrections beyond right limit - if at limit and trying to move right, stop
       if (rightPressed() && error < 0) {
+        stopMotor();
+        encoder.write(UPPER_BOUND);
+        return;
+      }
+      // Lane 4: Never exceed UPPER_BOUND
+      if (activeTargetIndex == 3 && currentPos < UPPER_BOUND) {
         stopMotor();
         encoder.write(UPPER_BOUND);
         return;
@@ -902,13 +978,17 @@ void runStateMachine() {
 void runMotionControl() {
   long currentPosition = encoder.read();
   
-  // Clamp encoder reading at right limit switch - prevent reading beyond UPPER_BOUND
-  // This prevents the encoder from counting beyond the physical limit
-  // Always clamp if reading beyond UPPER_BOUND (encoder can drift due to mechanical play)
+  // Clamp encoder reading at bounds - prevent reading beyond UPPER_BOUND or LOWER_BOUND
+  // This prevents the encoder from counting beyond the physical limits
   if (currentPosition < UPPER_BOUND) {
-    // Always clamp if beyond limit - prevents encoder drift
+    // Clamp to UPPER_BOUND if beyond (more negative)
     encoder.write(UPPER_BOUND);
     currentPosition = UPPER_BOUND;
+  }
+  if (currentPosition > LOWER_BOUND) {
+    // Clamp to LOWER_BOUND if beyond (less negative/positive)
+    encoder.write(LOWER_BOUND);
+    currentPosition = LOWER_BOUND;
   }
   
   long adjustedDesiredPosition = desiredPosition;
@@ -954,14 +1034,10 @@ void runMotionControl() {
   
   float originalError = desiredPosition - currentPosition;
   
-  // Enhanced deadband for Lane 4 to prevent oscillation
-  // Lane 4 is more prone to oscillation, so use larger deadband
+  // Lane 4: COMPLETELY DISABLE error correction - no PID, no corrections
   bool isLane4 = (activeTargetIndex == 3);
-  int deadbandSize = isLane4 ? 5 : 3;  // Larger deadband for Lane 4
-  int hysteresisThreshold = isLane4 ? 8 : 5;  // Larger hysteresis for Lane 4
-  
-  // For Lane 4, if we're at the target position, completely stop all corrections
-  if (isLane4 && abs(originalError) <= deadbandSize) {
+  if (isLane4) {
+    // Lane 4: Stop motor and do nothing - no error correction at all
     stopMotor();
     errorIntegral = 0;
     adaptiveLearning = false;
@@ -972,8 +1048,12 @@ void runMotionControl() {
     if (!targetReached) {
       targetReached = true;
     }
-    return;
+    return;  // Exit immediately - no PID, no corrections
   }
+  
+  // For other lanes, use normal deadband
+  int deadbandSize = 3;
+  int hysteresisThreshold = 5;
   
   static bool inDeadband = false;
   static unsigned long lastMoveStart = 0;
@@ -1022,9 +1102,8 @@ void runMotionControl() {
 
   targetReached = false;
 
-  // Retry logic - skip if within deadband (larger for Lane 4)
-  int deadbandSize = isLane4 ? 5 : 3;
-  if (abs(originalError) > deadbandSize && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
+  // Retry logic - skip if within deadband
+  if (abs(originalError) > 3 && abs(originalError) > RETRY_ERROR_THRESHOLD && abs(originalError) < 50) {
     // Check if stuck
     if (millis() - moveStartTime > 300 && positionRetryCount < MAX_POSITION_RETRIES) {
       positionRetryCount++;
@@ -1121,9 +1200,9 @@ void runMotionControl() {
     return;
   }
   
-  // Skip PID correction if error is within deadband (larger for Lane 4)
-  int deadbandSize = isLane4 ? 5 : 3;
-  if (abs(error) <= deadbandSize) {
+  // Skip PID correction if error is within deadband
+  // Note: Lane 4 already handled above with early return
+  if (abs(error) <= 3) {
     stopMotor();
     lastError = 0;  // Reset to prevent derivative spikes
     return;
@@ -1133,7 +1212,8 @@ void runMotionControl() {
   
   // PID CONTROL - uses EEPROM values
   
-  // Adaptive PID gains - reduce aggressiveness when close to target, especially for Lane 4
+  // Adaptive PID gains - reduce aggressiveness when close to target
+  // Note: Lane 4 already handled above with early return, so isLane4 will always be false here
   if (abs(error) > 1000) {
     KP_active = KP * 3.5;
     KI_active = 0;
@@ -1155,29 +1235,16 @@ void runMotionControl() {
     KD_active = KD * 1.2;
   } else if (abs(error) > 10) {
     // Reduced gains when close to target to prevent oscillation
-    if (isLane4) {
-      // Lane 4: even more conservative gains
-      KP_active = KP * 0.5;
-      KI_active = KI * 0.2;
-      KD_active = KD * 2.0;  // Very high damping for Lane 4
-    } else {
-      KP_active = KP * 1.0;
-      KI_active = KI * 0.5;
-      KD_active = KD * 1.5;
-    }
+    KP_active = KP * 1.0;
+    KI_active = KI * 0.5;
+    KD_active = KD * 1.5;
     errorIntegral += error * dt;
     errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
   } else {
-    // Very close - minimal gains, especially for Lane 4
-    if (isLane4) {
-      KP_active = KP * 0.2;  // Very low for Lane 4
-      KI_active = 0;
-      KD_active = KD * 3.0;  // Very high damping
-    } else {
-      KP_active = KP * 0.5;
-      KI_active = 0;
-      KD_active = KD * 2.0;
-    }
+    // Very close - minimal gains
+    KP_active = KP * 0.5;
+    KI_active = 0;
+    KD_active = KD * 2.0;
     errorIntegral = 0;  // Reset integral
   }
   
@@ -1187,12 +1254,9 @@ void runMotionControl() {
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
   
-  // Momentum compensation - disabled when very close to target, especially for Lane 4
+  // Momentum compensation - disabled when very close to target
   float momentumCompensation = 1.0;
-  if (isLane4 && abs(error) <= 20) {
-    // Lane 4: disable momentum compensation when close to prevent oscillation
-    momentumCompensation = 1.0;
-  } else if (abs(error) <= 10) {
+  if (abs(error) <= 10) {
     // Disable momentum compensation when very close to prevent oscillation
     momentumCompensation = 1.0;
   } else if (abs(error) > 200) {
@@ -1210,10 +1274,9 @@ void runMotionControl() {
   pidVoltage *= momentumCompensation;
 
   // FRICTION COMPENSATION - higher on right side (lane 4)
-  // Skip friction compensation if within deadband (larger for Lane 4)
-  int deadbandSize = isLane4 ? 5 : 3;
+  // Skip friction compensation if within deadband
   float frictionComp = 0;
-  if (abs(error) > deadbandSize) {
+  if (abs(error) > 3) {
     bool movingTowardMoreNegative = (error < 0);
     float baseFriction = movingTowardMoreNegative ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float positionFrictionBoost = 1.0;
@@ -1259,9 +1322,9 @@ void runMotionControl() {
   }
 
   float velocityFF = 0;
-  // Fine adjustment boost - disabled when very close, especially for Lane 4
+  // Fine adjustment boost - disabled when very close
   float fineAdjustmentBoost = 0;
-  if (fineAdjustmentActive && !isLane4 && abs(error) > 3 && abs(error) <= 5 && abs(motorVelocity) < 15) {
+  if (fineAdjustmentActive && abs(error) > 3 && abs(error) <= 5 && abs(motorVelocity) < 15) {
     float boostMultiplier = 1.2;
     fineAdjustmentBoost = error * boostMultiplier;
     fineAdjustmentBoost = constrain(fineAdjustmentBoost, -2.0, 2.0);
@@ -1318,10 +1381,9 @@ void runMotionControl() {
   }
 
   // Stuck detection with voltage ramping
-  // Skip stuck detection if within deadband (larger for Lane 4)
-  int deadbandSize = isLane4 ? 5 : 3;
+  // Skip stuck detection if within deadband
   unsigned long currentTime = millis();
-  if (abs(originalError) > deadbandSize) {
+  if (abs(originalError) > 3) {
     if (currentTime - lastStuckCheckTime >= 150) {
       if (abs(currentPosition - lastStuckCheckPos) < 2) {
         stuckCounter++;
@@ -1364,9 +1426,8 @@ void runMotionControl() {
   }
 
   // Ensure minimum voltage for error correction
-  // Skip if within deadband (larger for Lane 4)
-  int deadbandSize = isLane4 ? 5 : 3;
-  if (abs(originalError) > deadbandSize && !voltageRamping) {
+  // Skip if within deadband
+  if (abs(originalError) > 3 && !voltageRamping) {
     bool movingRight = (error < 0);
     float baseFrictionVoltage = movingRight ? adaptiveFrictionLeft : adaptiveFrictionRight;
     float minFrictionVoltage = max(baseFrictionVoltage, 1.5f);
@@ -1381,7 +1442,15 @@ void runMotionControl() {
   }
 
   // Final check: prevent moving right (more negative) when at right limit
+  // Also prevent Lane 4 from exceeding UPPER_BOUND
   if (rightPressed() && totalVoltage < 0) {
+    stopMotor();
+    encoder.write(UPPER_BOUND);
+    lastError = 0;
+    return;
+  }
+  // Lane 4: Never exceed UPPER_BOUND (which is more negative than LOWER_BOUND)
+  if (isLane4 && currentPosition < UPPER_BOUND) {
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
@@ -1485,10 +1554,20 @@ void checkLimitSwitches() {
       !lane4AtLimit &&
       currentState == MOVE_TO_TARGET &&
       abs(motorVelocity) < 10) {
-    // Accidentally hit right limit - clamp encoder to prevent drift
+    // Accidentally hit right limit - clamp encoder to UPPER_BOUND
     long currentPos = encoder.read();
     if (currentPos < UPPER_BOUND) {
       encoder.write(UPPER_BOUND);
+      errorIntegral = 0;
+    }
+  }
+  // Left limit switch: clamp encoder to LOWER_BOUND
+  if (digitalRead(LIMIT_LEFT) == HIGH && 
+      currentState == MOVE_TO_TARGET &&
+      abs(motorVelocity) < 10) {
+    long currentPos = encoder.read();
+    if (currentPos > LOWER_BOUND) {
+      encoder.write(LOWER_BOUND);
       errorIntegral = 0;
     }
   }
@@ -1777,7 +1856,7 @@ void processCommand() {
     case 'G':
       if (!autoMode) {
         Serial.println(F("\nAUTO MODE"));
-        Serial.println(F("Bounds: 0 to -1424\n"));
+        Serial.println(F("Bounds: will be set after calibration\n"));
 
           stopMotor();
           delay(200);
