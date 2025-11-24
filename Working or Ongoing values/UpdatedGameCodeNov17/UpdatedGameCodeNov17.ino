@@ -994,15 +994,11 @@ float updatePID(long targetPosition) {
   // Calculate error
   float error = targetPosition - currentPosition;
   
-  // Apply deadband (like PIDAutoTune)
+  // Apply deadband (like PIDAutoTune) - if within deadband, set error to 0
   if (abs(error) < DEADBAND) {
     error = 0;
-    // Conditional integral reset
-    if (abs(errorIntegral) < 10.0) {
-      errorIntegral = 0;
-    } else {
-      errorIntegral *= 0.9;  // Gradual decay
-    }
+    // Reset integral when in deadband to prevent windup
+    errorIntegral = 0;
   } else {
     // Calculate integral with anti-windup
     float dt = CONTROL_PERIOD / 1000.0;
@@ -1034,13 +1030,12 @@ float updatePID(long targetPosition) {
   }
   
   // Prevent crossing bounds - don't apply voltage that would cross limits
-  // But allow reaching the target if it's at the bound
   if (currentPosition > LOWER_BOUND) {
     // Past lower bound - block all leftward movement
     frictionComp = 0;
     if (pidOutput > 0) pidOutput = 0;
-  } else if (currentPosition == LOWER_BOUND && targetPosition > LOWER_BOUND) {
-    // At lower bound but target is beyond it - block leftward movement
+  } else if (currentPosition == LOWER_BOUND && error > DEADBAND && targetPosition > LOWER_BOUND) {
+    // At lower bound, error is significant, and target is beyond it - block leftward movement
     frictionComp = 0;
     if (pidOutput > 0) pidOutput = 0;
   }
@@ -1048,8 +1043,8 @@ float updatePID(long targetPosition) {
     // Past upper bound - block all rightward movement
     frictionComp = 0;
     if (pidOutput < 0) pidOutput = 0;
-  } else if (currentPosition == UPPER_BOUND && targetPosition < UPPER_BOUND) {
-    // At upper bound but target is beyond it - block rightward movement
+  } else if (currentPosition == UPPER_BOUND && error < -DEADBAND && targetPosition < UPPER_BOUND) {
+    // At upper bound, error is significant, and target is beyond it - block rightward movement
     frictionComp = 0;
     if (pidOutput < 0) pidOutput = 0;
   }
@@ -1138,41 +1133,41 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
-  // Prevent crossing bounds, but allow reaching the target if it's at the bound
-  // Only block if we're past the bound OR if target is not at the bound
+  // Prevent crossing bounds - block if past bounds
   if (currentPos > LOWER_BOUND) {
-    // Already past lower bound - stop and clamp
     stopMotor();
     encoder.write(LOWER_BOUND);
     lastError = 0;
     return;
   }
   if (currentPos < UPPER_BOUND) {
-    // Already past upper bound - stop and clamp
     stopMotor();
     encoder.write(UPPER_BOUND);
     lastError = 0;
     return;
   }
-  // If at LOWER_BOUND and trying to move leftward, only block if target is not at LOWER_BOUND
-  if (currentPos == LOWER_BOUND && error > 0 && desiredPosition > LOWER_BOUND) {
-    stopMotor();
-    lastError = 0;
-    return;
-  }
-  // If at UPPER_BOUND and trying to move rightward, only block if target is not at UPPER_BOUND
-  if (currentPos == UPPER_BOUND && error < 0 && desiredPosition < UPPER_BOUND) {
-    stopMotor();
-    lastError = 0;
-    return;
-  }
   
   // Deadband is now handled in updatePID(), but check if we're at target
+  // If within deadband, stop regardless of position
   if (abs(error) <= DEADBAND) {
     stopMotor();
+    errorIntegral = 0;
+    lastError = 0;
     if (!targetReached) {
       targetReached = true;
     }
+    return;
+  }
+  
+  // If at a bound and trying to move past it, block (unless error is very small, handled by deadband above)
+  if (currentPos == LOWER_BOUND && error > DEADBAND && desiredPosition > LOWER_BOUND) {
+    stopMotor();
+    lastError = 0;
+    return;
+  }
+  if (currentPos == UPPER_BOUND && error < -DEADBAND && desiredPosition < UPPER_BOUND) {
+    stopMotor();
+    lastError = 0;
     return;
   }
   
@@ -1387,7 +1382,7 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
-  // Only block if we're past the bounds, not if we're at them
+  // Block if past bounds
   if (currentPos < UPPER_BOUND) {
     stopMotor();
     encoder.write(UPPER_BOUND);
@@ -1400,13 +1395,14 @@ void runMotionControl() {
     lastError = 0;
     return;
   }
-  // If at bounds, only block if trying to move away from target
-  if (currentPos == LOWER_BOUND && totalVoltage > 0 && desiredPosition > LOWER_BOUND) {
+  // If at bounds and error is significant, block movement past bound
+  // Small errors within deadband are already handled above
+  if (currentPos == LOWER_BOUND && totalVoltage > 0 && abs(error) > DEADBAND && desiredPosition > LOWER_BOUND) {
     stopMotor();
     lastError = 0;
     return;
   }
-  if (currentPos == UPPER_BOUND && totalVoltage < 0 && desiredPosition < UPPER_BOUND) {
+  if (currentPos == UPPER_BOUND && totalVoltage < 0 && abs(error) > DEADBAND && desiredPosition < UPPER_BOUND) {
     stopMotor();
     lastError = 0;
     return;
