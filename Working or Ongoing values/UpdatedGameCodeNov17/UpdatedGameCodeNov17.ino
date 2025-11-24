@@ -198,6 +198,10 @@ bool autoMode = false;
 unsigned long lastPrintTime = 0;
 unsigned long moveStartTime = 0;
 bool targetReached = false;
+unsigned long lastDriftCheckTime = 0;
+const unsigned long DRIFT_CHECK_INTERVAL = 5000;  // Check drift every 5 seconds
+long lastDriftCheckPosition = 0;
+const long MAX_DRIFT_THRESHOLD = 20;  // Maximum allowed drift before correction
 
 const float CALIBRATION_VOLTAGE = 4.0;
 const float HOMING_VOLTAGE = 4.0;
@@ -300,6 +304,12 @@ void loop() {
       } else {
         printCompactStatus();
       }
+    }
+    
+    // Drift mitigation - check periodically during auto mode
+    if (autoMode && !dynamicCalibrationActive && (currentTime - lastDriftCheckTime >= DRIFT_CHECK_INTERVAL)) {
+      mitigateDrift();
+      lastDriftCheckTime = currentTime;
     }
   }
   
@@ -1011,12 +1021,18 @@ void runMotionControl() {
     return;
   }
   
+  // Drift check is now handled by periodic mitigateDrift() function
+  // This immediate check is kept as a safety measure
   if (currentState == MOVE_TO_TARGET && autoMode) {
-    // Check drift
     if (currentPosition > 50) {
-      Serial.println(F("Position drift"));
-      stopMotor();
+      Serial.println(F("Position drift - immediate correction"));
+      // Try to correct by moving back
+      desiredPosition = LOWER_BOUND;
       return;
+    }
+    if (currentPosition < UPPER_BOUND) {
+      encoder.write(UPPER_BOUND);
+      currentPosition = UPPER_BOUND;
     }
   }
   
@@ -1034,26 +1050,10 @@ void runMotionControl() {
   
   float originalError = desiredPosition - currentPosition;
   
-  // Lane 4: COMPLETELY DISABLE error correction - no PID, no corrections
+  // Lane 4: Use larger deadband to prevent oscillation, but allow movement
   bool isLane4 = (activeTargetIndex == 3);
-  if (isLane4) {
-    // Lane 4: Stop motor and do nothing - no error correction at all
-    stopMotor();
-    errorIntegral = 0;
-    adaptiveLearning = false;
-    lastError = 0;
-    stuckCounter = 0;
-    stuckStartTime = 0;
-    voltageRamping = false;
-    if (!targetReached) {
-      targetReached = true;
-    }
-    return;  // Exit immediately - no PID, no corrections
-  }
-  
-  // For other lanes, use normal deadband
-  const int deadbandSize = 3;
-  const int hysteresisThreshold = 5;
+  int deadbandSize = isLane4 ? 5 : 3;  // Larger deadband for Lane 4
+  int hysteresisThreshold = isLane4 ? 8 : 5;  // Larger hysteresis for Lane 4
   
   static bool inDeadband = false;
   static unsigned long lastMoveStart = 0;
@@ -1212,39 +1212,74 @@ void runMotionControl() {
   
   // PID CONTROL - uses EEPROM values
   
-  // Adaptive PID gains - reduce aggressiveness when close to target
-  // Note: Lane 4 already handled above with early return, so isLane4 will always be false here
+  // Adaptive PID gains - reduce aggressiveness when close to target, especially for Lane 4
   if (abs(error) > 1000) {
-    KP_active = KP * 3.5;
-    KI_active = 0;
-    KD_active = KD * 0.8;
+    if (isLane4) {
+      KP_active = KP * 2.0;  // More conservative for Lane 4
+      KI_active = 0;
+      KD_active = KD * 1.0;
+    } else {
+      KP_active = KP * 3.5;
+      KI_active = 0;
+      KD_active = KD * 0.8;
+    }
     errorIntegral = 0;
   } else if (abs(error) > 500) {
-    KP_active = KP * 3.0;
-    KI_active = 0;
-    KD_active = KD * 0.75;
+    if (isLane4) {
+      KP_active = KP * 1.5;
+      KI_active = 0;
+      KD_active = KD * 1.2;
+    } else {
+      KP_active = KP * 3.0;
+      KI_active = 0;
+      KD_active = KD * 0.75;
+    }
     errorIntegral = 0;
   } else if (abs(error) > 300) {
-    KP_active = KP * 2.5;
-    KI_active = 0;
-    KD_active = KD * 0.7;
+    if (isLane4) {
+      KP_active = KP * 1.2;
+      KI_active = 0;
+      KD_active = KD * 1.5;
+    } else {
+      KP_active = KP * 2.5;
+      KI_active = 0;
+      KD_active = KD * 0.7;
+    }
     errorIntegral = 0;
   } else if (abs(error) > 50) {
-    KP_active = KP * 2.0;
-    KI_active = KI * 0.8;
-    KD_active = KD * 1.2;
+    if (isLane4) {
+      KP_active = KP * 1.0;
+      KI_active = KI * 0.3;
+      KD_active = KD * 1.8;
+    } else {
+      KP_active = KP * 2.0;
+      KI_active = KI * 0.8;
+      KD_active = KD * 1.2;
+    }
   } else if (abs(error) > 10) {
     // Reduced gains when close to target to prevent oscillation
-    KP_active = KP * 1.0;
-    KI_active = KI * 0.5;
-    KD_active = KD * 1.5;
+    if (isLane4) {
+      KP_active = KP * 0.5;  // Very conservative for Lane 4
+      KI_active = KI * 0.2;
+      KD_active = KD * 2.0;  // High damping
+    } else {
+      KP_active = KP * 1.0;
+      KI_active = KI * 0.5;
+      KD_active = KD * 1.5;
+    }
     errorIntegral += error * dt;
     errorIntegral = constrain(errorIntegral, -MAX_INTEGRAL, MAX_INTEGRAL);
   } else {
     // Very close - minimal gains
-    KP_active = KP * 0.5;
-    KI_active = 0;
-    KD_active = KD * 2.0;
+    if (isLane4) {
+      KP_active = KP * 0.2;  // Very low for Lane 4
+      KI_active = 0;
+      KD_active = KD * 3.0;  // Very high damping
+    } else {
+      KP_active = KP * 0.5;
+      KI_active = 0;
+      KD_active = KD * 2.0;
+    }
     errorIntegral = 0;  // Reset integral
   }
   
@@ -1254,9 +1289,12 @@ void runMotionControl() {
                      (KI_active * errorIntegral) +
                      (KD_active * errorDerivative);
   
-  // Momentum compensation - disabled when very close to target
+  // Momentum compensation - disabled when very close to target, especially for Lane 4
   float momentumCompensation = 1.0;
-  if (abs(error) <= 10) {
+  if (isLane4 && abs(error) <= 20) {
+    // Lane 4: disable momentum compensation when close to prevent oscillation
+    momentumCompensation = 1.0;
+  } else if (abs(error) <= 10) {
     // Disable momentum compensation when very close to prevent oscillation
     momentumCompensation = 1.0;
   } else if (abs(error) > 200) {
@@ -1520,6 +1558,69 @@ void stopMotor() {
   digitalWrite(MOTOR_IN2, LOW);
   digitalWrite(MOTOR_IN3, LOW);
   analogWrite(MOTOR_ENA, 0);
+}
+
+// DRIFT MITIGATION
+void mitigateDrift() {
+  if (!autoMode || dynamicCalibrationActive) return;
+  
+  long currentPos = encoder.read();
+  
+  // Check if position is beyond physical bounds
+  if (currentPos < UPPER_BOUND) {
+    // Beyond right limit - clamp to UPPER_BOUND
+    encoder.write(UPPER_BOUND);
+    Serial.println(F("Drift: clamped to UPPER_BOUND"));
+    lastDriftCheckPosition = UPPER_BOUND;
+    return;
+  }
+  if (currentPos > LOWER_BOUND) {
+    // Beyond left limit - clamp to LOWER_BOUND
+    encoder.write(LOWER_BOUND);
+    Serial.println(F("Drift: clamped to LOWER_BOUND"));
+    lastDriftCheckPosition = LOWER_BOUND;
+    return;
+  }
+  
+  // Check for gradual drift when not moving
+  if (currentState == CHOOSE_ACTIVE_TARGET || (currentState == MOVE_TO_TARGET && abs(motorVelocity) < 5)) {
+    // Only check drift when stationary or choosing target
+    if (lastDriftCheckPosition != 0) {
+      long driftAmount = abs(currentPos - lastDriftCheckPosition);
+      
+      if (driftAmount > MAX_DRIFT_THRESHOLD) {
+        // Significant drift detected
+        Serial.print(F("Drift detected: "));
+        Serial.print(driftAmount);
+        Serial.print(F(" counts from "));
+        Serial.print(lastDriftCheckPosition);
+        Serial.print(F(" to "));
+        Serial.println(currentPos);
+        
+        // If drift is very large, consider re-homing
+        if (driftAmount > 100 || currentPos > 50) {
+          Serial.println(F("Large drift - rehoming..."));
+          if (homeToLeftLimit()) {
+            Serial.println(F("Rehomed after drift"));
+            lastDriftCheckPosition = 0;  // Reset after rehome
+            return;
+          }
+        } else {
+          // Small drift - correct encoder value back
+          encoder.write(lastDriftCheckPosition);
+          Serial.print(F("Corrected drift to "));
+          Serial.println(lastDriftCheckPosition);
+          currentPos = lastDriftCheckPosition;
+        }
+      }
+    }
+    
+    // Update last known good position
+    lastDriftCheckPosition = currentPos;
+  } else {
+    // Moving - update reference position
+    lastDriftCheckPosition = currentPos;
+  }
 }
 
 // LIMIT SWITCHES
@@ -1873,6 +1974,9 @@ void processCommand() {
           rangeFindingComplete = true;
           sensorCalibrated = false;
           dynamicCalibrationActive = false;
+          // Initialize drift check
+          lastDriftCheckPosition = encoder.read();
+          lastDriftCheckTime = millis();
           
           currentState = CALIBRATE;
           errorIntegral = 0;
