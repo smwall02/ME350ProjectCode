@@ -297,7 +297,7 @@ void loop() {
 
       if (dynamicCalibrationActive) {
         printCalibrationProgress();
-      } else {
+      } else if (currentState != FIND_RANGE) {
         printCompactStatus();
       }
     }
@@ -713,6 +713,21 @@ void runStateMachine() {
           desiredPosition = LOWER_BOUND;  // Move to left limit (position 0)
           currentState = CHOOSE_ACTIVE_TARGET;
         }
+      }
+      break;
+    
+    case FIND_RANGE:
+      // Range finding is skipped - using fixed bounds (0 to -1424)
+      // If we somehow enter this state, mark range finding as complete and transition
+      rangeFindingComplete = true;
+      if (sensorCalibrated) {
+        currentState = CHOOSE_ACTIVE_TARGET;
+        systemEnabled = true;
+      } else {
+        // Start sensor calibration
+        startDynamicCalibration();
+        desiredPosition = LOWER_BOUND;
+        systemEnabled = true;
       }
       break;
     
