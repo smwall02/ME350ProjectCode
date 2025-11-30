@@ -195,7 +195,7 @@ ProxSensor ProxSensors[4];
 const float alpha = 0.75;           // Lowered from 0.85 - much faster response (25% new data)
 const float velocityAlpha = 0.70;   // Lowered from 0.80 - faster velocity tracking  
 const int stopTimeout = 80;         // Lowered from 100 - faster STOPPED detection
-int noiseLimit = 6;                 // Lowered from 8
+// Noise thresholds are derived per-sensor during updates to avoid cross-lane coupling.
 const int lowerNoiseLimit = 5;      // Lowered from 6
 const int upperNoiseLimit = 8;      // Lowered from 10
 const int noiseThreshold = 225;
@@ -1072,8 +1072,13 @@ void loop() {
   updateSensors();
   
   for (int i = 0; i < 4; i++) {
-    zombieDistances[i] = (ProxSensors[i].currVal - ProxRange[i][1]) / 
-                          (float)(ProxRange[i][0] - ProxRange[i][1]);
+    const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
+    if (range != 0.0f) {
+      zombieDistances[i] = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
+    } else {
+      // Defensive fallback to avoid divide-by-zero if calibration data is bad
+      zombieDistances[i] = 1.0f;
+    }
     zombieDistances[i] = constrain(zombieDistances[i], 0.0, 1.0);
   }
   
@@ -2034,22 +2039,25 @@ float calculateThreatScore(int lane) {
 // More responsive direction detection for bounce-back
 //============================================
 void updateSensors() {
+  unsigned long now = millis();
+
   for (int i = 0; i < 4; i++) {
     int rawVal = analogRead(ProxSensors[i].pin);
     ProxSensors[i].currVal = alpha * ProxSensors[i].currVal + (1.0 - alpha) * rawVal;
     ProxSensors[i].smoothVal = velocityAlpha * ProxSensors[i].smoothVal + (1.0 - velocityAlpha) * rawVal;
-    
-    noiseLimit = (ProxSensors[i].currVal >= noiseThreshold) ? upperNoiseLimit : lowerNoiseLimit;
-    
+
+    // Derive sensor-specific noise limit rather than sharing across lanes
+    int sensorNoiseLimit = (ProxSensors[i].currVal >= noiseThreshold) ? upperNoiseLimit : lowerNoiseLimit;
+
     float change = ProxSensors[i].currVal - ProxSensors[i].prevVal;
-    
+
     // IMPROVED: Use MAGNITUDE of change to detect fast movement
     float changeMagnitude = abs(change);
-    bool fastMovement = changeMagnitude > noiseLimit * 2;  // Moving fast if >2x noise threshold
-    
-    if (changeMagnitude < noiseLimit) {
+    bool fastMovement = changeMagnitude > sensorNoiseLimit * 2;  // Moving fast if >2x noise threshold
+
+    if (changeMagnitude < sensorNoiseLimit) {
       // No significant change detected
-      if (millis() - ProxSensors[i].prevChangeTime >= stopTimeout) {
+      if (now - ProxSensors[i].prevChangeTime >= stopTimeout) {
         ProxSensors[i].direction = STOPPED;
         ProxSensors[i].forwardCount = 0;
         ProxSensors[i].backwardCount = 0;
@@ -2059,7 +2067,7 @@ void updateSensors() {
       ProxSensors[i].forwardCount++;
       ProxSensors[i].backwardCount = 0;
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
-      ProxSensors[i].prevChangeTime = millis();
+      ProxSensors[i].prevChangeTime = now;
       if (ProxSensors[i].forwardCount >= 2) {
         ProxSensors[i].direction = FORWARD;
       }
@@ -2068,7 +2076,7 @@ void updateSensors() {
       ProxSensors[i].backwardCount++;
       ProxSensors[i].forwardCount = 0;
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
-      ProxSensors[i].prevChangeTime = millis();
+      ProxSensors[i].prevChangeTime = now;
       
       // IMPROVED BACKWARD DETECTION:
       // 1. If moving FAST backward, detect immediately (2 samples)
