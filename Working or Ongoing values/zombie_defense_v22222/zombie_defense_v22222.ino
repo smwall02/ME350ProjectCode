@@ -333,6 +333,10 @@ bool laneAttempted[4] = {false, false, false, false};  // Track which lanes we'v
 unsigned long laneAttemptTime[4] = {0, 0, 0, 0};       // When we attempted each lane
 const unsigned long ATTEMPT_COOLDOWN = 1000;           // CRITICAL FIX: Reduced from 3s to 1s - allow faster re-engagement
 
+// STOPPED LANES TRACKING - Prevent targeting lanes that have been stopped too long
+unsigned long laneStoppedTime[4] = {0, 0, 0, 0};       // When each lane became STOPPED (0 = not stopped)
+const unsigned long STOPPED_TIMEOUT = 2000;            // Skip lanes that have been STOPPED for > 2 seconds
+
 // Batch statistics for debugging
 int batchesCompleted = 0;
 int batchesReset = 0;
@@ -355,7 +359,7 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 1.0;
 float arrivalZombieDistance = 1.0;
 
-const unsigned long MIN_DWELL_TIME = 200;       // REDUCED: Faster transitions to save time
+const unsigned long MIN_DWELL_TIME = 225;       // INCREASED by 25ms: Better hit detection
 
 //============================================
 // ANALYSIS MODE - Lane Priority Tracking
@@ -369,9 +373,9 @@ int cycleHitCount[4] = {0,0,0,0};    // Hits per lane in current cycle
 int cycleMissCount[4] = {0,0,0,0};   // Misses per lane in current cycle (reached wall)
 float lanePriorityScores[4];         // Calculated priority scores at decision time
 int priorityOrder[4];                // Lane order by priority (highest first)
-const unsigned long NORMAL_DWELL_TIME = 400;   // REDUCED: Faster transitions to save time
-const unsigned long MAX_DWELL_TIME = 800;       // REDUCED: Faster transitions to save time
-const unsigned long L4_DWELL_TIME = 1000;       // REDUCED: Faster transitions to save time
+const unsigned long NORMAL_DWELL_TIME = 425;   // INCREASED by 25ms: Better hit detection
+const unsigned long MAX_DWELL_TIME = 825;       // INCREASED by 25ms: Better hit detection
+const unsigned long L4_DWELL_TIME = 1025;       // INCREASED by 25ms: Better hit detection
 
 const unsigned long BACKWARD_CONFIRM_TIME = 40;  // FASTER - reduced from 60
 unsigned long backwardStartTime = 0;
@@ -806,8 +810,9 @@ bool shouldOverride(int newLane) {
   
   if (newIsLongLane && committedIsShortLane && !newIsCritical) {
     // Long lane (L1/L4) trying to override short lane (L2/L3) when not critical
-    // Only allow if new lane is MUCH closer (at least 30% closer)
-    if (newDist >= committedDist * 0.7) {
+    // STRICT: Only allow if new lane is MUCH closer (at least 50% closer) OR is critical
+    // This ensures L2/L3 have priority when distances are similar
+    if (newDist >= committedDist * 0.5) {
       return false;  // Don't allow override - protect short lanes
     }
   }
@@ -824,9 +829,13 @@ bool shouldOverride(int newLane) {
     // When both are far (80-100%), require at least 20% gap to override
     // When both are closer, require at least 15% gap
     // EXCEPTION: Short lane overriding long lane only needs 10% gap
+    // CRITICAL: At 95-100% distance, require even larger gap (30%) to prevent excessive bouncing
     float distanceGap = abs(newDist - committedDist);
     float minGapRequired;
-    if (newIsShortLane && committedIsLongLane) {
+    if (committedDist > 0.95 && newDist > 0.95) {
+      // Both at 95-100% - require very large gap (30%) to prevent bouncing
+      minGapRequired = 0.30;
+    } else if (newIsShortLane && committedIsLongLane) {
       // Short lane overriding long lane - only need 10% gap
       minGapRequired = 0.10;
     } else {
@@ -1027,6 +1036,14 @@ int getBestTarget() {
   for (int i = 0; i < 4; i++) {
     if (ProxSensors[i].direction != FORWARD) continue;
     
+    // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
+    if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0) {
+      unsigned long stoppedDuration = millis() - laneStoppedTime[i];
+      if (stoppedDuration > STOPPED_TIMEOUT) {
+        continue;  // Skip this lane - it's been frozen too long
+      }
+    }
+    
     float dist = zombieDistances[i];
     // Use lane-specific threshold - L2/L3 engage earlier
     float laneThreshold = getEarlyEngageThreshold(i);
@@ -1124,11 +1141,22 @@ void calculateNewBatch() {
     
     // Build the full sequence, including all lanes that are valid
     // CRITICAL: Accept forward-moving targets too - they're starting to approach
+    // CRITICAL: Skip STOPPED lanes that have been stopped for too long (> 2 seconds)
     for (int i = 0; i < 4 && batchSize < MAX_BATCH_SIZE; i++) {
       int lane = fixedSequence[i];
-      bool laneValid = (zombieDistances[lane] < 0.35) && 
+      
+      // Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
+      bool stoppedTooLong = false;
+      if (ProxSensors[lane].direction == STOPPED && laneStoppedTime[lane] > 0) {
+        unsigned long stoppedDuration = now - laneStoppedTime[lane];
+        if (stoppedDuration > STOPPED_TIMEOUT) {
+          stoppedTooLong = true;  // Skip this lane - it's been frozen too long
+        }
+      }
+      
+      bool laneValid = !stoppedTooLong && (zombieDistances[lane] < 0.35) && 
                        (ProxSensors[lane].direction == FORWARD || 
-                        ProxSensors[lane].direction == STOPPED);
+                        (ProxSensors[lane].direction == STOPPED && !stoppedTooLong));
       
       if (laneValid) {
         targetBatch[batchSize++] = lane;
@@ -1172,6 +1200,7 @@ void calculateNewBatch() {
     // Backward-moving targets are retreating and should NEVER be in batches
     // Use lane-specific threshold - L2/L3 engage much earlier
     // IMPROVED: Exclude lanes that have already been attempted (within cooldown)
+    // CRITICAL: Skip STOPPED lanes that have been stopped for too long (> 2 seconds)
     bool isForwardMoving = (ProxSensors[i].direction == FORWARD);
     float laneThreshold = getEarlyEngageThreshold(i);
     bool isInRange = (lanes[i].distance < laneThreshold &&
@@ -1189,7 +1218,16 @@ void calculateNewBatch() {
       }
     }
     
-    lanes[i].isActive = (isForwardMoving && isInRange && !recentlyAttempted);
+    // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
+    bool stoppedTooLong = false;
+    if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0) {
+      unsigned long stoppedDuration = millis() - laneStoppedTime[i];
+      if (stoppedDuration > STOPPED_TIMEOUT) {
+        stoppedTooLong = true;  // Skip this lane - it's been frozen too long
+      }
+    }
+    
+    lanes[i].isActive = (isForwardMoving && isInRange && !recentlyAttempted && !stoppedTooLong);
     
     if (lanes[i].isActive) {
       lanes[i].effectiveTTI = getEffectiveTTI(i);
@@ -1328,27 +1366,27 @@ void calculateNewBatch() {
           }
         } else {
           // Normal case: Short lane vs long lane - short lane wins if distances are similar (within 15%)
-          // CRITICAL: If long lane is NOT critical, short lane gets priority even with larger distance gap
+          // CRITICAL: If long lane is NOT critical, short lane gets ABSOLUTE priority regardless of distance gap
           float distanceGap = abs(lanes[j].distance - lanes[i].distance);
           bool iIsLongCritical = (iIsLong && iIsCritical);
           bool jIsLongCritical = (jIsLong && jIsCritical);
           
           if (jIsShort && iIsLong) {
             // Short lane (j) vs long lane (i)
-            if (!iIsLongCritical && distanceGap < 0.25) {
-              // Long lane not critical - prioritize short lane with larger gap (25%)
+            if (!iIsLongCritical) {
+              // Long lane not critical - ALWAYS prioritize short lane regardless of distance gap
               shouldSwap = true;
             } else if (distanceGap < 0.15) {
-              // Long lane critical or distances very similar - prioritize short lane
+              // Long lane critical but distances very similar - prioritize short lane
               shouldSwap = true;
             }
           } else if (iIsShort && jIsLong) {
             // Short lane (i) vs long lane (j)
-            if (!jIsLongCritical && distanceGap < 0.25) {
-              // Long lane not critical - keep short lane first with larger gap (25%)
+            if (!jIsLongCritical) {
+              // Long lane not critical - ALWAYS keep short lane first regardless of distance gap
               shouldSwap = false;
             } else if (distanceGap < 0.15) {
-              // Long lane critical or distances very similar - keep short lane first
+              // Long lane critical but distances very similar - keep short lane first
               shouldSwap = false;
             } else {
               // Distance gap too large - use distance
@@ -1940,8 +1978,12 @@ void loop() {
           // When both are far (80-100%), require at least 20% gap to override
           // When both are closer, require at least 15% gap
           // EXCEPTION: Short lane overriding long lane only needs 10% gap
+          // CRITICAL: At 95-100% distance, require even larger gap (30%) to prevent excessive bouncing
           float minGapRequired;
-          if (isShortLane && committedIsLongLane) {
+          if (committedDist > 0.95 && dist > 0.95) {
+            // Both at 95-100% - require very large gap (30%) to prevent bouncing
+            minGapRequired = 0.30;
+          } else if (isShortLane && committedIsLongLane) {
             // Short lane overriding long lane - only need 10% gap
             minGapRequired = 0.10;
           } else {
@@ -1951,6 +1993,20 @@ void loop() {
           
           if (distanceGap < minGapRequired) {
             continue;  // Skip - targets too similar in distance
+          }
+          
+          // CRITICAL: NEVER allow L1/L4 to override L2/L3 when L1/L4 are not critical
+          // L2/L3 have shorter lanes and must be protected to prevent impact
+          bool isLongLane = laneIsLong[i];
+          bool committedIsShortLane = laneIsShort[committedLane];
+          
+          if (isLongLane && committedIsShortLane && !isCritical) {
+            // Long lane (L1/L4) trying to override short lane (L2/L3) when not critical
+            // STRICT: Only allow if new lane is MUCH closer (at least 50% closer) OR is critical
+            // This ensures L2/L3 have priority when distances are similar
+            if (dist >= committedDist * 0.5) {
+              continue;  // Skip - don't allow override, protect short lanes
+            }
           }
           
           // When batch is locked, only override for:
@@ -1982,8 +2038,12 @@ void loop() {
           // When both are far (80-100%), require at least 20% gap to override
           // When both are closer, require at least 15% gap
           // EXCEPTION: Short lane overriding long lane only needs 10% gap
+          // CRITICAL: At 95-100% distance, require even larger gap (30%) to prevent excessive bouncing
           float minGapRequired;
-          if (isShortLane && committedIsLongLane) {
+          if (committedDist > 0.95 && dist > 0.95) {
+            // Both at 95-100% - require very large gap (30%) to prevent bouncing
+            minGapRequired = 0.30;
+          } else if (isShortLane && committedIsLongLane) {
             // Short lane overriding long lane - only need 10% gap
             minGapRequired = 0.10;
           } else {
@@ -1993,6 +2053,20 @@ void loop() {
           
           if (distanceGap < minGapRequired) {
             continue;  // Skip - targets too similar in distance
+          }
+          
+          // CRITICAL: NEVER allow L1/L4 to override L2/L3 when L1/L4 are not critical
+          // L2/L3 have shorter lanes and must be protected to prevent impact
+          bool isLongLane = laneIsLong[i];
+          bool committedIsShortLane = laneIsShort[committedLane];
+          
+          if (isLongLane && committedIsShortLane && !isCritical) {
+            // Long lane (L1/L4) trying to override short lane (L2/L3) when not critical
+            // STRICT: Only allow if new lane is MUCH closer (at least 50% closer) OR is critical
+            // This ensures L2/L3 have priority when distances are similar
+            if (dist >= committedDist * 0.5) {
+              continue;  // Skip - don't allow override, protect short lanes
+            }
           }
           
           // Batch not locked - use normal override criteria
@@ -3434,9 +3508,10 @@ float calculateThreatScore(int lane) {
         
         // CRITICAL: If long lane is NOT critical, boost short lane even more aggressively
         // This ensures L2/L3 are prioritized when L1/L4 are not about to make impact
-        if (!otherIsCritical && distanceGap < 0.30) {
-          // Long lane not critical - boost short lane with larger gap (30%)
-          score += 1200;  // Larger boost when long lane is not critical
+        if (!otherIsCritical) {
+          // Long lane not critical - ALWAYS boost short lane regardless of distance gap
+          // This ensures L2/L3 are prioritized when L1/L4 are not about to make impact
+          score += 2000;  // Much larger boost when long lane is not critical
           break;  // Only need to boost once
         } else if (distanceGap < 0.15) {
           // Long lane critical or distances very similar - still boost
@@ -3476,6 +3551,13 @@ void updateSensors() {
       // So: 1.0 = at impact (urgent!), 0.0 = at start
       float normalized = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
       currentDistance = constrain(normalized, 0.0f, 1.0f);
+      
+      // CRITICAL: Make L2/L3 appear 7% shorter to prioritize them earlier
+      // This makes them appear closer than they really are, triggering priority sooner
+      if (i == 1 || i == 2) {  // L2 or L3 (short lanes)
+        currentDistance = currentDistance * 0.93f;  // Make appear 7% closer (shorter)
+        currentDistance = constrain(currentDistance, 0.0f, 1.0f);
+      }
     }
     zombieDistances[i] = currentDistance;
 
@@ -3491,9 +3573,18 @@ void updateSensors() {
     if (changeMagnitude < sensorNoiseLimit) {
       // No significant change detected
       if (now - ProxSensors[i].prevChangeTime >= stopTimeout) {
+        // Track when lane becomes STOPPED
+        if (ProxSensors[i].direction != STOPPED) {
+          laneStoppedTime[i] = now;  // Record when it became STOPPED
+        }
         ProxSensors[i].direction = STOPPED;
         ProxSensors[i].forwardCount = 0;
         ProxSensors[i].backwardCount = 0;
+      }
+    } else {
+      // Lane is moving - clear stopped time
+      if (ProxSensors[i].direction == STOPPED) {
+        laneStoppedTime[i] = 0;  // Clear stopped time when lane starts moving
       }
     } else if (change < 0) {
       // Moving forward (sensor value decreasing = getting closer)
@@ -3502,6 +3593,10 @@ void updateSensors() {
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
       ProxSensors[i].prevChangeTime = now;
       if (ProxSensors[i].forwardCount >= 2) {
+        // Lane is moving forward - clear stopped time
+        if (ProxSensors[i].direction == STOPPED) {
+          laneStoppedTime[i] = 0;  // Clear stopped time when lane starts moving
+        }
         ProxSensors[i].direction = FORWARD;
       }
     } else {
@@ -3530,6 +3625,10 @@ void updateSensors() {
       }
       
       if (ProxSensors[i].backwardCount >= backwardThreshold) {
+        // Lane is moving backward - clear stopped time
+        if (ProxSensors[i].direction == STOPPED) {
+          laneStoppedTime[i] = 0;  // Clear stopped time when lane starts moving
+        }
         ProxSensors[i].direction = BACKWARD;
       }
     }
