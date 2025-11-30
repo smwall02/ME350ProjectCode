@@ -139,15 +139,30 @@ const int SHORT_LANE_BOOST = 150;  // Give L2/L3 150ms "head start" - balanced
 
 //============================================
 // EARLY ENGAGEMENT THRESHOLDS
-// Now we engage zombies as soon as they appear!
+// LANE-SPECIFIC: L2/L3 are SHORTER - need MUCH earlier engagement!
 //============================================
-const float EARLY_ENGAGE_THRESHOLD = 0.85;   // Engage when zombie at 85% (just appeared)
-const float MIN_ENGAGE_THRESHOLD = 0.10;     // Don't engage if below 10% for normal targeting
+// Lane-specific engagement thresholds
+// L2/L3: Engage at 95%+ (very early) since they're short lanes
+// L1/L4: Engage at 92% (still early but longer lanes give more time)
+const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.92, 0.92};   // L1, L4
+const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.95, 0.95}; // L2, L3 - MUCH earlier!
+const float MIN_ENGAGE_THRESHOLD = 0.05;     // Don't engage if below 5% (allows closer for emergency before impact)
+
+// Get lane-specific engagement threshold
+float getEarlyEngageThreshold(int lane) {
+  if (lane == 1 || lane == 2) {  // L2 or L3 (short lanes)
+    return EARLY_ENGAGE_THRESHOLD_SHORT[lane == 1 ? 0 : 1];
+  } else {  // L1 or L4 (long lanes)
+    return EARLY_ENGAGE_THRESHOLD_LONG[lane == 0 ? 0 : 1];
+  }
+}
 
 // Override thresholds - LANE SPECIFIC!
-// L2/L3 are SHORT lanes - override must trigger EARLIER (at higher distance %)
-const float OVERRIDE_THRESHOLD[4] = {0.08, 0.12, 0.12, 0.08};  // TIGHT thresholds - only TRUE emergencies (92%/88%)
+// L2/L3 are SHORT lanes - override must trigger MUCH EARLIER (at higher distance %)
+// These are CRITICAL - game ends if zombie reaches wall!
+const float OVERRIDE_THRESHOLD[4] = {0.10, 0.20, 0.20, 0.10};  // L2/L3 at 20% (80% on display) = CRITICAL!
 const float ABSOLUTE_OVERRIDE_DISTANCE = 0.10;  // Fallback for L1/L4
+const float SHORT_LANE_CRITICAL_DISTANCE = 0.25;  // L2/L3 at 25% = game-ending threat!
 
 // Retreat detection - Lane 4 needs more tolerance due to longer travel
 const float RETREAT_CONFIRMED_DISTANCE = 0.35;
@@ -252,6 +267,7 @@ int batchSize = 0;                       // How many targets in current batch
 int batchIndex = 0;                      // Current position in batch
 unsigned long batchStartTime = 0;        // When current batch was created
 bool batchActive = false;                // Is a batch currently being executed?
+bool batchLocked = false;                // Is batch sequence locked? (stick to sequence)
 
 // Anti-consecutive-lane tracking
 int lastHitLane = -1;                    // Last lane we successfully hit
@@ -262,6 +278,13 @@ const int MAX_CONSECUTIVE_SAME = 2;      // Max times to hit same lane before fo
 // Batch statistics for debugging
 int batchesCompleted = 0;
 int batchesReset = 0;
+
+// Cooldown tracking to prevent spam and rapid retries
+unsigned long lastSkipMessageTime = 0;
+unsigned long lastBatchSkipTime = 0;
+int lastSkippedLane = -1;
+const unsigned long SKIP_MESSAGE_COOLDOWN = 2000;  // Only print skip message every 2 seconds
+const unsigned long BATCH_SKIP_COOLDOWN = 500;     // Wait 500ms before retrying after skip
 
 //============================================
 // DWELL TRACKING
@@ -341,6 +364,8 @@ int getNextFromQueue();
 void updatePendingQueue();
 void updateCalibration();
 void applyCalibration();
+void stopMotor();
+void setMotorVoltage(float voltage);
 // Analysis mode functions
 void resetAnalysisCycle();
 void recordTargetSelection(int lane);
@@ -524,22 +549,111 @@ void commitToTarget(int lane) {
   
   float dist = zombieDistances[lane];
   
+  // CRITICAL: Never commit to backward-moving targets - they're retreating!
+  if (ProxSensors[lane].direction == BACKWARD) {
+    return;
+  }
+  
   // For normal targeting, reject if outside range
   // But for emergencies (very close + forward), allow it
   bool isEmergency = (dist < ABSOLUTE_OVERRIDE_DISTANCE && ProxSensors[lane].direction == FORWARD);
   
   if (!isEmergency) {
-    // Normal targeting rules
-    if (dist > EARLY_ENGAGE_THRESHOLD || dist < MIN_ENGAGE_THRESHOLD) {
+    // Normal targeting rules - use lane-specific threshold
+    float laneThreshold = getEarlyEngageThreshold(lane);
+    if (dist > laneThreshold || dist < MIN_ENGAGE_THRESHOLD) {
       return;
     }
     // Reject if not moving forward (unless very close emergency)
     if (ProxSensors[lane].direction != FORWARD) {
       return;
     }
-  }
+    
+    // BATCH LOCK CHECK: If batch is locked, only allow breaking sequence for:
+    // 1. Backward-moving targets (already rejected above)
+    // 2. Significantly closer targets (emergency override)
+    if (batchLocked && batchActive && committedLane >= 0) {
+    // Check if this lane is in the current batch sequence
+    bool isInBatch = false;
+    for (int i = 0; i < batchSize; i++) {
+      if (targetBatch[i] == lane) {
+        isInBatch = true;
+        break;
+      }
+    }
+    
+    // If not in batch sequence, only allow if significantly closer OR has high velocity
+    if (!isInBatch) {
+      float committedDist = zombieDistances[committedLane];
+      float distanceGap = dist - committedDist;  // Negative if new is closer
+      
+      // Check velocity - fast-moving targets need earlier engagement
+      float velocity = abs(zombieVelocities[lane]);
+      bool isFastMoving = (velocity > 0.0005);  // Fast moving if velocity > threshold
+      float effectiveTTI = getEffectiveTTI(lane);
+      bool isUrgent = (effectiveTTI < 800);  // Urgent if TTI is low
+      
+      // Break batch sequence if:
+      // 1. New target is significantly closer (>15% closer) - reduced from 20% for faster response
+      // 2. OR new target is fast-moving AND closer (accounts for momentum)
+      // 3. OR new target has very low TTI (emergency)
+      bool shouldBreak = (distanceGap < -0.15) ||  // 15% closer
+                         (isFastMoving && distanceGap < -0.10 && dist < 0.60) ||  // Fast and closer
+                         (isUrgent && distanceGap < 0);  // Urgent and at least as close
+      
+      if (!shouldBreak) {
+        // Stick to batch sequence
+        return;
+      }
+    }
+    // If lane IS in batch, allow commit (will be validated by batch order)
+    }
+    
+    // PRIORITY CHECK: Don't commit to a far lane if closer forward-moving lanes exist
+    // This prevents going to distant zombies when closer ones are available
+    // BUT: Respect batch lock - if batch is locked, only apply this to non-batch lanes
+    if (!batchLocked || !batchActive || committedLane < 0) {
+    float closestDist = 1.0;
+    int closestLane = -1;
+    
+    for (int i = 0; i < 4; i++) {
+      // Only consider forward-moving targets in valid range - use lane-specific threshold
+      if (i != lane && 
+          ProxSensors[i].direction == FORWARD &&
+          zombieDistances[i] < getEarlyEngageThreshold(i) &&
+          zombieDistances[i] > MIN_ENGAGE_THRESHOLD) {
+        if (zombieDistances[i] < closestDist) {
+          closestDist = zombieDistances[i];
+          closestLane = i;
+        }
+      }
+    }
+    
+    // If there's a closer forward-moving target, only commit to far lane if it's not much further
+    if (closestLane >= 0 && closestDist < dist) {
+      float distanceGap = dist - closestDist;
+      
+      // If the gap is large (>0.12 = 12%), prefer the closer target
+      // Reduced from 15% to be more aggressive about prioritizing closer targets
+      if (distanceGap > 0.12 && closestDist < 0.50) {
+        return;  // Reject - closer target exists
+      }
+    }
+    }
+  }  // End of !isEmergency block
   
   isCommitted = true;
+  
+  // LOCK BATCH: Once we commit to first target in a batch, lock the sequence
+  if (batchActive && !batchLocked && batchSize > 0) {
+    // Check if this lane is the first target in the batch
+    if (targetBatch[0] == lane) {
+      batchLocked = true;
+      if (analysisMode) {
+        Serial.println(F("[BATCH] Sequence LOCKED - sticking to batch order"));
+      }
+    }
+  }
   committedLane = lane;
   commitStartTime = millis();
   commitStartDistance = zombieDistances[lane];
@@ -708,9 +822,16 @@ void calculateNewBatch() {
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
     lanes[i].distance = zombieDistances[i];
-    lanes[i].isActive = (ProxSensors[i].direction == FORWARD && 
-                         lanes[i].distance < EARLY_ENGAGE_THRESHOLD &&
-                         lanes[i].distance > MIN_ENGAGE_THRESHOLD);
+    
+    // CRITICAL: Only include forward-moving targets - exclude backward/stoppe
+    // Backward-moving targets are retreating and should NEVER be in batches
+    // Use lane-specific threshold - L2/L3 engage much earlier
+    bool isForwardMoving = (ProxSensors[i].direction == FORWARD);
+    float laneThreshold = getEarlyEngageThreshold(i);
+    bool isInRange = (lanes[i].distance < laneThreshold &&
+                      lanes[i].distance > MIN_ENGAGE_THRESHOLD);
+    
+    lanes[i].isActive = (isForwardMoving && isInRange);
     
     if (lanes[i].isActive) {
       lanes[i].effectiveTTI = getEffectiveTTI(i);
@@ -731,6 +852,10 @@ void calculateNewBatch() {
       activeLanes++;
     } else {
       lanes[i].effectiveTTI = 99999;
+      // Mark as inactive if backward-moving (even if in range)
+      if (!isForwardMoving) {
+        lanes[i].isActive = false;
+      }
     }
   }
   
@@ -754,20 +879,48 @@ void calculateNewBatch() {
     // If it's the same lane we've been hitting repeatedly, skip this batch
     if (activeLane == lastHitLane && millis() - lastHitTime < 1000) {
       batchActive = false;
-      if (analysisMode) {
+      
+      // Rate-limited skip message - only print once per cooldown period
+      unsigned long now = millis();
+      bool shouldPrint = (now - lastSkipMessageTime >= SKIP_MESSAGE_COOLDOWN) || 
+                         (lastSkippedLane != activeLane);
+      
+      if (analysisMode && shouldPrint) {
         Serial.print(F("[BATCH] Skipping L"));
         Serial.print(activeLane + 1);
         Serial.println(F(" - hit too many times, waiting for others"));
+        lastSkipMessageTime = now;
+        lastSkippedLane = activeLane;
       }
+      
+      // Record skip time for cooldown
+      lastBatchSkipTime = now;
       return;
     }
   }
   
-  // Sort lanes by effective TTI (lowest first = most urgent)
+  // Sort lanes by PRIORITY: 
+  // 1. Distance (closest = lowest distance value = highest priority)
+  // 2. Effective TTI (lowest = most urgent) as tiebreaker
+  // This ensures we prioritize closer zombies over distant ones
   // Simple bubble sort for 4 elements
   for (int i = 0; i < 3; i++) {
     for (int j = i + 1; j < 4; j++) {
-      if (lanes[j].effectiveTTI < lanes[i].effectiveTTI) {
+      bool shouldSwap = false;
+      
+      // Primary sort: by distance (closer = higher priority)
+      // Lower distance value = zombie is closer = should be targeted first
+      if (lanes[j].distance < lanes[i].distance) {
+        // Lane j is closer - higher priority
+        shouldSwap = true;
+      } else if (lanes[j].distance == lanes[i].distance) {
+        // Same distance - use TTI as tiebreaker (lower TTI = more urgent)
+        if (lanes[j].effectiveTTI < lanes[i].effectiveTTI) {
+          shouldSwap = true;
+        }
+      }
+      
+      if (shouldSwap) {
         LaneInfo temp = lanes[i];
         lanes[i] = lanes[j];
         lanes[j] = temp;
@@ -775,16 +928,30 @@ void calculateNewBatch() {
     }
   }
   
-  // Build batch: Add each active lane ONCE in TTI order
+  // Build batch: Add each active lane ONCE in priority order (closest first)
   // NO DUPLICATES - each lane appears at most once per batch
   // LIMITED TO MAX_BATCH_SIZE (3) to allow time to reach all targets
+  // DOUBLE-CHECK: Ensure we never add backward-moving lanes to batch
   for (int i = 0; i < 4; i++) {
     if (lanes[i].isActive && batchSize < MAX_BATCH_SIZE) {
-      targetBatch[batchSize++] = lanes[i].lane;
+      int lane = lanes[i].lane;
+      
+      // Final safety check: Never add backward-moving lanes to batch
+      if (ProxSensors[lane].direction == FORWARD) {
+        targetBatch[batchSize++] = lane;
+      }
+      // If lane became backward since we checked, skip it
     }
   }
   
   batchActive = (batchSize > 0);
+  batchLocked = false;  // Batch not locked yet - will lock when first target is committed
+  
+  // Reset skip tracking on successful batch creation
+  if (batchActive) {
+    lastBatchSkipTime = 0;
+    lastSkippedLane = -1;
+  }
   
   // Debug output
   if (analysisMode && batchActive) {
@@ -794,7 +961,7 @@ void calculateNewBatch() {
       Serial.print(targetBatch[i] + 1);
       if (i < batchSize - 1) Serial.print(F("->"));
     }
-    Serial.println();
+    Serial.println(F(" (sequence will be locked)"));
   }
 }
 
@@ -802,30 +969,72 @@ void calculateNewBatch() {
 int getNextBatchTarget() {
   // If batch is empty or exhausted, calculate new one
   if (!batchActive || batchIndex >= batchSize) {
+    // Check cooldown - don't recalculate immediately after a skip
+    unsigned long now = millis();
+    if (lastBatchSkipTime > 0 && (now - lastBatchSkipTime) < BATCH_SKIP_COOLDOWN) {
+      // Still in cooldown period, return -1 without recalculating
+      return -1;
+    }
+    
     calculateNewBatch();
     if (!batchActive) return -1;
+    
+    // Reset skip cooldown on successful batch creation
+    if (batchActive) {
+      lastBatchSkipTime = 0;
+      lastSkippedLane = -1;
+    }
   }
   
   // Find next valid target in batch
   while (batchIndex < batchSize) {
     int lane = targetBatch[batchIndex];
     
+    // CRITICAL: Remove backward-moving lanes from batch - they're retreating!
+    // Also validate forward direction, range, and lane validity
+    // Use lane-specific threshold - L2/L3 have higher thresholds
+    bool isValid = (lane >= 0 && lane < 4);
+    bool isForward = (ProxSensors[lane].direction == FORWARD);
+    bool isBackward = (ProxSensors[lane].direction == BACKWARD);
+    float laneThreshold = getEarlyEngageThreshold(lane);
+    bool isInRange = (zombieDistances[lane] < laneThreshold &&
+                      zombieDistances[lane] > MIN_ENGAGE_THRESHOLD);
+    
+    // If target is backward-moving, remove it from batch entirely
+    if (isValid && isBackward) {
+      // Remove this lane from batch by shifting remaining elements
+      for (int i = batchIndex; i < batchSize - 1; i++) {
+        targetBatch[i] = targetBatch[i + 1];
+      }
+      batchSize--;
+      // Don't increment batchIndex - check the same position again (now has different lane)
+      continue;
+    }
+    
     // Check if this target is still valid (forward-moving, in range)
-    if (lane >= 0 && lane < 4 &&
-        ProxSensors[lane].direction == FORWARD &&
-        zombieDistances[lane] < EARLY_ENGAGE_THRESHOLD &&
-        zombieDistances[lane] > MIN_ENGAGE_THRESHOLD) {
+    if (isValid && isForward && isInRange) {
       batchIndex++;  // Move to next for next call
       return lane;
     }
     
-    // Target no longer valid, skip it
+    // Target no longer valid (stopped, out of range, etc.) - skip it
     batchIndex++;
   }
   
-  // Batch exhausted, calculate new one
+  // Batch exhausted, calculate new one (with cooldown check)
+  unsigned long now = millis();
+  if (lastBatchSkipTime > 0 && (now - lastBatchSkipTime) < BATCH_SKIP_COOLDOWN) {
+    return -1;
+  }
+  
   calculateNewBatch();
   if (!batchActive) return -1;
+  
+  // Reset skip cooldown on successful batch creation
+  if (batchActive) {
+    lastBatchSkipTime = 0;
+    lastSkippedLane = -1;
+  }
   
   // Return first target of new batch
   if (batchSize > 0) {
@@ -839,9 +1048,14 @@ int getNextBatchTarget() {
 // Reset the batch (called on emergency override or major change)
 void resetBatch() {
   batchActive = false;
+  batchLocked = false;  // Unlock batch on reset
   batchIndex = 0;
   batchSize = 0;
   batchesReset++;
+  
+  // Clear skip tracking on reset to allow immediate recalculation
+  lastBatchSkipTime = 0;
+  lastSkippedLane = -1;
   
   if (analysisMode) {
     Serial.println(F("[BATCH] Reset - recalculating"));
@@ -849,9 +1063,20 @@ void resetBatch() {
 }
 
 // Mark current batch target as complete (hit registered)
+// Also handles batch unlocking when sequence is complete
 void advanceBatch() {
-  // Already advanced in getNextBatchTarget, but check if batch complete
-  if (batchIndex >= batchSize) {
+  // Check if batch sequence is complete
+  if (batchIndex >= batchSize && batchLocked) {
+    batchesCompleted++;
+    batchLocked = false;  // Unlock batch when sequence complete
+    batchActive = false;
+    
+    if (analysisMode) {
+      Serial.print(F("[BATCH] Sequence complete #"));
+      Serial.print(batchesCompleted);
+      Serial.println(F(" - unlocking"));
+    }
+  } else if (batchIndex >= batchSize) {
     batchesCompleted++;
     batchActive = false;
     
@@ -1229,7 +1454,9 @@ void chooseAndCommitTarget() {
     if (ProxSensors[lane].direction != FORWARD) continue;
     
     float dist = zombieDistances[lane];
-    if (dist < MIN_ENGAGE_THRESHOLD || dist > EARLY_ENGAGE_THRESHOLD) continue;
+    // Use lane-specific threshold - L2/L3 engage earlier
+    float laneThreshold = getEarlyEngageThreshold(lane);
+    if (dist < MIN_ENGAGE_THRESHOLD || dist > laneThreshold) continue;
     
     float score = calculateThreatScore(lane);
     if (score > bestScore) {
@@ -1245,8 +1472,9 @@ void chooseAndCommitTarget() {
     
     float dist = zombieDistances[i];
     
-    // Skip if zombie is outside valid engagement range
-    if (dist < MIN_ENGAGE_THRESHOLD || dist > EARLY_ENGAGE_THRESHOLD) continue;
+    // Skip if zombie is outside valid engagement range - use lane-specific threshold
+    float laneThreshold = getEarlyEngageThreshold(i);
+    if (dist < MIN_ENGAGE_THRESHOLD || dist > laneThreshold) continue;
     
     float score = calculateThreatScore(i);
     
@@ -1284,8 +1512,52 @@ void chooseAndCommitTarget() {
 //============================================
 // CHOOSE AND COMMIT TARGET FROM BATCH
 // Uses the batch system for more predictable targeting
+// STICKS TO BATCH SEQUENCE when locked (groups of 3)
 //============================================
 void chooseAndCommitTargetFromBatch() {
+  // If batch is locked, ONLY get targets from the batch sequence
+  // Don't allow breaking sequence except for backward targets (handled in getNextBatchTarget)
+  if (batchLocked && batchActive) {
+    // Get next target from current batch sequence
+    int nextLane = getNextBatchTarget();
+    
+    if (nextLane >= 0) {
+      // Verify this lane is still valid (forward-moving, in range)
+      // Use lane-specific threshold
+      float laneThreshold = getEarlyEngageThreshold(nextLane);
+      if (ProxSensors[nextLane].direction == FORWARD &&
+          zombieDistances[nextLane] < laneThreshold &&
+          zombieDistances[nextLane] > MIN_ENGAGE_THRESHOLD) {
+        // Target is valid - commit to it (batch sequence enforced)
+        commitToTarget(nextLane);
+        if (isCommitted) {
+          state = MOVE_TO_TARGET;
+        }
+        return;
+      } else {
+        // Target became invalid (backward or out of range) - remove from batch and continue
+        // getNextBatchTarget already handles this, so just get next one
+        nextLane = getNextBatchTarget();
+        if (nextLane >= 0) {
+          commitToTarget(nextLane);
+          if (isCommitted) {
+            state = MOVE_TO_TARGET;
+          }
+          return;
+        }
+      }
+    }
+    
+    // Batch exhausted but was locked - unlock and recalculate
+    if (batchIndex >= batchSize) {
+      batchLocked = false;
+      batchActive = false;
+      if (analysisMode) {
+        Serial.println(F("[BATCH] Sequence complete - unlocking"));
+      }
+    }
+  }
+  
   // Get next target from batch (will calculate new batch if needed)
   int nextLane = getNextBatchTarget();
   
@@ -1402,13 +1674,23 @@ void dwellAtTarget() {
       stoppedStartTime = 0;  // Reset stopped tracker
       releaseCommitment();
       
-      // Get next target from batch
+      // Advance batch (will unlock if sequence complete)
+      advanceBatch();
+      
+      // Get next target from batch (respects batch lock)
       int next = getNextBatchTarget();
       if (next >= 0 && ProxSensors[next].direction == FORWARD) {
         commitToTarget(next);
         if (isCommitted) state = MOVE_TO_TARGET;
         else state = CHOOSE_TARGET;
       } else {
+        // Batch complete or no valid targets - unlock and go to choose
+        if (batchLocked) {
+          batchLocked = false;
+          if (analysisMode) {
+            Serial.println(F("[BATCH] Unlocked - sequence complete"));
+          }
+        }
         state = CHOOSE_TARGET;
       }
       return;
@@ -1436,12 +1718,19 @@ void dwellAtTarget() {
       
       stoppedStartTime = 0;  // Reset stopped tracker
       releaseCommitment();
+      advanceBatch();  // Advance batch sequence
       int next = getNextBatchTarget();
       if (next >= 0 && ProxSensors[next].direction == FORWARD) {
         commitToTarget(next);
         if (isCommitted) state = MOVE_TO_TARGET;
         else state = CHOOSE_TARGET;
       } else {
+        if (batchLocked) {
+          batchLocked = false;
+          if (analysisMode) {
+            Serial.println(F("[BATCH] Unlocked - sequence complete"));
+          }
+        }
         state = CHOOSE_TARGET;
       }
       return;
