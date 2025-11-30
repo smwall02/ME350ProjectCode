@@ -884,7 +884,16 @@ bool shouldOverride(int newLane) {
   if (atTarget && ProxSensors[committedLane].direction == FORWARD) {
     bool newIsShortLane = laneIsShort[newLane];
     bool committedIsLongLane = laneIsLong[committedLane];
+    bool committedIsShortLane = laneIsShort[committedLane];
+    bool newIsLongLane = laneIsLong[newLane];
     bool newIsCritical = laneIsCritical[newLane];
+    
+    // CRITICAL: NEVER allow L1/L4 to override L2/L3 when dwelling, unless L1/L4 is critical
+    // L2/L3 have shorter lanes and must be protected to prevent impact
+    if (newIsLongLane && committedIsShortLane && !newIsCritical) {
+      // Long lane trying to override short lane when not critical - don't allow
+      return false;
+    }
     
     // CRITICAL FIX: Distance is normalized where 0.0 = at impact, 1.0 = far
     // So LOW distance values mean close to impact (urgent!)
@@ -924,6 +933,15 @@ bool shouldOverride(int newLane) {
     // Check if new target is critical (game-ending threat)
     bool newIsCritical = laneIsCritical[newLane];
     bool committedIsCritical = (committedLane >= 0) ? laneIsCritical[committedLane] : false;
+    bool newIsLongLane = laneIsLong[newLane];
+    bool committedIsShortLane = laneIsShort[committedLane];
+    
+    // CRITICAL: NEVER allow L1/L4 to override L2/L3 when moving, unless L1/L4 is critical
+    // L2/L3 have shorter lanes and must be protected to prevent impact
+    if (newIsLongLane && committedIsShortLane && !newIsCritical) {
+      // Long lane trying to override short lane when not critical - don't allow
+      return false;
+    }
     
     // Only override if:
     // 1. New is critical AND committed is NOT critical (game-ending threat vs non-critical)
@@ -942,6 +960,16 @@ bool shouldOverride(int newLane) {
   // only override if new lane is MUCH more critical
   if (nearingTarget && committedDist < 0.40 && 
       ProxSensors[committedLane].direction == FORWARD) {
+    // CRITICAL: NEVER allow L1/L4 to override L2/L3 when nearing target, unless L1/L4 is critical
+    bool newIsLongLane = laneIsLong[newLane];
+    bool committedIsShortLane = laneIsShort[committedLane];
+    bool newIsCritical = laneIsCritical[newLane];
+    
+    if (newIsLongLane && committedIsShortLane && !newIsCritical) {
+      // Long lane trying to override short lane when not critical - don't allow
+      return false;
+    }
+    
     // TIGHTER: New must be at least 3x closer than committed to justify switch (was 2x)
     return newDist < committedDist * 0.3;
   }
@@ -950,6 +978,16 @@ bool shouldOverride(int newLane) {
   // AND is significantly more urgent than committed
   float threshold = OVERRIDE_THRESHOLD[newLane];
   if (newDist < threshold) {
+    // CRITICAL: NEVER allow L1/L4 to override L2/L3 in general case, unless L1/L4 is critical
+    bool newIsLongLane = laneIsLong[newLane];
+    bool committedIsShortLane = laneIsShort[committedLane];
+    bool newIsCritical = laneIsCritical[newLane];
+    
+    if (newIsLongLane && committedIsShortLane && !newIsCritical) {
+      // Long lane trying to override short lane when not critical - don't allow
+      return false;
+    }
+    
     // TIGHTER: If committed is still a threat, new must be MUCH more critical
     if (committedDist < 0.25 && ProxSensors[committedLane].direction == FORWARD) {
       return newDist < committedDist * 0.4;  // TIGHTER: Must be 2.5x closer (was 2x = 0.5)
@@ -1290,13 +1328,34 @@ void calculateNewBatch() {
           }
         } else {
           // Normal case: Short lane vs long lane - short lane wins if distances are similar (within 15%)
+          // CRITICAL: If long lane is NOT critical, short lane gets priority even with larger distance gap
           float distanceGap = abs(lanes[j].distance - lanes[i].distance);
-          if (jIsShort && iIsLong && distanceGap < 0.15) {
-            // Short lane (j) vs long lane (i) at similar distance - prioritize short lane
-            shouldSwap = true;
-          } else if (iIsShort && jIsLong && distanceGap < 0.15) {
-            // Short lane (i) vs long lane (j) at similar distance - keep short lane first
-            shouldSwap = false;
+          bool iIsLongCritical = (iIsLong && iIsCritical);
+          bool jIsLongCritical = (jIsLong && jIsCritical);
+          
+          if (jIsShort && iIsLong) {
+            // Short lane (j) vs long lane (i)
+            if (!iIsLongCritical && distanceGap < 0.25) {
+              // Long lane not critical - prioritize short lane with larger gap (25%)
+              shouldSwap = true;
+            } else if (distanceGap < 0.15) {
+              // Long lane critical or distances very similar - prioritize short lane
+              shouldSwap = true;
+            }
+          } else if (iIsShort && jIsLong) {
+            // Short lane (i) vs long lane (j)
+            if (!jIsLongCritical && distanceGap < 0.25) {
+              // Long lane not critical - keep short lane first with larger gap (25%)
+              shouldSwap = false;
+            } else if (distanceGap < 0.15) {
+              // Long lane critical or distances very similar - keep short lane first
+              shouldSwap = false;
+            } else {
+              // Distance gap too large - use distance
+              if (lanes[j].distance < lanes[i].distance) {
+                shouldSwap = true;
+              }
+            }
           } else {
             // Primary sort: by distance (closer = higher priority)
             // Lower distance value = zombie is closer = should be targeted first
@@ -1847,6 +1906,14 @@ void loop() {
         float dist = zombieDistances[i];
         bool isCritical = laneIsCritical[i];
         
+        // CRITICAL: NEVER allow L1/L4 to override L2/L3 when L1/L4 are not critical
+        // L2/L3 have shorter lanes and must be protected to prevent impact
+        bool newIsLongLane = laneIsLong[i];
+        bool committedIsShortLane = (committedLane >= 0) ? laneIsShort[committedLane] : false;
+        if (newIsLongLane && committedIsShortLane && !isCritical) {
+          continue;  // Skip - don't allow long lane to override short lane when not critical
+        }
+        
         // TIGHTER CRITERIA: Only override for truly critical threats
         // OPTIMIZATION: Use cached critical status for committed lane
         bool committedIsCritical = (committedLane >= 0) ? laneIsCritical[committedLane] : false;
@@ -2311,7 +2378,14 @@ void dwellAtTarget() {
     bool isShortLane = laneIsShort[i];
     bool isLongLane = laneIsLong[i];
     bool committedIsLongLane = laneIsLong[activeTargetIndex];
+    bool committedIsShortLane = laneIsShort[activeTargetIndex];
     bool isCritical = laneIsCritical[i];
+    
+    // CRITICAL: NEVER allow L1/L4 to override L2/L3 when dwelling, unless L1/L4 is critical
+    // L2/L3 have shorter lanes and must be protected to prevent impact
+    if (isLongLane && committedIsShortLane && !isCritical) {
+      continue;  // Skip - don't allow long lane to override short lane when not critical
+    }
     
     // CRITICAL: Short lanes (L2/L3) can override long lanes (L1/L4) when getting close
     // If we're dwelling at a long lane and a short lane is getting close, override immediately
@@ -3356,8 +3430,16 @@ float calculateThreatScore(int lane) {
       if (laneIsLong[otherLane] && ProxSensors[otherLane].direction == FORWARD) {
         float otherDist = zombieDistances[otherLane];
         float distanceGap = abs(dist - otherDist);
-        // If long lane is at similar distance (within 15%), boost short lane significantly
-        if (distanceGap < 0.15) {
+        bool otherIsCritical = laneIsCritical[otherLane];
+        
+        // CRITICAL: If long lane is NOT critical, boost short lane even more aggressively
+        // This ensures L2/L3 are prioritized when L1/L4 are not about to make impact
+        if (!otherIsCritical && distanceGap < 0.30) {
+          // Long lane not critical - boost short lane with larger gap (30%)
+          score += 1200;  // Larger boost when long lane is not critical
+          break;  // Only need to boost once
+        } else if (distanceGap < 0.15) {
+          // Long lane critical or distances very similar - still boost
           score += 800;  // Significant boost to ensure short lane wins
           break;  // Only need to boost once
         }
