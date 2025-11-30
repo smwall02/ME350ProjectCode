@@ -55,7 +55,7 @@ const int STOPPED = 0;
 //============================================
 long targetPositions[4] = {-73, -341, -594, -1200};
 const long WAIT_POSITION = -594;
-const int TARGET_BAND = 20;  // Increased for more forgiving positioning
+const int TARGET_BAND = 10;  // Increased for more forgiving positioning
 
 //============================================
 // SENSOR CALIBRATION RANGES
@@ -97,8 +97,8 @@ bool gameOver = false;
 //============================================
 // THREAT LEVELS
 //============================================
-const float CRITICAL_THREAT = 0.10;  // <10% distance = CRITICAL (90%+ danger)
-const float MAX_ENGAGE = 0.12;       // <12% distance = too close (88%+ danger)
+const float CRITICAL_THREAT = 0.15;  // <10% distance = CRITICAL (90%+ danger)
+const float MAX_ENGAGE = 0.17;       // <12% distance = too close (88%+ danger)
 const float MIN_ENGAGE = 0.20;       // >20% distance = too far (<80% danger)
 
 //============================================
