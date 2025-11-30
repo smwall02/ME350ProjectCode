@@ -359,7 +359,7 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 1.0;
 float arrivalZombieDistance = 1.0;
 
-const unsigned long MIN_DWELL_TIME = 225;       // INCREASED by 25ms: Better hit detection
+const unsigned long MIN_DWELL_TIME = 250;       // INCREASED by 25ms: Better hit detection
 
 //============================================
 // ANALYSIS MODE - Lane Priority Tracking
@@ -373,9 +373,9 @@ int cycleHitCount[4] = {0,0,0,0};    // Hits per lane in current cycle
 int cycleMissCount[4] = {0,0,0,0};   // Misses per lane in current cycle (reached wall)
 float lanePriorityScores[4];         // Calculated priority scores at decision time
 int priorityOrder[4];                // Lane order by priority (highest first)
-const unsigned long NORMAL_DWELL_TIME = 425;   // INCREASED by 25ms: Better hit detection
-const unsigned long MAX_DWELL_TIME = 825;       // INCREASED by 25ms: Better hit detection
-const unsigned long L4_DWELL_TIME = 1025;       // INCREASED by 25ms: Better hit detection
+const unsigned long NORMAL_DWELL_TIME = 450;   // INCREASED by 25ms: Better hit detection
+const unsigned long MAX_DWELL_TIME = 850;       // INCREASED by 25ms: Better hit detection
+const unsigned long L4_DWELL_TIME = 1050;       // INCREASED by 25ms: Better hit detection
 
 const unsigned long BACKWARD_CONFIRM_TIME = 40;  // FASTER - reduced from 60
 unsigned long backwardStartTime = 0;
@@ -1932,6 +1932,14 @@ void loop() {
         // TIGHTER: Longer anti-return period
         if (i == lastOverrideLane && timeSinceOverride < 2000) continue;  // TIGHTER: 2s anti-return (was 1.2s)
         
+        // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
+        if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0) {
+          unsigned long stoppedDuration = millis() - laneStoppedTime[i];
+          if (stoppedDuration > STOPPED_TIMEOUT) {
+            continue;  // Skip this lane - it's been frozen too long
+          }
+        }
+        
         // IMPROVED: Don't override to lanes that have already been attempted recently
         if (laneAttempted[i]) {
           unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
@@ -2448,6 +2456,14 @@ void dwellAtTarget() {
     if (i == activeTargetIndex) continue;  // Skip committed lane
     if (ProxSensors[i].direction != FORWARD) continue;  // Only forward-moving
     
+    // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
+    if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0) {
+      unsigned long stoppedDuration = millis() - laneStoppedTime[i];
+      if (stoppedDuration > STOPPED_TIMEOUT) {
+        continue;  // Skip this lane - it's been frozen too long
+      }
+    }
+    
     float dist = zombieDistances[i];
     bool isShortLane = laneIsShort[i];
     bool isLongLane = laneIsLong[i];
@@ -2480,8 +2496,12 @@ void dwellAtTarget() {
       // When both are far (80-100%), require at least 20% gap to override
       // When both are closer, require at least 15% gap
       // EXCEPTION: Short lane overriding long lane only needs 10% gap
+      // CRITICAL: At 95-100% distance, require even larger gap (30%) to prevent excessive bouncing
       float minGapRequired;
-      if (isShortLane && committedIsLongLane) {
+      if (committedDist > 0.95 && dist > 0.95) {
+        // Both at 95-100% - require very large gap (30%) to prevent bouncing
+        minGapRequired = 0.30;
+      } else if (isShortLane && committedIsLongLane) {
         // Short lane overriding long lane - only need 10% gap
         minGapRequired = 0.10;
       } else {
@@ -3372,7 +3392,14 @@ float calculateThreatScore(int lane) {
   }
   
   // Stopped targets are low priority unless very close
+  // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
   if (ProxSensors[lane].direction == STOPPED) {
+    if (laneStoppedTime[lane] > 0) {
+      unsigned long stoppedDuration = millis() - laneStoppedTime[lane];
+      if (stoppedDuration > STOPPED_TIMEOUT) {
+        return 0;  // Skip this lane - it's been frozen too long
+      }
+    }
     if (dist > 0.20) return 0;  // Far and stopped = ignore
     // Close and stopped = minor threat (it might start moving any moment)
     return (1.0 - dist) * 50 * LANE_PRIORITY[lane];
@@ -3552,10 +3579,10 @@ void updateSensors() {
       float normalized = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
       currentDistance = constrain(normalized, 0.0f, 1.0f);
       
-      // CRITICAL: Make L2/L3 appear 7% shorter to prioritize them earlier
+      // CRITICAL: Make L2/L3 appear 12% shorter to prioritize them earlier
       // This makes them appear closer than they really are, triggering priority sooner
       if (i == 1 || i == 2) {  // L2 or L3 (short lanes)
-        currentDistance = currentDistance * 0.93f;  // Make appear 7% closer (shorter)
+        currentDistance = currentDistance * 0.88f;  // Make appear 12% closer (shorter)
         currentDistance = constrain(currentDistance, 0.0f, 1.0f);
       }
     }
@@ -3581,26 +3608,25 @@ void updateSensors() {
         ProxSensors[i].forwardCount = 0;
         ProxSensors[i].backwardCount = 0;
       }
-    } else {
-      // Lane is moving - clear stopped time
+    } else if (change < 0) {
+      // Moving forward (sensor value decreasing = getting closer)
+      // Lane is moving forward - clear stopped time
       if (ProxSensors[i].direction == STOPPED) {
         laneStoppedTime[i] = 0;  // Clear stopped time when lane starts moving
       }
-    } else if (change < 0) {
-      // Moving forward (sensor value decreasing = getting closer)
       ProxSensors[i].forwardCount++;
       ProxSensors[i].backwardCount = 0;
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
       ProxSensors[i].prevChangeTime = now;
       if (ProxSensors[i].forwardCount >= 2) {
-        // Lane is moving forward - clear stopped time
-        if (ProxSensors[i].direction == STOPPED) {
-          laneStoppedTime[i] = 0;  // Clear stopped time when lane starts moving
-        }
         ProxSensors[i].direction = FORWARD;
       }
     } else {
       // Moving backward (sensor value increasing = getting farther)
+      // Lane is moving backward - clear stopped time
+      if (ProxSensors[i].direction == STOPPED) {
+        laneStoppedTime[i] = 0;  // Clear stopped time when lane starts moving
+      }
       ProxSensors[i].backwardCount++;
       ProxSensors[i].forwardCount = 0;
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
@@ -3625,10 +3651,6 @@ void updateSensors() {
       }
       
       if (ProxSensors[i].backwardCount >= backwardThreshold) {
-        // Lane is moving backward - clear stopped time
-        if (ProxSensors[i].direction == STOPPED) {
-          laneStoppedTime[i] = 0;  // Clear stopped time when lane starts moving
-        }
         ProxSensors[i].direction = BACKWARD;
       }
     }
