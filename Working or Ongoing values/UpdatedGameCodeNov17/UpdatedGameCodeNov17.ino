@@ -509,9 +509,11 @@ void runStateMachine() {
       // Track position
       previousMoveStartPosition = encoder.read();
 
-      // Find closest forward zombie FIRST - always check for new targets
-      int newTargetIndex = -1;
-      float newClosestDist = 2.0;
+      // Find all approaching targets - identify multiple threats
+      int approachingTargets[4];
+      int numApproaching = 0;
+      float approachingDistances[4];
+      
       for (int i = 0; i < 4; i++) {
         // Target forward zombies primarily
         // Also target zombies that are close enough (likely approaching, even if direction not detected yet)
@@ -520,49 +522,84 @@ void runStateMachine() {
         bool notRetreating = (ProxSensors[i].direction != BACKWARD);  // Not clearly retreating
         
         // Select if: forward, OR (close enough and not retreating)
-        if ((isForward || (isCloseEnough && notRetreating)) &&
-            zombieDistances[i] < newClosestDist) {
-          newClosestDist = zombieDistances[i];
-          newTargetIndex = i;
+        if (isForward || (isCloseEnough && notRetreating)) {
+          approachingTargets[numApproaching] = i;
+          approachingDistances[numApproaching] = zombieDistances[i];
+          numApproaching++;
         }
       }
       
-      // Check if we should stay committed to current target
-      // Only if we have a current target AND it's still valid AND we're within commit time
-      // BUT allow override if a much closer threat appears
-      bool shouldStayCommitted = false;
-      bool hasMuchCloserThreat = false;
-      
-      if (activeTargetIndex >= 0 && 
-          activeTargetIndex < 4 &&
-          newTargetIndex >= 0 &&
-          newTargetIndex != activeTargetIndex) {
-        // Check if new target is significantly closer (override threshold)
-        float currentDist = zombieDistances[activeTargetIndex];
-        float newDist = zombieDistances[newTargetIndex];
-        if (newDist < (currentDist - 0.15)) {  // New target is 15% closer - allow override
-          hasMuchCloserThreat = true;
+      // Find the closest approaching target
+      int newTargetIndex = -1;
+      float newClosestDist = 2.0;
+      for (int i = 0; i < numApproaching; i++) {
+        if (approachingDistances[i] < newClosestDist) {
+          newClosestDist = approachingDistances[i];
+          newTargetIndex = approachingTargets[i];
         }
       }
       
-      if (activeTargetIndex >= 0 && 
-          activeTargetIndex < 4 &&
-          ProxSensors[activeTargetIndex].direction == FORWARD &&
-          zombieDistances[activeTargetIndex] < MIN_COMMIT_DISTANCE &&
-          targetCommitTime > 0 &&
-          (millis() - targetCommitTime) < MIN_TARGET_COMMIT_TIME &&
-          !hasMuchCloserThreat) {  // Don't stay committed if much closer threat exists
-        // Check if target is hit or retreated
-        if (!ProxSensors[activeTargetIndex].hitDetected &&
-            !(ProxSensors[activeTargetIndex].direction == BACKWARD && 
-              zombieDistances[activeTargetIndex] > 0.70)) {
-          // Target is still valid - stay committed (unless much closer threat)
-          shouldStayCommitted = true;
+      // PRIORITIZATION LOGIC: When multiple targets are approaching, commit to one
+      // Only switch if:
+      // 1. No current target (first target selection)
+      // 2. Current target is hit/retreating
+      // 3. New target is MUCH closer (larger threshold to prevent switching)
+      // 4. Current target is no longer approaching
+      
+      bool shouldSwitchTarget = false;
+      bool currentTargetStillValid = false;
+      
+      // Check if current target is still valid
+      if (activeTargetIndex >= 0 && activeTargetIndex < 4) {
+        bool isHit = ProxSensors[activeTargetIndex].hitDetected;
+        bool isRetreating = (ProxSensors[activeTargetIndex].direction == BACKWARD && 
+                            zombieDistances[activeTargetIndex] > 0.70);
+        bool isStillApproaching = (ProxSensors[activeTargetIndex].direction == FORWARD ||
+                                   (zombieDistances[activeTargetIndex] < 0.60 && 
+                                    ProxSensors[activeTargetIndex].direction != BACKWARD));
+        
+        currentTargetStillValid = !isHit && !isRetreating && isStillApproaching;
+      }
+      
+      // Decision logic for target switching
+      if (newTargetIndex >= 0) {
+        if (activeTargetIndex < 0) {
+          // No current target - select the closest one
+          shouldSwitchTarget = true;
+        } else if (activeTargetIndex != newTargetIndex) {
+          // Different target found - check if we should switch
+          if (!currentTargetStillValid) {
+            // Current target is no longer valid - switch
+            shouldSwitchTarget = true;
+          } else {
+            // Current target is still valid - only switch if new target is MUCH closer
+            float currentDist = zombieDistances[activeTargetIndex];
+            float newDist = zombieDistances[newTargetIndex];
+            
+            // Require new target to be at least 25% closer to switch (increased from 15%)
+            // This prevents switching when multiple targets are approaching at similar distances
+            if (newDist < (currentDist - 0.25)) {
+              shouldSwitchTarget = true;
+            }
+            // Also allow switch if current target is far and new is much closer
+            else if (currentDist > 0.50 && newDist < (currentDist - 0.20)) {
+              shouldSwitchTarget = true;
+            }
+          }
+        } else {
+          // Same target - keep it
+          shouldSwitchTarget = false;
+        }
+      } else {
+        // No new targets found
+        if (!currentTargetStillValid && activeTargetIndex >= 0) {
+          // Current target is no longer valid and no new targets - clear it
+          activeTargetIndex = -1;
         }
       }
       
-      // If no new target found and we're not committed, go to wait position
-      if (newTargetIndex < 0 && !shouldStayCommitted) {
+      // If no targets found and no valid current target, go to wait position
+      if (newTargetIndex < 0 && activeTargetIndex < 0) {
         activeTargetIndex = -1;
         activeTargetPosition = WAIT_POSITION;
         WAIT_POS = true;
@@ -584,54 +621,15 @@ void runStateMachine() {
         break;
       }
       
-      // If committed to current target and it's still valid, keep it (unless much closer threat)
-      if (shouldStayCommitted && activeTargetIndex >= 0 && !hasMuchCloserThreat) {
-        activeTargetPosition = targetPositions[activeTargetIndex];
-        WAIT_POS = false;
-        if (lane4LimitSwitchMode) {
-          desiredPosition = UPPER_BOUND;
-        } else {
-          desiredPosition = activeTargetPosition;
-        }
-        moveStartTime = millis();
-        arrivalTime = millis();
-        currentState = MOVE_TO_TARGET;
-        break;
-      }
-      
-      // Always select the closest target - simple and direct
-      // If we found a new target, use it (it's already the closest)
-      if (newTargetIndex >= 0) {
-        // Always switch to the closest target found, unless current is very close and committed
-        if (activeTargetIndex >= 0 && 
-            activeTargetIndex < 4 &&
-            activeTargetIndex != newTargetIndex) {
-          float currentDist = zombieDistances[activeTargetIndex];
-          float newDist = zombieDistances[newTargetIndex];
-          
-          // Only keep current target if it's very close AND within commit time
-          bool keepCurrent = (currentDist < MIN_COMMIT_DISTANCE && 
-                             targetCommitTime > 0 &&
-                             (millis() - targetCommitTime) < MIN_TARGET_COMMIT_TIME &&
-                             newDist >= (currentDist - 0.01));  // New must be at least 1% closer to switch
-          
-          if (!keepCurrent) {
-            // Switch to new target (it's closer or current is far)
-            activeTargetIndex = newTargetIndex;
-            closestZombieDist = newClosestDist;
-          }
-        } else {
-          // No current target or same target - use new target
-          activeTargetIndex = newTargetIndex;
-          closestZombieDist = newClosestDist;
-        }
-      } else {
-        // No new target found - clear current if it's no longer valid
-        if (activeTargetIndex >= 0 && 
-            activeTargetIndex < 4 &&
-            ProxSensors[activeTargetIndex].direction != FORWARD) {
-          activeTargetIndex = -1;
-        }
+      // Update target if we should switch
+      if (shouldSwitchTarget && newTargetIndex >= 0) {
+        activeTargetIndex = newTargetIndex;
+        closestZombieDist = newClosestDist;
+        // Update commit time when switching targets
+        targetCommitTime = millis();
+      } else if (activeTargetIndex >= 0 && currentTargetStillValid) {
+        // Keep current target - don't update commit time (maintain commitment)
+        // This ensures we stay focused on one target when multiple are approaching
       }
       
       if (activeTargetIndex >= 0) {
@@ -890,17 +888,23 @@ void runStateMachine() {
           }
         }
 
-        // Check for closer threat - be more responsive to closer targets
-        // Check even if we're close to current target (but allow override)
+        // Check for closer threat - but be more conservative when committed to a target
+        // Only switch if threat is MUCH closer to prevent switching between multiple approaching targets
         for (int i = 0; i < 4; i++) {
           if (i != activeTargetIndex &&
               (ProxSensors[i].direction == FORWARD || 
                (zombieDistances[i] < 0.60 && ProxSensors[i].direction != BACKWARD))) {
             float currentDist = zombieDistances[activeTargetIndex];
             float threatDist = zombieDistances[i];
-            // Switch if threat is significantly closer (reduced threshold)
-            if (threatDist < (currentDist - 0.10)) {  // Reduced threshold for more responsiveness
-              // Closer threat detected - switch
+            
+            // Require threat to be at least 25% closer to switch (increased threshold)
+            // This prevents switching when multiple targets are approaching at similar distances
+            bool isMuchCloser = (threatDist < (currentDist - 0.25));
+            // Also allow switch if current is far and threat is much closer
+            bool isFarButThreatMuchCloser = (currentDist > 0.50 && threatDist < (currentDist - 0.20));
+            
+            if (isMuchCloser || isFarButThreatMuchCloser) {
+              // Much closer threat detected - switch
               currentState = CHOOSE_ACTIVE_TARGET;
               break;
             }
