@@ -1071,17 +1071,6 @@ void loop() {
   computeVelocity();
   updateSensors();
   
-  for (int i = 0; i < 4; i++) {
-    const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
-    if (range != 0.0f) {
-      zombieDistances[i] = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
-    } else {
-      // Defensive fallback to avoid divide-by-zero if calibration data is bad
-      zombieDistances[i] = 1.0f;
-    }
-    zombieDistances[i] = constrain(zombieDistances[i], 0.0, 1.0);
-  }
-  
   if (millis() - lastTTIUpdate >= TTI_UPDATE_INTERVAL) {
     updateTTI();
     lastTTIUpdate = millis();
@@ -2046,6 +2035,15 @@ void updateSensors() {
     ProxSensors[i].currVal = alpha * ProxSensors[i].currVal + (1.0 - alpha) * rawVal;
     ProxSensors[i].smoothVal = velocityAlpha * ProxSensors[i].smoothVal + (1.0 - velocityAlpha) * rawVal;
 
+    // Compute current distance using calibrated range so direction checks use latest data
+    const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
+    float currentDistance = 1.0f;
+    if (range != 0.0f) {
+      currentDistance = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
+    }
+    currentDistance = constrain(currentDistance, 0.0f, 1.0f);
+    zombieDistances[i] = currentDistance;
+
     // Derive sensor-specific noise limit rather than sharing across lanes
     int sensorNoiseLimit = (ProxSensors[i].currVal >= noiseThreshold) ? upperNoiseLimit : lowerNoiseLimit;
 
@@ -2087,12 +2085,12 @@ void updateSensors() {
       if (fastMovement) {
         // Fast backward movement - detect quickly
         backwardThreshold = 2;
-      } else if (zombieDistances[i] < 0.15) {
+      } else if (currentDistance < 0.15f) {
         // Very close to wall - likely bouncing back
         backwardThreshold = 2;
-      } else if (zombieDistances[i] < 0.30) {
+      } else if (currentDistance < 0.30f) {
         backwardThreshold = 3;
-      } else if (zombieDistances[i] < 0.50) {
+      } else if (currentDistance < 0.50f) {
         backwardThreshold = 2;
       }
       
@@ -2103,7 +2101,7 @@ void updateSensors() {
     
     // NOISE FILTER: Ignore targets below 15% that aren't clearly forward
     // This prevents false locks on sensor noise
-    if (zombieDistances[i] > 0.85 && ProxSensors[i].direction == FORWARD) {
+    if (currentDistance > 0.85f && ProxSensors[i].direction == FORWARD) {
       // Very low signal - require stronger evidence
       if (ProxSensors[i].forwardCount < 3) {
         ProxSensors[i].direction = STOPPED;
