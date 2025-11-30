@@ -1,6 +1,35 @@
-// ME350 Zombie Defense - HYBRID MODE v9
+// ME350 Zombie Defense - HYBRID MODE v12
 // EARLY ENGAGEMENT: Hit zombies at lane start
 // DYNAMIC CALIBRATION: Auto-find lane ranges first few seconds
+//
+// PERFORMANCE OPTIMIZATIONS:
+// - Cached encoder position: Read once per loop (5ms cache) to avoid redundant reads
+// - Cached critical status: Pre-calculate lane critical status (10ms cache) 
+// - Cached lane types: Pre-computed short/long lane flags (L2/L3 short, L1/L4 long)
+// - Reduced redundant calculations: Use cached values in override checks and batch calculations
+// - Optimized position calculations: Use cached encoder in PID, movement, and travel time functions
+//
+// IMPROVED DWELL LOGIC (v10):
+// - Attempted lanes tracking: Once a lane is attempted, it won't be re-engaged for 1 second (reduced from 3s)
+// - More persistent dwell: Increased dwell times (400ms min, 800ms normal, 1800ms max, 2200ms L4)
+// - Better STOP handling: Only exits on STOP after 800ms+ of persistence and 500ms confirmed stopped
+// - Prevents override loops: Override logic now checks attempted lanes to avoid loops
+// - Cooldown-based reset: Attempted lanes automatically reset after cooldown period expires
+//
+// CRITICAL FIXES (v11) - Prevents Missing Targets in L2/L3:
+// - Extremely conservative GONE thresholds: L2/L3 at 95%+ (only 5% remaining), L1 at 92%, L4 at 90%
+// - Don't mark as attempted on arrival - only mark after successful hit or timeout
+// - Reset attempted flag when GONE - allows immediate re-engagement if new zombie appears
+// - Rate-limited batch recalculation - prevents excessive recalculations causing missed targets
+// - Stricter GONE validation - requires retreating OR consistently far for 3x min dwell time
+// - Never mark short lanes as GONE unless truly unreachable (95%+ AND retreating/extended time)
+//
+// CRITICAL FIX (v12) - Prevents L2/L3 Impact While Dwelling at Other Lanes:
+// - Override checking INSIDE dwellAtTarget() - continuously monitors for critical threats while dwelling
+// - More aggressive override for short lanes: L2/L3 can override long lanes when < 25% distance (75%+ remaining)
+// - No cooldown restrictions while dwelling - checks every 100ms to catch critical threats immediately
+// - Fixed override logic in shouldOverride() - allows short lanes to override when getting close (< 20% distance)
+// - Priority system: Short lanes at critical distance override long lanes even if long lane is not critical
 
 #include <Encoder.h>
 #include <EEPROM.h>
@@ -91,9 +120,23 @@ const int travelTimeMatrix[4][4] = {
   {        328,  252,  179,    0 }    // L4 to others
 };
 
+//============================================
+// CACHED VALUES FOR EFFICIENCY (DECLARED EARLY FOR USE IN FUNCTIONS)
+//============================================
+long cachedEncoderPos = 0;              // Cache encoder position (updated each loop)
+unsigned long lastEncoderRead = 0;      // Track when encoder was last read
+const unsigned long ENCODER_CACHE_INTERVAL = 5;  // Update encoder cache every 5ms max
+bool laneIsCritical[4] = {false, false, false, false};  // Cache critical status per lane
+bool laneIsShort[4] = {false, true, true, false};       // Cache lane type (L2/L3 are short)
+bool laneIsLong[4] = {true, false, false, true};        // Cache lane type (L1/L4 are long)
+unsigned long lastCriticalUpdate = 0;   // Track when critical status was last updated
+const unsigned long CRITICAL_UPDATE_INTERVAL = 10;  // Update critical status every 10ms
+
 // Get dynamic travel time from current position to target lane
+// OPTIMIZATION: Uses cached encoder position for efficiency
 int getDynamicTravelTime(int targetLane) {
-  long currentPos = encoder.read();
+  // OPTIMIZATION: Use cached encoder position instead of reading again
+  long currentPos = cachedEncoderPos;
   
   // Find which lane we're closest to (or between)
   int closestLane = 0;
@@ -139,20 +182,45 @@ const int SHORT_LANE_BOOST = 150;  // Give L2/L3 150ms "head start" - balanced
 
 //============================================
 // EARLY ENGAGEMENT THRESHOLDS
-// Now we engage zombies as soon as they appear!
+// LANE-SPECIFIC: L2/L3 are SHORTER - need MUCH earlier engagement!
 //============================================
-const float EARLY_ENGAGE_THRESHOLD = 0.85;   // Engage when zombie at 85% (just appeared)
-const float MIN_ENGAGE_THRESHOLD = 0.10;     // Don't engage if below 10% for normal targeting
+// Lane-specific engagement thresholds
+// L2/L3: Engage at 95%+ (very early) since they're short lanes
+// L1/L4: Engage at 92% (still early but longer lanes give more time)
+const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.92, 0.92};   // L1, L4
+const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.95, 0.95}; // L2, L3 - MUCH earlier!
+const float MIN_ENGAGE_THRESHOLD = 0.05;     // Don't engage if below 5% (allows closer for emergency before impact)
+
+// Get lane-specific engagement threshold
+float getEarlyEngageThreshold(int lane) {
+  if (lane == 1 || lane == 2) {  // L2 or L3 (short lanes)
+    return EARLY_ENGAGE_THRESHOLD_SHORT[lane == 1 ? 0 : 1];
+  } else {  // L1 or L4 (long lanes)
+    return EARLY_ENGAGE_THRESHOLD_LONG[lane == 0 ? 0 : 1];
+  }
+}
 
 // Override thresholds - LANE SPECIFIC!
-// L2/L3 are SHORT lanes - override must trigger EARLIER (at higher distance %)
-const float OVERRIDE_THRESHOLD[4] = {0.08, 0.12, 0.12, 0.08};  // TIGHT thresholds - only TRUE emergencies (92%/88%)
-const float ABSOLUTE_OVERRIDE_DISTANCE = 0.10;  // Fallback for L1/L4
+// TIGHTER CRITERIA: Require targets to be much closer before overriding
+// This prevents excessive target switching while moving
+// L2/L3 are SHORT lanes - override must trigger MUCH EARLIER (at higher distance %)
+// L1/L4 also need earlier overrides when critical to prevent misses
+// These are CRITICAL - game ends if zombie reaches wall!
+const float OVERRIDE_THRESHOLD[4] = {0.10, 0.15, 0.15, 0.10};  // TIGHTER: L1/L4 at 10%, L2/L3 at 15% = CRITICAL!
+const float ABSOLUTE_OVERRIDE_DISTANCE = 0.08;  // TIGHTER: Fallback emergency override (was 0.10)
+const float SHORT_LANE_CRITICAL_DISTANCE = 0.20;  // TIGHTER: L2/L3 at 20% = game-ending threat! (was 0.25)
+const float LONG_LANE_CRITICAL_DISTANCE = 0.15;  // TIGHTER: L1/L4 at 15% = critical (was 0.20)
 
 // Retreat detection - Lane 4 needs more tolerance due to longer travel
 const float RETREAT_CONFIRMED_DISTANCE = 0.35;
-const float ZOMBIE_GONE_DISTANCE = 0.65;        // Raised from 0.60
-const float L4_GONE_DISTANCE = 0.75;            // Lane 4 specific - even more tolerant
+// CRITICAL FIX: Much more conservative GONE thresholds - zombies should only be marked gone when truly unreachable
+// CRITICAL FIX: Impact occurs when zombie is FAR from proximity sensors (sensors at start of lane)
+// For normalized distance: 0.0 = at start (close to sensors), 1.0 = at impact (far from sensors)
+// So 1.0 = at impact (urgent!), 0.0 = at start
+// For short lanes (L2/L3), we must be EXTREMELY conservative since they can end the game
+const float ZOMBIE_GONE_DISTANCE = 0.92;        // CRITICAL: Only mark gone at 92%+ of lane (8% remaining)
+const float L2_L3_GONE_DISTANCE = 0.95;         // CRITICAL: Short lanes (L2/L3) - extremely conservative at 95%+ (5% remaining)
+const float L4_GONE_DISTANCE = 0.90;            // CRITICAL: Lane 4 - conservative at 90%+ (10% remaining)
 
 //============================================
 // DYNAMIC CALIBRATION
@@ -195,7 +263,7 @@ ProxSensor ProxSensors[4];
 const float alpha = 0.75;           // Lowered from 0.85 - much faster response (25% new data)
 const float velocityAlpha = 0.70;   // Lowered from 0.80 - faster velocity tracking  
 const int stopTimeout = 80;         // Lowered from 100 - faster STOPPED detection
-int noiseLimit = 6;                 // Lowered from 8
+// Noise thresholds are derived per-sensor during updates to avoid cross-lane coupling.
 const int lowerNoiseLimit = 5;      // Lowered from 6
 const int upperNoiseLimit = 8;      // Lowered from 10
 const int noiseThreshold = 225;
@@ -252,6 +320,7 @@ int batchSize = 0;                       // How many targets in current batch
 int batchIndex = 0;                      // Current position in batch
 unsigned long batchStartTime = 0;        // When current batch was created
 bool batchActive = false;                // Is a batch currently being executed?
+bool batchLocked = false;                // Is batch sequence locked? (stick to sequence)
 
 // Anti-consecutive-lane tracking
 int lastHitLane = -1;                    // Last lane we successfully hit
@@ -259,9 +328,25 @@ unsigned long lastHitTime = 0;           // When we hit it
 int consecutiveSameLane = 0;             // How many times we've hit same lane consecutively
 const int MAX_CONSECUTIVE_SAME = 2;      // Max times to hit same lane before forcing rotation
 
+// ATTEMPTED LANES TRACKING - Prevent re-engaging lanes already attempted
+bool laneAttempted[4] = {false, false, false, false};  // Track which lanes we've already attempted
+unsigned long laneAttemptTime[4] = {0, 0, 0, 0};       // When we attempted each lane
+const unsigned long ATTEMPT_COOLDOWN = 1000;           // CRITICAL FIX: Reduced from 3s to 1s - allow faster re-engagement
+
 // Batch statistics for debugging
 int batchesCompleted = 0;
 int batchesReset = 0;
+
+// Cooldown tracking to prevent spam and rapid retries
+unsigned long lastSkipMessageTime = 0;
+unsigned long lastBatchSkipTime = 0;
+int lastSkippedLane = -1;
+const unsigned long SKIP_MESSAGE_COOLDOWN = 2000;  // Only print skip message every 2 seconds
+const unsigned long BATCH_SKIP_COOLDOWN = 500;     // Wait 500ms before retrying after skip
+
+// CRITICAL FIX: Rate limit batch recalculation to prevent excessive recalculations
+unsigned long lastBatchRecalcTime = 0;
+const unsigned long BATCH_RECALC_COOLDOWN = 300;   // Minimum 300ms between batch recalculations
 
 //============================================
 // DWELL TRACKING
@@ -270,7 +355,7 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 1.0;
 float arrivalZombieDistance = 1.0;
 
-const unsigned long MIN_DWELL_TIME = 250;       // FASTER - reduced from 400
+const unsigned long MIN_DWELL_TIME = 400;       // IMPROVED: Increased for better persistence (was 250)
 
 //============================================
 // ANALYSIS MODE - Lane Priority Tracking
@@ -284,9 +369,9 @@ int cycleHitCount[4] = {0,0,0,0};    // Hits per lane in current cycle
 int cycleMissCount[4] = {0,0,0,0};   // Misses per lane in current cycle (reached wall)
 float lanePriorityScores[4];         // Calculated priority scores at decision time
 int priorityOrder[4];                // Lane order by priority (highest first)
-const unsigned long NORMAL_DWELL_TIME = 500;   // FASTER - reduced from 800
-const unsigned long MAX_DWELL_TIME = 1200;     // FASTER - reduced from 2000
-const unsigned long L4_DWELL_TIME = 1800;      // FASTER - reduced from 2500
+const unsigned long NORMAL_DWELL_TIME = 800;   // IMPROVED: Increased for better persistence (was 500)
+const unsigned long MAX_DWELL_TIME = 1800;     // IMPROVED: Increased for better persistence (was 1200)
+const unsigned long L4_DWELL_TIME = 2200;      // IMPROVED: Increased for better persistence (was 1800)
 
 const unsigned long BACKWARD_CONFIRM_TIME = 40;  // FASTER - reduced from 60
 unsigned long backwardStartTime = 0;
@@ -332,6 +417,7 @@ int getDynamicTravelTime(int targetLane);
 float getEffectiveTTI(int lane);
 bool canReachInTime(int lane);
 float calculateThreatScore(int lane);
+float getEarlyEngageThreshold(int lane);
 void commitToTarget(int lane);
 void releaseCommitment();
 bool shouldOverride(int newLane);
@@ -341,6 +427,8 @@ int getNextFromQueue();
 void updatePendingQueue();
 void updateCalibration();
 void applyCalibration();
+void stopMotor();
+void setMotorVoltage(float voltage);
 // Analysis mode functions
 void resetAnalysisCycle();
 void recordTargetSelection(int lane);
@@ -524,22 +612,142 @@ void commitToTarget(int lane) {
   
   float dist = zombieDistances[lane];
   
+  // CRITICAL: Never commit to backward-moving targets - they're retreating!
+  if (ProxSensors[lane].direction == BACKWARD) {
+    return;
+  }
+  
   // For normal targeting, reject if outside range
   // But for emergencies (very close + forward), allow it
   bool isEmergency = (dist < ABSOLUTE_OVERRIDE_DISTANCE && ProxSensors[lane].direction == FORWARD);
   
   if (!isEmergency) {
-    // Normal targeting rules
-    if (dist > EARLY_ENGAGE_THRESHOLD || dist < MIN_ENGAGE_THRESHOLD) {
+    // Normal targeting rules - use lane-specific threshold
+    float laneThreshold = getEarlyEngageThreshold(lane);
+    if (dist > laneThreshold || dist < MIN_ENGAGE_THRESHOLD) {
       return;
     }
     // Reject if not moving forward (unless very close emergency)
     if (ProxSensors[lane].direction != FORWARD) {
       return;
     }
-  }
+    
+    // BATCH LOCK CHECK: If batch is locked, only allow breaking sequence for:
+    // 1. Backward-moving targets (already rejected above)
+    // 2. Significantly closer targets (emergency override)
+    if (batchLocked && batchActive && committedLane >= 0) {
+    // Check if this lane is in the current batch sequence
+    bool isInBatch = false;
+    for (int i = 0; i < batchSize; i++) {
+      if (targetBatch[i] == lane) {
+        isInBatch = true;
+        break;
+      }
+    }
+    
+    // If not in batch sequence, only allow if significantly closer OR has high velocity
+    if (!isInBatch) {
+      float committedDist = zombieDistances[committedLane];
+      float distanceGap = dist - committedDist;  // Negative if new is closer
+      
+      // Check velocity - fast-moving targets need earlier engagement
+      float velocity = abs(zombieVelocities[lane]);
+      bool isFastMoving = (velocity > 0.0005);  // Fast moving if velocity > threshold
+      float effectiveTTI = getEffectiveTTI(lane);
+      bool isUrgent = (effectiveTTI < 800);  // Urgent if TTI is low
+      
+      // OPTIMIZATION: Use cached critical status instead of recalculating
+      // CRITICAL: ALL lanes can be critical when close to impact!
+      // L2/L3 are SHORT lanes - game ends if zombie reaches wall!
+      // L1/L4 also need to break batches when critical to prevent misses!
+      bool isCritical = laneIsCritical[lane];
+      bool isDangerous = false;
+      
+      // Calculate dangerous status (not cached since it's less frequently used)
+      if (laneIsShort[lane]) {
+        isDangerous = (dist < 0.40);  // At 40% or less for short lanes
+      } else {
+        isDangerous = (dist < 0.35);  // At 35% or less for long lanes
+      }
+      
+      // OPTIMIZATION: Use cached critical status for committed lane
+      bool committedIsCritical = (committedLane >= 0) ? laneIsCritical[committedLane] : false;
+      
+      // TIGHTER CRITERIA: Break batch sequence only if:
+      // 1. New target is MUCH closer (larger gap required)
+      // 2. OR new target is critical AND committed is NOT critical (priority override)
+      // 3. OR new target is fast-moving AND significantly closer (accounts for momentum)
+      // 4. OR new target has very low TTI AND much closer (emergency)
+      // TIGHTER: Require larger distance gaps to prevent excessive switching
+      // OPTIMIZATION: Use cached lane type
+      float breakThreshold = laneIsShort[lane] ? -0.20 : -0.25;  // TIGHTER: Require 20-25% closer (was 10-12%)
+      
+      bool shouldBreak = (distanceGap < breakThreshold) ||  // Much closer (tighter threshold)
+                         (isCritical && !committedIsCritical) ||  // Critical target vs non-critical = ALWAYS break!
+                         (isFastMoving && distanceGap < -0.15 && dist < 0.50) ||  // TIGHTER: Fast and much closer (was -0.10, 0.60)
+                         (isUrgent && distanceGap < -0.10 && dist < 0.40);  // TIGHTER: Urgent AND much closer (was just < 0)
+      
+      if (!shouldBreak) {
+        // Stick to batch sequence
+        return;
+      }
+    }
+    // If lane IS in batch, allow commit (will be validated by batch order)
+    }
+    
+    // PRIORITY CHECK: Don't commit to a far lane if closer forward-moving lanes exist
+    // This prevents going to distant zombies when closer ones are available
+    // BUT: Respect batch lock - if batch is locked, only apply this to non-batch lanes
+    // CRITICAL: ANY lane at critical distance can ALWAYS break priority check
+    // OPTIMIZATION: Use cached critical status
+    bool isCritical = laneIsCritical[lane];
+    
+    if (!batchLocked || !batchActive || committedLane < 0 || isCritical) {
+      float closestDist = 1.0;
+      int closestLane = -1;
+      
+      for (int i = 0; i < 4; i++) {
+        // Only consider forward-moving targets in valid range - use lane-specific threshold
+        if (i != lane && 
+            ProxSensors[i].direction == FORWARD &&
+            zombieDistances[i] < getEarlyEngageThreshold(i) &&
+            zombieDistances[i] > MIN_ENGAGE_THRESHOLD) {
+          if (zombieDistances[i] < closestDist) {
+            closestDist = zombieDistances[i];
+            closestLane = i;
+          }
+        }
+      }
+      
+      // If there's a closer forward-moving target, only commit to far lane if it's not much further
+      // EXCEPTION: ANY lane at critical distance can override this (game-ending threat!)
+      if (closestLane >= 0 && closestDist < dist && !isCritical) {
+        float distanceGap = dist - closestDist;
+        
+        // TIGHTER CRITERIA: If the gap is large, prefer the closer target
+        // Require larger gaps to prevent switching to slightly closer targets
+        // For L2/L3, use smaller gap since they're shorter lanes, but still tighter
+        // OPTIMIZATION: Use cached lane type
+        float gapThreshold = laneIsShort[lane] ? 0.15 : 0.20;  // TIGHTER: Require 15-20% gap (was 10-12%)
+        if (distanceGap > gapThreshold && closestDist < 0.50) {
+          return;  // Reject - closer target exists
+        }
+      }
+    }
+  }  // End of !isEmergency block
   
   isCommitted = true;
+  
+  // LOCK BATCH: Once we commit to first target in a batch, lock the sequence
+  if (batchActive && !batchLocked && batchSize > 0) {
+    // Check if this lane is the first target in the batch
+    if (targetBatch[0] == lane) {
+      batchLocked = true;
+      if (analysisMode) {
+        Serial.println(F("[BATCH] Sequence LOCKED - sticking to batch order"));
+      }
+    }
+  }
   committedLane = lane;
   commitStartTime = millis();
   commitStartDistance = zombieDistances[lane];
@@ -590,32 +798,88 @@ bool shouldOverride(int newLane) {
   float newDist = zombieDistances[newLane];
   float committedDist = zombieDistances[committedLane];
   
+  // OPTIMIZATION: Use cached encoder position
   // Calculate how close we are to our target position
-  long currentPos = encoder.read();
+  long currentPos = cachedEncoderPos;
   int distToTarget = abs(currentPos - targetPositions[committedLane]);
   bool atTarget = (distToTarget < 50);        // Already at target
   bool nearingTarget = (distToTarget < 300);  // Within 300 ticks
+  bool activelyMoving = (distToTarget > 100);  // More than 100 ticks away = actively moving
   
-  // RULE 1: If we're AT the target (dwelling), only override for EXTREME emergency (<5%)
+  // CRITICAL FIX: If we're AT the target (dwelling), allow overrides for critical threats
+  // Especially allow short lanes (L2/L3) to override when they're getting close
   if (atTarget && ProxSensors[committedLane].direction == FORWARD) {
-    return newDist < 0.05;  // 95%+ on display
+    bool newIsShortLane = laneIsShort[newLane];
+    bool committedIsLongLane = laneIsLong[committedLane];
+    bool newIsCritical = laneIsCritical[newLane];
+    
+    // CRITICAL FIX: Distance is normalized where 0.0 = at impact, 1.0 = far
+    // So LOW distance values mean close to impact (urgent!)
+    // We want to override when distance is LOW (close to impact)
+    
+    // PRIORITY 1: Short lane getting close while dwelling at long lane = override immediately
+    if (newIsShortLane && committedIsLongLane) {
+      // Override if short lane is at < 20% distance (80%+ remaining, getting very close) or critical
+      if (newDist < 0.20 || newIsCritical) {
+        return true;
+      }
+    }
+    
+    // PRIORITY 2: Any critical threat while dwelling = override
+    if (newIsCritical) {
+      return true;
+    }
+    
+    // PRIORITY 3: Any lane at < 15% distance (85%+ remaining, very close to impact) = override
+    if (newDist < 0.15) {
+      return true;
+    }
+    
+    // PRIORITY 4: Extreme emergency (< 5% distance = 95%+ remaining)
+    if (newDist < 0.05) {
+      return true;
+    }
+    
+    // Otherwise, don't override while dwelling (prevent excessive switching)
+    return false;
   }
   
-  // RULE 2: If we're nearing target and committed lane still needs attention,
+  // RULE 2: TIGHTER - If we're actively moving to target, be VERY restrictive
+  // Only override for truly critical emergencies to prevent excessive switching
+  if (activelyMoving && ProxSensors[committedLane].direction == FORWARD) {
+    // OPTIMIZATION: Use cached critical status instead of recalculating
+    // Check if new target is critical (game-ending threat)
+    bool newIsCritical = laneIsCritical[newLane];
+    bool committedIsCritical = (committedLane >= 0) ? laneIsCritical[committedLane] : false;
+    
+    // Only override if:
+    // 1. New is critical AND committed is NOT critical (game-ending threat vs non-critical)
+    // 2. OR new is critical AND much closer (at least 30% closer)
+    if (newIsCritical && !committedIsCritical) {
+      return true;  // Critical vs non-critical = override
+    }
+    if (newIsCritical && committedIsCritical && newDist < committedDist * 0.7) {
+      return true;  // Critical and much closer
+    }
+    // Otherwise, don't override while moving - stick to current target
+    return false;
+  }
+  
+  // RULE 3: If we're nearing target and committed lane still needs attention,
   // only override if new lane is MUCH more critical
   if (nearingTarget && committedDist < 0.40 && 
       ProxSensors[committedLane].direction == FORWARD) {
-    // New must be at least 2x closer than committed to justify switch
-    return newDist < committedDist * 0.4;
+    // TIGHTER: New must be at least 3x closer than committed to justify switch (was 2x)
+    return newDist < committedDist * 0.3;
   }
   
-  // RULE 3: General case - only override if new target is at TRUE emergency level
+  // RULE 4: General case - only override if new target is at TRUE emergency level
   // AND is significantly more urgent than committed
   float threshold = OVERRIDE_THRESHOLD[newLane];
   if (newDist < threshold) {
-    // If committed is still a threat, new must be MUCH more critical
+    // TIGHTER: If committed is still a threat, new must be MUCH more critical
     if (committedDist < 0.25 && ProxSensors[committedLane].direction == FORWARD) {
-      return newDist < committedDist * 0.5;
+      return newDist < committedDist * 0.4;  // TIGHTER: Must be 2.5x closer (was 2x = 0.5)
     }
     return true;
   }
@@ -653,7 +917,9 @@ int getBestTarget() {
     if (ProxSensors[i].direction != FORWARD) continue;
     
     float dist = zombieDistances[i];
-    if (dist < MIN_ENGAGE_THRESHOLD || dist > EARLY_ENGAGE_THRESHOLD) continue;
+    // Use lane-specific threshold - L2/L3 engage earlier
+    float laneThreshold = getEarlyEngageThreshold(i);
+    if (dist < MIN_ENGAGE_THRESHOLD || dist > laneThreshold) continue;
     
     float score = calculateThreatScore(i);
     if (score > bestScore) {
@@ -686,6 +952,15 @@ int getBestTarget() {
 
 // Calculate and create a new target batch
 void calculateNewBatch() {
+  // CRITICAL FIX: Rate limit batch recalculation to prevent excessive recalculations
+  // This prevents the system from constantly recalculating and missing targets
+  unsigned long now = millis();
+  if (lastBatchRecalcTime > 0 && (now - lastBatchRecalcTime) < BATCH_RECALC_COOLDOWN) {
+    // Still in cooldown - don't recalculate yet
+    return;
+  }
+  lastBatchRecalcTime = now;
+  
   // Clear existing batch
   for (int i = 0; i < 4; i++) {
     targetBatch[i] = -1;
@@ -708,9 +983,29 @@ void calculateNewBatch() {
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
     lanes[i].distance = zombieDistances[i];
-    lanes[i].isActive = (ProxSensors[i].direction == FORWARD && 
-                         lanes[i].distance < EARLY_ENGAGE_THRESHOLD &&
-                         lanes[i].distance > MIN_ENGAGE_THRESHOLD);
+    
+    // CRITICAL: Only include forward-moving targets - exclude backward/stoppe
+    // Backward-moving targets are retreating and should NEVER be in batches
+    // Use lane-specific threshold - L2/L3 engage much earlier
+    // IMPROVED: Exclude lanes that have already been attempted (within cooldown)
+    bool isForwardMoving = (ProxSensors[i].direction == FORWARD);
+    float laneThreshold = getEarlyEngageThreshold(i);
+    bool isInRange = (lanes[i].distance < laneThreshold &&
+                      lanes[i].distance > MIN_ENGAGE_THRESHOLD);
+    
+    // IMPROVED: Check if lane was recently attempted - exclude if within cooldown
+    bool recentlyAttempted = false;
+    if (laneAttempted[i]) {
+      unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
+      if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
+        recentlyAttempted = true;
+      } else {
+        // Cooldown expired - reset attempted flag
+        laneAttempted[i] = false;
+      }
+    }
+    
+    lanes[i].isActive = (isForwardMoving && isInRange && !recentlyAttempted);
     
     if (lanes[i].isActive) {
       lanes[i].effectiveTTI = getEffectiveTTI(i);
@@ -731,6 +1026,10 @@ void calculateNewBatch() {
       activeLanes++;
     } else {
       lanes[i].effectiveTTI = 99999;
+      // Mark as inactive if backward-moving (even if in range)
+      if (!isForwardMoving) {
+        lanes[i].isActive = false;
+      }
     }
   }
   
@@ -754,20 +1053,69 @@ void calculateNewBatch() {
     // If it's the same lane we've been hitting repeatedly, skip this batch
     if (activeLane == lastHitLane && millis() - lastHitTime < 1000) {
       batchActive = false;
-      if (analysisMode) {
+      
+      // Rate-limited skip message - only print once per cooldown period
+      unsigned long now = millis();
+      bool shouldPrint = (now - lastSkipMessageTime >= SKIP_MESSAGE_COOLDOWN) || 
+                         (lastSkippedLane != activeLane);
+      
+      if (analysisMode && shouldPrint) {
         Serial.print(F("[BATCH] Skipping L"));
         Serial.print(activeLane + 1);
         Serial.println(F(" - hit too many times, waiting for others"));
+        lastSkipMessageTime = now;
+        lastSkippedLane = activeLane;
       }
+      
+      // Record skip time for cooldown
+      lastBatchSkipTime = now;
       return;
     }
   }
   
-  // Sort lanes by effective TTI (lowest first = most urgent)
+  // Sort lanes by PRIORITY: 
+  // 1. CRITICAL: ANY lane at critical distance gets highest priority (game-ending threat!)
+  //    - L2/L3 at 25% or less = critical (short lanes)
+  //    - L1/L4 at 20% or less = critical (long lanes)
+  // 2. Distance (closer = lowest distance value = highest priority)
+  // 3. Effective TTI (lowest = most urgent) as tiebreaker
+  // This ensures we prioritize closer zombies AND critical targets in ALL lanes
   // Simple bubble sort for 4 elements
   for (int i = 0; i < 3; i++) {
     for (int j = i + 1; j < 4; j++) {
-      if (lanes[j].effectiveTTI < lanes[i].effectiveTTI) {
+      bool shouldSwap = false;
+      
+      // OPTIMIZATION: Use cached critical status instead of recalculating
+      // Check if lanes are critical based on their type
+      bool iIsCritical = laneIsCritical[lanes[i].lane];
+      bool jIsCritical = laneIsCritical[lanes[j].lane];
+      
+      // CRITICAL: Any lane at critical distance ALWAYS comes first
+      if (jIsCritical && !iIsCritical) {
+        shouldSwap = true;  // j is critical, i is not - swap
+      } else if (!jIsCritical && iIsCritical) {
+        shouldSwap = false;  // i is critical, j is not - don't swap
+      } else if (iIsCritical && jIsCritical) {
+        // Both critical - prioritize by distance (closer critical = higher priority)
+        if (lanes[j].distance < lanes[i].distance) {
+          shouldSwap = true;  // j is closer critical
+        }
+      } else {
+        // Both critical or both not - sort by distance
+        // Primary sort: by distance (closer = higher priority)
+        // Lower distance value = zombie is closer = should be targeted first
+        if (lanes[j].distance < lanes[i].distance) {
+          // Lane j is closer - higher priority
+          shouldSwap = true;
+        } else if (lanes[j].distance == lanes[i].distance) {
+          // Same distance - use TTI as tiebreaker (lower TTI = more urgent)
+          if (lanes[j].effectiveTTI < lanes[i].effectiveTTI) {
+            shouldSwap = true;
+          }
+        }
+      }
+      
+      if (shouldSwap) {
         LaneInfo temp = lanes[i];
         lanes[i] = lanes[j];
         lanes[j] = temp;
@@ -775,16 +1123,30 @@ void calculateNewBatch() {
     }
   }
   
-  // Build batch: Add each active lane ONCE in TTI order
+  // Build batch: Add each active lane ONCE in priority order (closest first)
   // NO DUPLICATES - each lane appears at most once per batch
   // LIMITED TO MAX_BATCH_SIZE (3) to allow time to reach all targets
+  // DOUBLE-CHECK: Ensure we never add backward-moving lanes to batch
   for (int i = 0; i < 4; i++) {
     if (lanes[i].isActive && batchSize < MAX_BATCH_SIZE) {
-      targetBatch[batchSize++] = lanes[i].lane;
+      int lane = lanes[i].lane;
+      
+      // Final safety check: Never add backward-moving lanes to batch
+      if (ProxSensors[lane].direction == FORWARD) {
+        targetBatch[batchSize++] = lane;
+      }
+      // If lane became backward since we checked, skip it
     }
   }
   
   batchActive = (batchSize > 0);
+  batchLocked = false;  // Batch not locked yet - will lock when first target is committed
+  
+  // Reset skip tracking on successful batch creation
+  if (batchActive) {
+    lastBatchSkipTime = 0;
+    lastSkippedLane = -1;
+  }
   
   // Debug output
   if (analysisMode && batchActive) {
@@ -794,7 +1156,7 @@ void calculateNewBatch() {
       Serial.print(targetBatch[i] + 1);
       if (i < batchSize - 1) Serial.print(F("->"));
     }
-    Serial.println();
+    Serial.println(F(" (sequence will be locked)"));
   }
 }
 
@@ -802,30 +1164,84 @@ void calculateNewBatch() {
 int getNextBatchTarget() {
   // If batch is empty or exhausted, calculate new one
   if (!batchActive || batchIndex >= batchSize) {
+    // Check cooldown - don't recalculate immediately after a skip
+    unsigned long now = millis();
+    if (lastBatchSkipTime > 0 && (now - lastBatchSkipTime) < BATCH_SKIP_COOLDOWN) {
+      // Still in cooldown period, return -1 without recalculating
+      return -1;
+    }
+    
     calculateNewBatch();
     if (!batchActive) return -1;
+    
+    // Reset skip cooldown on successful batch creation
+    if (batchActive) {
+      lastBatchSkipTime = 0;
+      lastSkippedLane = -1;
+    }
   }
   
   // Find next valid target in batch
   while (batchIndex < batchSize) {
     int lane = targetBatch[batchIndex];
     
-    // Check if this target is still valid (forward-moving, in range)
-    if (lane >= 0 && lane < 4 &&
-        ProxSensors[lane].direction == FORWARD &&
-        zombieDistances[lane] < EARLY_ENGAGE_THRESHOLD &&
-        zombieDistances[lane] > MIN_ENGAGE_THRESHOLD) {
+    // CRITICAL: Remove backward-moving lanes from batch - they're retreating!
+    // Also validate forward direction, range, and lane validity
+    // Use lane-specific threshold - L2/L3 have higher thresholds
+    bool isValid = (lane >= 0 && lane < 4);
+    bool isForward = (ProxSensors[lane].direction == FORWARD);
+    bool isBackward = (ProxSensors[lane].direction == BACKWARD);
+    float laneThreshold = getEarlyEngageThreshold(lane);
+    bool isInRange = (zombieDistances[lane] < laneThreshold &&
+                      zombieDistances[lane] > MIN_ENGAGE_THRESHOLD);
+    
+    // If target is backward-moving, remove it from batch entirely
+    if (isValid && isBackward) {
+      // Remove this lane from batch by shifting remaining elements
+      for (int i = batchIndex; i < batchSize - 1; i++) {
+        targetBatch[i] = targetBatch[i + 1];
+      }
+      batchSize--;
+      // Don't increment batchIndex - check the same position again (now has different lane)
+      continue;
+    }
+    
+    // IMPROVED: Check if lane was recently attempted - skip if within cooldown
+    bool recentlyAttempted = false;
+    if (laneAttempted[lane]) {
+      unsigned long timeSinceAttempt = millis() - laneAttemptTime[lane];
+      if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
+        recentlyAttempted = true;
+      } else {
+        // Cooldown expired - reset attempted flag
+        laneAttempted[lane] = false;
+      }
+    }
+    
+    // Check if this target is still valid (forward-moving, in range, not recently attempted)
+    if (isValid && isForward && isInRange && !recentlyAttempted) {
       batchIndex++;  // Move to next for next call
       return lane;
     }
     
-    // Target no longer valid, skip it
+    // Target no longer valid (stopped, out of range, or already attempted) - skip it
     batchIndex++;
   }
   
-  // Batch exhausted, calculate new one
+  // Batch exhausted, calculate new one (with cooldown check)
+  unsigned long now = millis();
+  if (lastBatchSkipTime > 0 && (now - lastBatchSkipTime) < BATCH_SKIP_COOLDOWN) {
+    return -1;
+  }
+  
   calculateNewBatch();
   if (!batchActive) return -1;
+  
+  // Reset skip cooldown on successful batch creation
+  if (batchActive) {
+    lastBatchSkipTime = 0;
+    lastSkippedLane = -1;
+  }
   
   // Return first target of new batch
   if (batchSize > 0) {
@@ -839,9 +1255,14 @@ int getNextBatchTarget() {
 // Reset the batch (called on emergency override or major change)
 void resetBatch() {
   batchActive = false;
+  batchLocked = false;  // Unlock batch on reset
   batchIndex = 0;
   batchSize = 0;
   batchesReset++;
+  
+  // Clear skip tracking on reset to allow immediate recalculation
+  lastBatchSkipTime = 0;
+  lastSkippedLane = -1;
   
   if (analysisMode) {
     Serial.println(F("[BATCH] Reset - recalculating"));
@@ -849,9 +1270,20 @@ void resetBatch() {
 }
 
 // Mark current batch target as complete (hit registered)
+// Also handles batch unlocking when sequence is complete
 void advanceBatch() {
-  // Already advanced in getNextBatchTarget, but check if batch complete
-  if (batchIndex >= batchSize) {
+  // Check if batch sequence is complete
+  if (batchIndex >= batchSize && batchLocked) {
+    batchesCompleted++;
+    batchLocked = false;  // Unlock batch when sequence complete
+    batchActive = false;
+    
+    if (analysisMode) {
+      Serial.print(F("[BATCH] Sequence complete #"));
+      Serial.print(batchesCompleted);
+      Serial.println(F(" - unlocking"));
+    }
+  } else if (batchIndex >= batchSize) {
     batchesCompleted++;
     batchActive = false;
     
@@ -872,7 +1304,7 @@ int checkBatchEmergency() {
     if (ProxSensors[i].direction != FORWARD) continue;
     
     // Emergency threshold - very close to wall
-    // Use lane-specific thresholds (L2/L3 at 15%, L1/L4 at 10%)
+    // Use lane-specific thresholds (L1/L4 at 15%, L2/L3 at 20%)
     if (zombieDistances[i] < OVERRIDE_THRESHOLD[i]) {
       return i;
     }
@@ -924,9 +1356,12 @@ void updatePendingQueue() {
       if (ProxSensors[lane].direction == BACKWARD) continue;
       
       // Keep if zombie present and moving forward
-      if (ProxSensors[lane].direction == FORWARD && 
-          zombieDistances[lane] < EARLY_ENGAGE_THRESHOLD) {
-        pendingQueue[newSize++] = lane;
+      // Use lane-specific threshold - L2/L3 engage earlier
+      if (ProxSensors[lane].direction == FORWARD) {
+        float laneThreshold = getEarlyEngageThreshold(lane);
+        if (zombieDistances[lane] < laneThreshold) {
+          pendingQueue[newSize++] = lane;
+        }
       }
     }
   }
@@ -1068,13 +1503,27 @@ void loop() {
   lastExecutionTime = micros();
   
   processSerialCommands();
+  
+  // OPTIMIZATION: Cache encoder position to avoid multiple reads
+  unsigned long now = millis();
+  if (now - lastEncoderRead >= ENCODER_CACHE_INTERVAL) {
+    cachedEncoderPos = encoder.read();
+    lastEncoderRead = now;
+  }
+  
   computeVelocity();
   updateSensors();
   
-  for (int i = 0; i < 4; i++) {
-    zombieDistances[i] = (ProxSensors[i].currVal - ProxRange[i][1]) / 
-                          (float)(ProxRange[i][0] - ProxRange[i][1]);
-    zombieDistances[i] = constrain(zombieDistances[i], 0.0, 1.0);
+  // OPTIMIZATION: Update cached critical status efficiently
+  if (now - lastCriticalUpdate >= CRITICAL_UPDATE_INTERVAL) {
+    for (int i = 0; i < 4; i++) {
+      if (laneIsShort[i]) {
+        laneIsCritical[i] = (zombieDistances[i] < SHORT_LANE_CRITICAL_DISTANCE);
+      } else {
+        laneIsCritical[i] = (zombieDistances[i] < LONG_LANE_CRITICAL_DISTANCE);
+      }
+    }
+    lastCriticalUpdate = now;
   }
   
   if (millis() - lastTTIUpdate >= TTI_UPDATE_INTERVAL) {
@@ -1104,8 +1553,27 @@ void loop() {
     float bestOverrideScore = 0;
     
     unsigned long timeSinceOverride = millis() - lastOverrideCommit;
-    // Longer cooldown between overrides to prevent rapid switching
-    bool canCheckOverride = (timeSinceOverride >= 600) && (millis() - overrideCheckTime >= 80);
+    // CRITICAL FIX: Allow override checks while dwelling - no cooldown restrictions
+    // While dwelling, we need to continuously check for critical threats (especially short lanes)
+    bool isDwelling = (state == DWELL_AT_TARGET);
+    bool canCheckOverride = false;
+    
+    if (isDwelling) {
+      // While dwelling: Check overrides every 100ms (no cooldown) to catch critical threats
+      canCheckOverride = (millis() - overrideCheckTime >= 100);
+    } else {
+      // While moving: Use cooldown to prevent excessive switching
+      canCheckOverride = (timeSinceOverride >= 1000) && (millis() - overrideCheckTime >= 150);
+      
+      // Don't check overrides while actively moving unless we've been moving for a while
+      // OPTIMIZATION: Use cached encoder position
+      long currentPos = cachedEncoderPos;
+      int distToTarget = abs(currentPos - targetPositions[committedLane]);
+      bool activelyMoving = (distToTarget > 100 && state == MOVE_TO_TARGET);
+      if (activelyMoving && timeSinceOverride < 2000) {
+        canCheckOverride = false;  // TIGHTER: Don't override while actively moving unless 2s has passed
+      }
+    }
     
     if (canCheckOverride) {
       overrideCheckTime = millis();
@@ -1113,12 +1581,75 @@ void loop() {
       for (int i = 0; i < 4; i++) {
         if (i == committedLane) continue;
         if (ProxSensors[i].direction != FORWARD) continue;
-        // Longer anti-return period
-        if (i == lastOverrideLane && timeSinceOverride < 1200) continue;
+        // TIGHTER: Longer anti-return period
+        if (i == lastOverrideLane && timeSinceOverride < 2000) continue;  // TIGHTER: 2s anti-return (was 1.2s)
         
-        // Use TIGHT OVERRIDE_THRESHOLD - only TRUE emergencies
-        if (zombieDistances[i] < OVERRIDE_THRESHOLD[i]) {
+        // IMPROVED: Don't override to lanes that have already been attempted recently
+        if (laneAttempted[i]) {
+          unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
+          if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
+            continue;  // Skip lanes attempted within cooldown period
+          }
+        }
+        
+        // OPTIMIZATION: Use cached critical status instead of recalculating
+        float dist = zombieDistances[i];
+        bool isCritical = laneIsCritical[i];
+        
+        // TIGHTER CRITERIA: Only override for truly critical threats
+        // OPTIMIZATION: Use cached critical status for committed lane
+        bool committedIsCritical = (committedLane >= 0) ? laneIsCritical[committedLane] : false;
+        
+        // CRITICAL FIX: More aggressive override criteria, especially for short lanes
+        // Short lanes (L2/L3) can end the game - must override aggressively when they're getting close
+        bool isShortLane = laneIsShort[i];
+        bool committedIsLongLane = (committedLane >= 0) ? laneIsLong[committedLane] : false;
+        
+        bool shouldOverride = false;
+        
+        // PRIORITY 1: Short lane getting close while committed to long lane = IMMEDIATE OVERRIDE
+        // CRITICAL FIX: Distance is LOW when close to impact (0.0 = impact, 1.0 = far)
+        // So check for LOW distance values, not HIGH ones
+        if (isShortLane && committedIsLongLane && dist < 0.25) {
+          // Short lane at < 25% distance (75%+ remaining, getting very close) while dwelling at long lane = override immediately
+          shouldOverride = true;
+        }
+        // PRIORITY 2: Critical vs non-critical = override
+        else if (isCritical && !committedIsCritical) {
+          shouldOverride = true;
+        }
+        // PRIORITY 3: Critical and much closer (at least 30% closer)
+        else if (isCritical && committedIsCritical && dist < zombieDistances[committedLane] * 0.7) {
+          shouldOverride = true;
+        }
+        // PRIORITY 4: Short lane getting close while long lane is at less urgent distance
+        // CRITICAL FIX: Check for LOW distance (close to impact), not HIGH
+        else if (isShortLane && dist < 0.30 && committedIsLongLane && zombieDistances[committedLane] > 0.20) {
+          // Short lane at < 30% distance (70%+ remaining) while long lane still has 20%+ distance = override
+          shouldOverride = true;
+        }
+        // PRIORITY 5: Below override threshold and committed is not critical
+        else if (dist < OVERRIDE_THRESHOLD[i] && !committedIsCritical) {
+          shouldOverride = true;
+        }
+        
+        if (shouldOverride) {
           float score = calculateThreatScore(i);
+          // OPTIMIZATION: Use cached lane type instead of recalculating
+          // Massive boost for short lanes getting close (LOW distance = close to impact)
+          if (isShortLane) {
+            if (dist < 0.15) {
+              score += 15000;  // Huge boost for short lanes at <15% distance (85%+ remaining, very close!)
+            } else if (dist < 0.20) {
+              score += 10000;  // Large boost for short lanes at <20% distance (80%+ remaining)
+            } else if (isCritical) {
+              score += 5000;  // Boost for critical short lanes
+            }
+          }
+          // Boost for any critical threat
+          else if (isCritical) {
+            score += 5000;
+          }
           if (score > bestOverrideScore) {
             bestOverrideScore = score;
             overrideLane = i;
@@ -1235,7 +1766,9 @@ void chooseAndCommitTarget() {
     if (ProxSensors[lane].direction != FORWARD) continue;
     
     float dist = zombieDistances[lane];
-    if (dist < MIN_ENGAGE_THRESHOLD || dist > EARLY_ENGAGE_THRESHOLD) continue;
+    // Use lane-specific threshold - L2/L3 engage earlier
+    float laneThreshold = getEarlyEngageThreshold(lane);
+    if (dist < MIN_ENGAGE_THRESHOLD || dist > laneThreshold) continue;
     
     float score = calculateThreatScore(lane);
     if (score > bestScore) {
@@ -1251,8 +1784,9 @@ void chooseAndCommitTarget() {
     
     float dist = zombieDistances[i];
     
-    // Skip if zombie is outside valid engagement range
-    if (dist < MIN_ENGAGE_THRESHOLD || dist > EARLY_ENGAGE_THRESHOLD) continue;
+    // Skip if zombie is outside valid engagement range - use lane-specific threshold
+    float laneThreshold = getEarlyEngageThreshold(i);
+    if (dist < MIN_ENGAGE_THRESHOLD || dist > laneThreshold) continue;
     
     float score = calculateThreatScore(i);
     
@@ -1290,8 +1824,65 @@ void chooseAndCommitTarget() {
 //============================================
 // CHOOSE AND COMMIT TARGET FROM BATCH
 // Uses the batch system for more predictable targeting
+// STICKS TO BATCH SEQUENCE when locked (groups of 3)
 //============================================
 void chooseAndCommitTargetFromBatch() {
+  // If batch is locked, ONLY get targets from the batch sequence
+  // Don't allow breaking sequence except for backward targets (handled in getNextBatchTarget)
+  if (batchLocked && batchActive) {
+    // Get next target from current batch sequence
+    int nextLane = getNextBatchTarget();
+    
+    if (nextLane >= 0) {
+      // Verify this lane is still valid (forward-moving, in range)
+      // Use lane-specific threshold
+      // IMPROVED: Also check if lane has already been attempted
+      float laneThreshold = getEarlyEngageThreshold(nextLane);
+      bool recentlyAttempted = false;
+      if (laneAttempted[nextLane]) {
+        unsigned long timeSinceAttempt = millis() - laneAttemptTime[nextLane];
+        if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
+          recentlyAttempted = true;
+        } else {
+          // Cooldown expired - reset attempted flag
+          laneAttempted[nextLane] = false;
+        }
+      }
+      
+      if (ProxSensors[nextLane].direction == FORWARD &&
+          zombieDistances[nextLane] < laneThreshold &&
+          zombieDistances[nextLane] > MIN_ENGAGE_THRESHOLD &&
+          !recentlyAttempted) {
+        // Target is valid - commit to it (batch sequence enforced)
+        commitToTarget(nextLane);
+        if (isCommitted) {
+          state = MOVE_TO_TARGET;
+        }
+        return;
+      } else {
+        // Target became invalid (backward or out of range) - remove from batch and continue
+        // getNextBatchTarget already handles this, so just get next one
+        nextLane = getNextBatchTarget();
+        if (nextLane >= 0) {
+          commitToTarget(nextLane);
+          if (isCommitted) {
+            state = MOVE_TO_TARGET;
+          }
+          return;
+        }
+      }
+    }
+    
+    // Batch exhausted but was locked - unlock and recalculate
+    if (batchIndex >= batchSize) {
+      batchLocked = false;
+      batchActive = false;
+      if (analysisMode) {
+        Serial.println(F("[BATCH] Sequence complete - unlocking"));
+      }
+    }
+  }
+  
   // Get next target from batch (will calculate new batch if needed)
   int nextLane = getNextBatchTarget();
   
@@ -1344,13 +1935,19 @@ void chooseAndCommitTargetFromBatch() {
 // MOVE TO TARGET
 //============================================
 void moveToTarget() {
-  long currentPos = encoder.read();
+  // OPTIMIZATION: Use cached encoder position
+  long currentPos = cachedEncoderPos;
   
   if (abs(currentPos - desiredPosition) <= TARGET_BAND) {
     arrivalTime = millis();
     if (activeTargetIndex >= 0) {
       peakZombieDistance = zombieDistances[activeTargetIndex];
       arrivalZombieDistance = zombieDistances[activeTargetIndex];
+      
+      // CRITICAL FIX: Don't mark as attempted on arrival - only mark after successful hit
+      // This allows the system to re-engage the same lane if the first attempt fails
+      // The attempted flag will be set only after a successful hit or timeout
+      // laneAttempted[activeTargetIndex] = true;  // REMOVED - only mark after hit/timeout
     }
     backwardStartTime = 0;
     
@@ -1377,6 +1974,95 @@ void dwellAtTarget() {
     return;
   }
   
+  // CRITICAL FIX: Check for emergency overrides while dwelling
+  // This prevents missing short lane targets (L2/L3) that are getting close while dwelling at long lanes
+  // Check continuously while dwelling - no cooldown restrictions
+  int overrideLane = -1;
+  float bestOverrideScore = 0;
+  
+  for (int i = 0; i < 4; i++) {
+    if (i == activeTargetIndex) continue;  // Skip committed lane
+    if (ProxSensors[i].direction != FORWARD) continue;  // Only forward-moving
+    
+    float dist = zombieDistances[i];
+    bool isShortLane = laneIsShort[i];
+    bool isLongLane = laneIsLong[i];
+    bool committedIsLongLane = laneIsLong[activeTargetIndex];
+    bool isCritical = laneIsCritical[i];
+    
+    // CRITICAL: Short lanes (L2/L3) can override long lanes (L1/L4) when getting close
+    // If we're dwelling at a long lane and a short lane is getting close, override immediately
+    bool shouldOverride = false;
+    
+    // CRITICAL FIX: Distance is normalized where 0.0 = at impact, 1.0 = far
+    // So LOW distance values mean close to impact (urgent!)
+    // If L3 shows "83%" remaining, distance = 0.17 (17% through lane, 83% remaining)
+    // We want to override when distance is LOW (close to impact)
+    
+    if (isShortLane && committedIsLongLane) {
+      // CRITICAL: Short lane can override long lane if getting close to impact
+      // Distance is normalized: 0.0 = at impact, 1.0 = far
+      // If L3 shows "83%" remaining, distance = 0.17 (83% remaining = 17% through lane)
+      // Override when distance is LOW (close to impact = urgent!)
+      // Critical threshold: distance < 0.20 means < 80% remaining (getting very close)
+      if (isCritical || dist < 0.20) {
+        shouldOverride = true;
+      }
+    } else if (isCritical && !laneIsCritical[activeTargetIndex]) {
+      // Any critical lane can override non-critical committed lane
+      shouldOverride = true;
+    } else if (dist < 0.15 && committedIsLongLane) {
+      // Any lane at < 15% distance (85%+ remaining, very close) can override long lanes
+      shouldOverride = true;
+    } else if (dist < OVERRIDE_THRESHOLD[i]) {
+      // Below override threshold
+      shouldOverride = true;
+    }
+    
+    if (shouldOverride) {
+      float score = calculateThreatScore(i);
+      // Massive boost for short lanes getting close (LOW distance = urgent)
+      if (isShortLane) {
+        if (dist < 0.15) {
+          score += 15000;  // Huge boost for short lanes at <15% distance (85%+ remaining)
+        } else if (dist < 0.20) {
+          score += 10000;  // Large boost for short lanes at <20% distance (80%+ remaining)
+        } else if (isCritical) {
+          score += 5000;  // Boost for critical short lanes
+        }
+      }
+      if (isCritical) {
+        score += 5000;  // Boost for critical threats
+      }
+      if (score > bestOverrideScore) {
+        bestOverrideScore = score;
+        overrideLane = i;
+      }
+    }
+  }
+  
+  // EMERGENCY OVERRIDE while dwelling - handle immediately
+  if (overrideLane >= 0 && shouldOverride(overrideLane)) {
+    int previousLane = activeTargetIndex;
+    
+    Serial.print(F("!!! OVERRIDE L"));
+    Serial.print(overrideLane + 1);
+    Serial.print(F(" @"));
+    Serial.print((int)((1.0 - zombieDistances[overrideLane]) * 100));
+    Serial.println(F("% !!!"));
+    
+    // Reset batch on emergency override
+    resetBatch();
+    
+    releaseCommitment();
+    commitToTarget(overrideLane);
+    
+    if (isCommitted) {
+      state = MOVE_TO_TARGET;
+      return;  // Exit dwell immediately to handle override
+    }
+  }
+  
   unsigned long dwellTime = millis() - arrivalTime;
   float currentDist = zombieDistances[activeTargetIndex];
   int currentDir = ProxSensors[activeTargetIndex].direction;
@@ -1395,7 +2081,7 @@ void dwellAtTarget() {
     if (backwardStartTime == 0) {
       backwardStartTime = millis();
     }
-    if (millis() - backwardStartTime >= BACKWARD_CONFIRM_TIME) {
+      if (millis() - backwardStartTime >= BACKWARD_CONFIRM_TIME) {
       zombiesKilled++;
       recordHit(activeTargetIndex);  // Analysis mode tracking
       Serial.print(F("HIT L"));
@@ -1406,16 +2092,39 @@ void dwellAtTarget() {
       
       backwardStartTime = 0;
       stoppedStartTime = 0;  // Reset stopped tracker
+      // IMPROVED: Lane is successfully hit - keep it marked as attempted (already marked)
+      // Reset attempted flag after cooldown period (handled in batch calculation)
       releaseCommitment();
       
-      // Get next target from batch
+      // Advance batch (will unlock if sequence complete)
+      advanceBatch();
+      
+      // Get next target from batch (respects batch lock) - IMMEDIATE transition, no delay
+      // IMPROVED: Skip lanes that have already been attempted recently
       int next = getNextBatchTarget();
-      if (next >= 0 && ProxSensors[next].direction == FORWARD) {
+      if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
         commitToTarget(next);
-        if (isCommitted) state = MOVE_TO_TARGET;
-        else state = CHOOSE_TARGET;
+        if (isCommitted) {
+          state = MOVE_TO_TARGET;  // Immediately move to next target
+        } else {
+          // If commit failed, try chooseAndCommitTargetFromBatch for immediate retry
+          state = CHOOSE_TARGET;
+        }
       } else {
-        state = CHOOSE_TARGET;
+        // Batch complete or no valid targets - unlock and immediately choose next
+        if (batchLocked) {
+          batchLocked = false;
+          if (analysisMode) {
+            Serial.println(F("[BATCH] Unlocked - sequence complete"));
+          }
+        }
+        // Immediately try to choose next target instead of waiting
+        chooseAndCommitTargetFromBatch();
+        if (isCommitted) {
+          state = MOVE_TO_TARGET;
+        } else {
+          state = CHOOSE_TARGET;
+        }
       }
       return;
     }
@@ -1441,14 +2150,34 @@ void dwellAtTarget() {
       Serial.println(F("]"));
       
       stoppedStartTime = 0;  // Reset stopped tracker
+      // IMPROVED: Mark lane as attempted when hit - already marked in moveToTarget, but ensure it's set
+      if (!laneAttempted[activeTargetIndex]) {
+        laneAttempted[activeTargetIndex] = true;
+        laneAttemptTime[activeTargetIndex] = millis();
+      }
       releaseCommitment();
+      advanceBatch();  // Advance batch sequence
+      // IMMEDIATE transition - no delay (skip attempted lanes)
       int next = getNextBatchTarget();
-      if (next >= 0 && ProxSensors[next].direction == FORWARD) {
+      if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
         commitToTarget(next);
         if (isCommitted) state = MOVE_TO_TARGET;
-        else state = CHOOSE_TARGET;
+        else {
+          chooseAndCommitTargetFromBatch();
+          if (isCommitted) state = MOVE_TO_TARGET;
+          else state = CHOOSE_TARGET;
+        }
       } else {
-        state = CHOOSE_TARGET;
+        if (batchLocked) {
+          batchLocked = false;
+          if (analysisMode) {
+            Serial.println(F("[BATCH] Unlocked - sequence complete"));
+          }
+        }
+        // Immediately try to choose next target
+        chooseAndCommitTargetFromBatch();
+        if (isCommitted) state = MOVE_TO_TARGET;
+        else state = CHOOSE_TARGET;
       }
       return;
     }
@@ -1469,38 +2198,51 @@ void dwellAtTarget() {
     Serial.print(zombiesKilled);
     Serial.println(F("]"));
     
-    releaseCommitment();
-    stoppedStartTime = 0;  // Reset stopped tracker
-    int next = getNextBatchTarget();
-    if (next >= 0 && ProxSensors[next].direction == FORWARD) {
-      commitToTarget(next);
-      if (isCommitted) state = MOVE_TO_TARGET;
-      else state = CHOOSE_TARGET;
-    } else {
-      state = CHOOSE_TARGET;
-    }
-    return;
+        // IMPROVED: Mark lane as attempted when hit
+        if (!laneAttempted[activeTargetIndex]) {
+          laneAttempted[activeTargetIndex] = true;
+          laneAttemptTime[activeTargetIndex] = millis();
+        }
+        releaseCommitment();
+        stoppedStartTime = 0;  // Reset stopped tracker
+        // IMMEDIATE transition - no delay (skip attempted lanes)
+        int next = getNextBatchTarget();
+        if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+          commitToTarget(next);
+          if (isCommitted) state = MOVE_TO_TARGET;
+          else {
+            chooseAndCommitTargetFromBatch();
+            if (isCommitted) state = MOVE_TO_TARGET;
+            else state = CHOOSE_TARGET;
+          }
+        } else {
+          chooseAndCommitTargetFromBatch();
+          if (isCommitted) state = MOVE_TO_TARGET;
+          else state = CHOOSE_TARGET;
+        }
+        return;
   }
   
   //--------------------------------------------
-  // EXIT CONDITION 2.5: ZOMBIE STOPPED - FAST EXIT
-  // If zombie hasn't moved significantly for STOPPED_CONFIRM_TIME, move on
-  // This catches stalled zombies that aren't clearly hit or retreating
+  // EXIT CONDITION 2.5: ZOMBIE STOPPED - PERSISTENT ATTEMPT
+  // IMPROVED: Be more persistent - only exit on STOP if we've tried long enough
+  // Don't exit too early - stay committed to getting a hit
   //--------------------------------------------
   // Check for STOPPED direction OR very small velocity (pseudo-stopped)
   bool isEffectivelyStopped = (currentDir == STOPPED) || 
                                (abs(zombieVelocities[activeTargetIndex]) < 0.0001);
   
-  if (isEffectivelyStopped && dwellTime >= 150) {  // Reduced from 200ms
+  // IMPROVED: Only check STOPPED exit after minimum persistent dwell time
+  if (isEffectivelyStopped && dwellTime >= 400) {  // INCREASED: Require 400ms before checking STOPPED
     if (stoppedStartTime == 0) {
       stoppedStartTime = millis();
       stoppedStartDistance = currentDist;
-    } else if (millis() - stoppedStartTime >= 300) {  // Reduced from 400ms for faster exit
+    } else if (millis() - stoppedStartTime >= 500) {  // INCREASED: 500ms confirmed stopped (was 300ms)
       // Check if distance barely changed - zombie truly stalled
       float distChange = abs(currentDist - stoppedStartDistance);
       if (distChange < 0.08) {  // Increased from 5% to 8% - more tolerant
-        // If zombie was close, probably a hit
-        if (peakZombieDistance < 0.25) {  // Increased threshold - more generous hit credit
+        // If zombie was close, probably a hit - be generous
+        if (peakZombieDistance < 0.30) {  // INCREASED threshold - more generous hit credit (was 0.25)
           zombiesKilled++;
           recordHit(activeTargetIndex);
           Serial.print(F("HIT L"));
@@ -1508,22 +2250,63 @@ void dwellAtTarget() {
           Serial.print(F(" (stop) ["));
           Serial.print(zombiesKilled);
           Serial.println(F("]"));
+          
+          // Mark as attempted and hit
+          laneAttempted[activeTargetIndex] = true;
+          laneAttemptTime[activeTargetIndex] = millis();
+          
+          releaseCommitment();
+          stoppedStartTime = 0;
+          // IMMEDIATE transition - no delay
+          int next = getNextBatchTarget();
+          if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+            commitToTarget(next);
+            if (isCommitted) state = MOVE_TO_TARGET;
+            else {
+              chooseAndCommitTargetFromBatch();
+              if (isCommitted) state = MOVE_TO_TARGET;
+              else state = CHOOSE_TARGET;
+            }
+          } else {
+            // Immediately try to choose next target
+            chooseAndCommitTargetFromBatch();
+            if (isCommitted) state = MOVE_TO_TARGET;
+            else state = CHOOSE_TARGET;
+          }
+          return;
         } else {
-          Serial.print(F("STOP L"));
-          Serial.println(activeTargetIndex + 1);
+          // IMPROVED: Only exit on STOP if we've been dwelling for a long time
+          // Be persistent - don't give up too easily
+          if (dwellTime >= 800) {  // Only exit if we've been here 800ms+ without progress
+            Serial.print(F("STOP L"));
+            Serial.println(activeTargetIndex + 1);
+            
+            // Mark as attempted - prevent immediate re-engagement
+            laneAttempted[activeTargetIndex] = true;
+            laneAttemptTime[activeTargetIndex] = millis();
+            
+            releaseCommitment();
+            stoppedStartTime = 0;
+            // IMMEDIATE transition - no delay
+            int next = getNextBatchTarget();
+            if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+              commitToTarget(next);
+              if (isCommitted) state = MOVE_TO_TARGET;
+              else {
+                chooseAndCommitTargetFromBatch();
+                if (isCommitted) state = MOVE_TO_TARGET;
+                else state = CHOOSE_TARGET;
+              }
+            } else {
+              // Immediately try to choose next target
+              chooseAndCommitTargetFromBatch();
+              if (isCommitted) state = MOVE_TO_TARGET;
+              else state = CHOOSE_TARGET;
+            }
+            return;
+          }
+          // Otherwise, keep trying - don't exit yet
         }
-        
-        releaseCommitment();
-        stoppedStartTime = 0;
-        int next = getNextBatchTarget();
-        if (next >= 0 && ProxSensors[next].direction == FORWARD) {
-          commitToTarget(next);
-          if (isCommitted) state = MOVE_TO_TARGET;
-          else state = CHOOSE_TARGET;
-        } else {
-          state = CHOOSE_TARGET;
-        }
-        return;
       } else {
         // Distance changed - reset stopped timer
         stoppedStartTime = millis();
@@ -1537,30 +2320,99 @@ void dwellAtTarget() {
   
   //--------------------------------------------
   // EXIT CONDITION 3: ZOMBIE COMPLETELY GONE
-  // Must have dwelt minimum time - prevents false GONE on arrival
-  // Lane 4 uses higher threshold due to longer travel time
+  // CRITICAL FIX: Much more conservative - only mark as GONE if:
+  // 1. Target is beyond lane-specific threshold (85-90% of lane)
+  // 2. Target has been consistently far for extended time
+  // 3. Target is moving backward (retreating past the threshold)
+  // For short lanes (L2/L3), use even higher threshold (90%+)
   //--------------------------------------------
-  float goneThreshold = (activeTargetIndex == 3) ? L4_GONE_DISTANCE : ZOMBIE_GONE_DISTANCE;
-  if (dwellTime >= MIN_DWELL_TIME && currentDist > goneThreshold) {
-    Serial.print(F("GONE L"));
-    Serial.println(activeTargetIndex + 1);
+  // Determine lane-specific gone threshold
+  float goneThreshold;
+  if (laneIsShort[activeTargetIndex]) {
+    // L2/L3 - short lanes - VERY conservative (90%+)
+    goneThreshold = L2_L3_GONE_DISTANCE;
+  } else if (activeTargetIndex == 3) {
+    // L4 - longer lane but still conservative (88%)
+    goneThreshold = L4_GONE_DISTANCE;
+  } else {
+    // L1 - conservative (85%)
+    goneThreshold = ZOMBIE_GONE_DISTANCE;
+  }
+  
+  // CRITICAL FIX: Much stricter validation - only mark as GONE if zombie is TRULY unreachable
+  // 1. Target must be beyond very conservative threshold (85-90% of lane)
+  // 2. Target must be moving backward (retreating past threshold) OR consistently far for extended time
+  // 3. Must have dwelt long enough to confirm (prevents false GONE on arrival)
+  // 4. For short lanes (L2/L3), require even higher threshold (90%+) since they're critical
+  bool isBeyondThreshold = (currentDist > goneThreshold);
+  bool isRetreating = (currentDir == BACKWARD);
+  bool hasBeenFarForExtendedTime = (dwellTime >= (MIN_DWELL_TIME * 3));  // CRITICAL: Require 3x min dwell (was 2x)
+  bool isConsistentlyFar = (currentDist > (goneThreshold - 0.05));  // Must be very close to threshold (within 5%)
+  
+  // CRITICAL: Only mark as GONE if:
+  // - Target is retreating AND beyond threshold (definitely gone), OR
+  // - Target has been consistently far beyond threshold for extended time (3x min dwell)
+  if (dwellTime >= MIN_DWELL_TIME && isBeyondThreshold) {
+    // Additional validation - must be retreating OR consistently far for extended time
+    // CRITICAL: For short lanes, require even more validation
+    bool shouldMarkGone = false;
     
-    releaseCommitment();
-    int next = getNextBatchTarget();
-    if (next >= 0 && ProxSensors[next].direction == FORWARD) {
-      commitToTarget(next);
-      if (isCommitted) state = MOVE_TO_TARGET;
-      else state = CHOOSE_TARGET;
+    if (laneIsShort[activeTargetIndex]) {
+      // L2/L3 - Short lanes: EXTREMELY conservative - only mark as GONE if truly unreachable
+      // 1. Retreating AND beyond 95% threshold (only 5% remaining), OR
+      // 2. Consistently far for extended time AND beyond 95% threshold
+      // CRITICAL: Never mark short lanes as GONE if there's any chance of hitting them
+      shouldMarkGone = (isRetreating && currentDist > L2_L3_GONE_DISTANCE) || 
+                       (hasBeenFarForExtendedTime && isConsistentlyFar && currentDist > L2_L3_GONE_DISTANCE);
     } else {
-      state = CHOOSE_TARGET;
+      // L1/L4 - Long lanes: Still conservative but slightly less strict
+      // Mark as GONE if retreating OR consistently far for extended time
+      shouldMarkGone = (isRetreating && currentDist > goneThreshold) || 
+                       (hasBeenFarForExtendedTime && isConsistentlyFar && currentDist > goneThreshold);
     }
-    return;
+    
+    if (shouldMarkGone) {
+      Serial.print(F("GONE L"));
+      Serial.print(activeTargetIndex + 1);
+      Serial.print(F(" @"));
+      Serial.print((int)((1.0 - currentDist) * 100));
+      Serial.println(F("%"));
+      
+      // CRITICAL FIX: Reset attempted flag when GONE - allow immediate re-engagement if target reappears
+      // This allows the system to try again immediately if a new zombie appears in this lane
+      laneAttempted[activeTargetIndex] = false;  // Clear attempted flag - allow re-engagement
+      
+      releaseCommitment();
+      // IMMEDIATE transition - don't skip attempted lanes since we're not marking as attempted
+      int next = getNextBatchTarget();
+      if (next >= 0 && ProxSensors[next].direction == FORWARD) {
+        commitToTarget(next);
+        if (isCommitted) state = MOVE_TO_TARGET;
+        else {
+          chooseAndCommitTargetFromBatch();
+          if (isCommitted) state = MOVE_TO_TARGET;
+          else state = CHOOSE_TARGET;
+        }
+      } else {
+        // Immediately try to choose next target
+        chooseAndCommitTargetFromBatch();
+        if (isCommitted) state = MOVE_TO_TARGET;
+        else state = CHOOSE_TARGET;
+      }
+      return;
+    }
+    // Otherwise, keep waiting - target might be coming back
   }
   
   //--------------------------------------------
   // EXIT CONDITION 4: TIMEOUT
+  // IMPROVED: Mark lane as attempted on timeout - prevent immediate re-engagement
   //--------------------------------------------
   if (dwellTime >= maxDwell) {
+    // IMPROVED: Mark lane as attempted - prevent immediate re-engagement
+    laneAttempted[activeTargetIndex] = true;
+    laneAttemptTime[activeTargetIndex] = millis();
+    
     if (currentDir == FORWARD && currentDist < arrivalZombieDistance - 0.03) {
       zombiesMissed++;
       recordMiss(activeTargetIndex);  // Analysis mode tracking
@@ -1582,13 +2434,21 @@ void dwellAtTarget() {
     }
     
     releaseCommitment();
+    // IMMEDIATE transition - no delay (skip attempted lanes)
     int next = getNextBatchTarget();
-    if (next >= 0 && ProxSensors[next].direction == FORWARD) {
+    if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
       commitToTarget(next);
       if (isCommitted) state = MOVE_TO_TARGET;
-      else state = CHOOSE_TARGET;
+      else {
+        chooseAndCommitTargetFromBatch();
+        if (isCommitted) state = MOVE_TO_TARGET;
+        else state = CHOOSE_TARGET;
+      }
     } else {
-      state = CHOOSE_TARGET;
+      // Immediately try to choose next target (skip attempted lanes)
+      chooseAndCommitTargetFromBatch();
+      if (isCommitted) state = MOVE_TO_TARGET;
+      else state = CHOOSE_TARGET;
     }
     return;
   }
@@ -2023,7 +2883,48 @@ float calculateThreatScore(int lane) {
     score *= 0.5;  // Halve score if we probably can't reach it
   }
   
-  // LANE PRIORITY MULTIPLIER (L4 gets 1.2x boost)
+  //============================================
+  // CRITICAL: DISTANCE-BASED PRIORITY BOOST
+  // ALL lanes need priority when close to impact, but L2/L3 are MORE urgent
+  // Game ends if zombie reaches wall - MUST prioritize close targets!
+  //============================================
+  if (lane == 1 || lane == 2) {  // L2 or L3 (short lanes)
+    // CRITICAL DISTANCE BOOST: When L2/L3 are close to impact, MASSIVE priority
+    // This ensures we ALWAYS prioritize short lanes when they're dangerous
+    if (dist < SHORT_LANE_CRITICAL_DISTANCE) {
+      // At 20% or less - game-ending threat! MASSIVE boost (tighter threshold)
+      float criticalBoost = (SHORT_LANE_CRITICAL_DISTANCE - dist) * 5000;  // Up to 10000 boost! (was 12500)
+      score += criticalBoost;
+    } else if (dist < 0.35) {
+      // TIGHTER: At 35% or less - very dangerous, large boost (was 40%)
+      score += (0.35 - dist) * 2000;  // Up to 3000 boost
+    } else if (dist < 0.55) {
+      // TIGHTER: At 55% or less - getting dangerous, moderate boost (was 60%)
+      score += (0.55 - dist) * 500;  // Up to 1000 boost
+    }
+    
+    // Additional early engagement boost for L2/L3
+    // They need to be engaged earlier due to shorter lane
+    if (dist > 0.70) {
+      score += 200;  // Boost early detection for short lanes
+    }
+  } else {  // L1 or L4 (long lanes)
+    // CRITICAL DISTANCE BOOST: L1/L4 also need priority when close to impact
+    // Less aggressive than L2/L3 but still significant - prevents misses!
+    if (dist < LONG_LANE_CRITICAL_DISTANCE) {
+      // At 15% or less - critical threat! Large boost (less than L2/L3 but still significant)
+      float criticalBoost = (LONG_LANE_CRITICAL_DISTANCE - dist) * 3000;  // Up to 4500 boost! (tighter)
+      score += criticalBoost;
+    } else if (dist < 0.30) {
+      // TIGHTER: At 30% or less - very dangerous, moderate boost (was 35%)
+      score += (0.30 - dist) * 1500;  // Up to 2250 boost
+    } else if (dist < 0.45) {
+      // TIGHTER: At 45% or less - getting dangerous, smaller boost (was 50%)
+      score += (0.45 - dist) * 400;  // Up to 600 boost
+    }
+  }
+  
+  // LANE PRIORITY MULTIPLIER (L2/L3 already boosted above, L4 gets 1.1x)
   score *= LANE_PRIORITY[lane];
   
   return max(score, 0.0f);
@@ -2034,22 +2935,42 @@ float calculateThreatScore(int lane) {
 // More responsive direction detection for bounce-back
 //============================================
 void updateSensors() {
+  unsigned long now = millis();
+
   for (int i = 0; i < 4; i++) {
     int rawVal = analogRead(ProxSensors[i].pin);
     ProxSensors[i].currVal = alpha * ProxSensors[i].currVal + (1.0 - alpha) * rawVal;
     ProxSensors[i].smoothVal = velocityAlpha * ProxSensors[i].smoothVal + (1.0 - velocityAlpha) * rawVal;
-    
-    noiseLimit = (ProxSensors[i].currVal >= noiseThreshold) ? upperNoiseLimit : lowerNoiseLimit;
-    
+
+    // Compute current distance using calibrated range so direction checks use latest data
+    // CRITICAL: Use lane-specific calibrated ranges to get accurate distance
+    // CRITICAL FIX: Impact occurs when zombie is FAR from proximity sensors (sensors at start of lane)
+    // So: HIGH sensor value = at impact, LOW sensor value = at start
+    // Normalized 0-1 where 0 = at start (close to sensors), 1 = at impact (far from sensors)
+    const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
+    float currentDistance = 0.0f;
+    if (range != 0.0f) {
+      // Calculate normalized distance: (sensor_value - close_range) / (far_range - close_range)
+      // When sensor = far_range (high, at impact) → normalized = 1.0
+      // When sensor = close_range (low, at start) → normalized = 0.0
+      // So: 1.0 = at impact (urgent!), 0.0 = at start
+      float normalized = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
+      currentDistance = constrain(normalized, 0.0f, 1.0f);
+    }
+    zombieDistances[i] = currentDistance;
+
+    // Derive sensor-specific noise limit rather than sharing across lanes
+    int sensorNoiseLimit = (ProxSensors[i].currVal >= noiseThreshold) ? upperNoiseLimit : lowerNoiseLimit;
+
     float change = ProxSensors[i].currVal - ProxSensors[i].prevVal;
-    
+
     // IMPROVED: Use MAGNITUDE of change to detect fast movement
     float changeMagnitude = abs(change);
-    bool fastMovement = changeMagnitude > noiseLimit * 2;  // Moving fast if >2x noise threshold
-    
-    if (changeMagnitude < noiseLimit) {
+    bool fastMovement = changeMagnitude > sensorNoiseLimit * 2;  // Moving fast if >2x noise threshold
+
+    if (changeMagnitude < sensorNoiseLimit) {
       // No significant change detected
-      if (millis() - ProxSensors[i].prevChangeTime >= stopTimeout) {
+      if (now - ProxSensors[i].prevChangeTime >= stopTimeout) {
         ProxSensors[i].direction = STOPPED;
         ProxSensors[i].forwardCount = 0;
         ProxSensors[i].backwardCount = 0;
@@ -2059,7 +2980,7 @@ void updateSensors() {
       ProxSensors[i].forwardCount++;
       ProxSensors[i].backwardCount = 0;
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
-      ProxSensors[i].prevChangeTime = millis();
+      ProxSensors[i].prevChangeTime = now;
       if (ProxSensors[i].forwardCount >= 2) {
         ProxSensors[i].direction = FORWARD;
       }
@@ -2068,7 +2989,7 @@ void updateSensors() {
       ProxSensors[i].backwardCount++;
       ProxSensors[i].forwardCount = 0;
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
-      ProxSensors[i].prevChangeTime = millis();
+      ProxSensors[i].prevChangeTime = now;
       
       // IMPROVED BACKWARD DETECTION:
       // 1. If moving FAST backward, detect immediately (2 samples)
@@ -2079,12 +3000,12 @@ void updateSensors() {
       if (fastMovement) {
         // Fast backward movement - detect quickly
         backwardThreshold = 2;
-      } else if (zombieDistances[i] < 0.15) {
+      } else if (currentDistance < 0.15f) {
         // Very close to wall - likely bouncing back
         backwardThreshold = 2;
-      } else if (zombieDistances[i] < 0.30) {
+      } else if (currentDistance < 0.30f) {
         backwardThreshold = 3;
-      } else if (zombieDistances[i] < 0.50) {
+      } else if (currentDistance < 0.50f) {
         backwardThreshold = 2;
       }
       
@@ -2095,7 +3016,7 @@ void updateSensors() {
     
     // NOISE FILTER: Ignore targets below 15% that aren't clearly forward
     // This prevents false locks on sensor noise
-    if (zombieDistances[i] > 0.85 && ProxSensors[i].direction == FORWARD) {
+    if (currentDistance > 0.85f && ProxSensors[i].direction == FORWARD) {
       // Very low signal - require stronger evidence
       if (ProxSensors[i].forwardCount < 3) {
         ProxSensors[i].direction = STOPPED;
@@ -2118,7 +3039,8 @@ void computeVelocity() {
 }
 
 void runPIDController() {
-  long currentPos = encoder.read();
+  // OPTIMIZATION: Use cached encoder position
+  long currentPos = cachedEncoderPos;
   float positionError = desiredPosition - currentPos;
   
   int effectiveBand = (activeTargetIndex == 3) ? 12 : TARGET_BAND;
