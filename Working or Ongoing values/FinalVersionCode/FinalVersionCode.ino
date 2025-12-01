@@ -191,7 +191,7 @@ const float L4_GONE_DISTANCE = 0.10;  // L4 gone when < 10% through
 //============================================
 bool calibrationActive = false;
 unsigned long calibrationStartTime = 0;
-const unsigned long CALIBRATION_DURATION = 15000;  // 15 seconds of calibration
+const unsigned long CALIBRATION_DURATION = 10000;  // 10 seconds of calibration
 
 // Track min/max readings per lane during calibration
 int calibrationMin[4] = {1023, 1023, 1023, 1023};  // Far (no zombie)
@@ -602,18 +602,20 @@ void commitToTarget(int lane) {
         }
       }
       
-      // If there's a closer forward-moving target, only commit to far lane if it's not much further
+      // If there's a more urgent forward-moving target, only commit to less urgent lane if gap is small
       // EXCEPTION: ANY lane at critical distance can override this (game-ending threat!)
-      if (closestLane >= 0 && closestDist < dist && !isCritical) {
-        float distanceGap = dist - closestDist;
+      // NEW SEMANTICS: closestDist > dist means closest is more urgent (further through lane)
+      if (closestLane >= 0 && closestDist > dist && !isCritical) {
+        float distanceGap = closestDist - dist;  // Gap between most urgent and this lane
         
-        // TIGHTER CRITERIA: If the gap is large, prefer the closer target
-        // Require larger gaps to prevent switching to slightly closer targets
+        // TIGHTER CRITERIA: If the gap is large, prefer the more urgent target
+        // Require larger gaps to prevent switching to slightly more urgent targets
         // For L2/L3, use smaller gap since they're shorter lanes, but still tighter
         // OPTIMIZATION: Use cached lane type
         float gapThreshold = laneIsShort[lane] ? 0.15 : 0.20;  // TIGHTER: Require 15-20% gap (was 10-12%)
-        if (distanceGap > gapThreshold && closestDist < 0.50) {
-          return;  // Reject - closer target exists
+        // NEW SEMANTICS: Reject if there's a more urgent target (higher dist = closer to impact)
+        if (distanceGap > gapThreshold && closestDist > 0.50) {
+          return;  // Reject - more urgent target exists (past 50% through lane)
         }
       }
     }
@@ -678,7 +680,8 @@ bool shouldOverride(int newLane) {
   if (ProxSensors[newLane].direction != FORWARD) return false;
   unsigned long commitmentDuration = millis() - commitStartTime;
   float newDist = zombieDistances[newLane];
-  bool isExtremeEmergency = (newDist < 0.08);
+  // NEW SEMANTICS: Extreme emergency = very close to impact (> 92%)
+  bool isExtremeEmergency = (newDist > 0.92);
   if (commitmentDuration < MIN_COMMITMENT_TIME && !isExtremeEmergency) return false;
   unsigned long timeSinceSwitch = millis() - lastTargetSwitchTime;
   if (timeSinceSwitch < TARGET_SWITCH_COOLDOWN && !isExtremeEmergency) return false;
@@ -686,8 +689,9 @@ bool shouldOverride(int newLane) {
   bool newIsLongLane = laneIsLong[newLane];
   bool committedIsShortLane = laneIsShort[committedLane];
   bool newIsCritical = laneIsCritical[newLane];
+  // NEW SEMANTICS: Don't let long lane override short lane unless significantly further through
   if (newIsLongLane && committedIsShortLane && !newIsCritical) {
-    if (newDist >= committedDist * 0.5) return false;
+    if (newDist <= committedDist + 0.30) return false;  // Require 30%+ gap
   }
   if (sequenceLocked && sequenceActive) {
     bool newIsShortLane = laneIsShort[newLane];
@@ -731,18 +735,20 @@ bool shouldOverride(int newLane) {
     }
     
     // PRIORITY 2: Short lane getting close while committed to long lane - MUCH EARLIER!
-    // FIXED: Override at 50% through lane, not 15%!
-    if (newIsShortLane && committedIsLongLane && newDist < 0.50) {
+    // NEW SEMANTICS: Override when short lane is past 50% through lane
+    if (newIsShortLane && committedIsLongLane && newDist > 0.50) {
       return true;
     }
-    
-    // PRIORITY 3: Both critical, but new is significantly closer (at least 20% closer)
-    if (newIsCritical && committedIsCritical && newDist < committedDist * 0.8) {
+
+    // PRIORITY 3: Both critical, but new is significantly further through (20%+ more)
+    // NEW SEMANTICS: Higher dist = closer to impact = higher priority
+    if (newIsCritical && committedIsCritical && newDist > committedDist + 0.15) {
       return true;
     }
-    
-    // PRIORITY 4: Extreme emergency - new target at < 10% distance
-    if (newDist < 0.10) {
+
+    // PRIORITY 4: Extreme emergency - new target past 90% through lane
+    // NEW SEMANTICS: High dist = close to impact = urgent
+    if (newDist > 0.90) {
       return true;
     }
     
@@ -774,21 +780,21 @@ bool shouldOverride(int newLane) {
       return false;
     }
     
-    // CRITICAL FIX: Distance is normalized where 0.0 = at impact, 1.0 = far
-    // So LOW distance values mean close to impact (urgent!)
-    // We want to override when distance is LOW (close to impact)
-    // FIXED: Override MUCH earlier for short lanes!
-    
+    // NEW SEMANTICS: Distance is normalized where 0% = at start, 100% = at impact
+    // So HIGH distance values mean close to impact (urgent!)
+    // We want to override when distance is HIGH (close to impact)
+    // Override MUCH earlier for short lanes!
+
     if (newIsShortLane && committedIsLongLane) {
-      // Short lane at 50% through lane while at long lane = override immediately!
-      if (newDist < 0.50 || newIsCritical) return true;
+      // Short lane past 50% through lane while at long lane = override immediately!
+      if (newDist > 0.50 || newIsCritical) return true;
     } else if (newIsShortLane && !committedIsLongLane) {
-      // Short lane at 70% through lane while at another lane = override
-      if (newDist < 0.70) return true;
+      // Short lane past 70% through lane while at another lane = override
+      if (newDist > 0.70) return true;
     }
     if (newIsCritical) return true;
-    if (newDist < OVERRIDE_THRESHOLD[newLane]) return true;
-    if (newDist < 0.05) return true;  // Extreme emergency
+    if (newDist > OVERRIDE_THRESHOLD[newLane]) return true;
+    if (newDist > 0.95) return true;  // Extreme emergency (past 95%)
     return false;
   }
   if (activelyMoving && ProxSensors[committedLane].direction == FORWARD) {
@@ -798,7 +804,8 @@ bool shouldOverride(int newLane) {
     bool committedIsShortLane = laneIsShort[committedLane];
     if (newIsLongLane && committedIsShortLane && !newIsCritical) return false;
     if (newIsCritical && !committedIsCritical) return true;
-    if (newIsCritical && committedIsCritical && newDist < committedDist * 0.7) return true;
+    // NEW SEMANTICS: Override if new is much further through lane (higher %)
+    if (newIsCritical && committedIsCritical && newDist > committedDist + 0.20) return true;
     return false;
   }
   float distanceGap = abs(newDist - committedDist);
@@ -823,32 +830,35 @@ bool shouldOverride(int newLane) {
     return false;
   }
   
-  // RULE 4: If we're nearing target and committed lane still needs attention,
+  // RULE 4: If we're nearing target and committed lane still early (< 60%),
   // only override if new lane is MUCH more critical
-  if (nearingTarget && committedDist < 0.40 && 
+  // NEW SEMANTICS: committedDist < 0.60 means committed is still early in lane
+  if (nearingTarget && committedDist < 0.60 &&
       ProxSensors[committedLane].direction == FORWARD) {
     // CRITICAL: NEVER allow L1/L4 to override L2/L3 when nearing target, unless L1/L4 is critical
     bool newIsLongLane = laneIsLong[newLane];
     bool committedIsShortLane = laneIsShort[committedLane];
     bool newIsCritical = laneIsCritical[newLane];
-    
+
     if (newIsLongLane && committedIsShortLane && !newIsCritical) {
       // Long lane trying to override short lane when not critical - don't allow
       return false;
     }
-    
-    // TIGHTER: New must be at least 3x closer than committed to justify switch (was 2x)
-    return newDist < committedDist * 0.3;
+
+    // NEW SEMANTICS: New must be significantly further through lane (40%+ ahead)
+    return newDist > committedDist + 0.40;
   }
-  
+
   float threshold = OVERRIDE_THRESHOLD[newLane];
-  if (newDist < threshold) {
+  // NEW SEMANTICS: Override when new is PAST threshold (high dist = close to impact)
+  if (newDist > threshold) {
     bool newIsLongLane = laneIsLong[newLane];
     bool committedIsShortLane = laneIsShort[committedLane];
     bool newIsCritical = laneIsCritical[newLane];
     if (newIsLongLane && committedIsShortLane && !newIsCritical) return false;
-    if (committedDist < 0.25 && ProxSensors[committedLane].direction == FORWARD) {
-      return newDist < committedDist * 0.4;
+    // NEW SEMANTICS: Only override if new is much further through (35%+ ahead)
+    if (committedDist > 0.75 && ProxSensors[committedLane].direction == FORWARD) {
+      return newDist > committedDist + 0.10;  // Need 10%+ gap when both are far through
     }
     return true;
   }
@@ -1366,8 +1376,30 @@ void applyCalibration() {
     }
   }
   
+  // CRITICAL NORMALIZATION FIX: Ensure start position reads as 0%
+  // After calibration, sample current sensor values and use them as the "start" baseline
+  // This ensures that current position = 0%, not some offset percentage
+  Serial.println(F("--- Normalizing start positions to 0% ---"));
+  for (int i = 0; i < 4; i++) {
+    int currentReading = analogRead(ProxSensors[i].pin);
+    if (currentReading > ProxRange[i][0]) {
+      // Current reading is higher than calibrated max - update to current value
+      // This ensures start position = 0%
+      Serial.print(F("  L"));
+      Serial.print(i + 1);
+      Serial.print(F(": Adjusting start from "));
+      Serial.print(ProxRange[i][0]);
+      Serial.print(F(" to "));
+      Serial.print(currentReading);
+      Serial.println(F(" (current reading is higher)"));
+      ProxRange[i][0] = currentReading;
+      // Save updated value to EEPROM
+      EEPROM.put(EEPROM_PROX_RANGE_BASE + i * 4, (int)currentReading);
+    }
+  }
+
   // Force a print of current ranges to verify they were updated
-  Serial.println(F("--- Updated Prox Ranges (NOW IN USE) ---"));
+  Serial.println(F("--- Final Prox Ranges (NOW IN USE) ---"));
   for (int i = 0; i < 4; i++) {
     Serial.print(F("  L"));
     Serial.print(i + 1);
@@ -1406,7 +1438,7 @@ void startCalibration() {
     calibrationUpdated[i] = false;
   }
   
-  Serial.println(F("=== CALIBRATION STARTED (15s) ==="));
+  Serial.println(F("=== CALIBRATION STARTED (10s) ==="));
   Serial.println(F("Mechanism moving to home (position 0)..."));
   Serial.println(F("Targets should start at 0% (beginning) - move them to 100% (impact) and back!"));
 }
@@ -3091,19 +3123,21 @@ bool canReachInTime(int lane) {
 
 //============================================
 // CALCULATE THREAT SCORE
+// NEW SEMANTICS: Higher dist = closer to impact = higher threat
 //============================================
 float calculateThreatScore(int lane) {
   float dist = zombieDistances[lane];
   float score = 0;
-  
+
   if (ProxSensors[lane].direction == BACKWARD) return 0;
   if (ProxSensors[lane].direction == STOPPED) {
     if (laneStoppedTime[lane] > 0) {
       unsigned long stoppedDuration = millis() - laneStoppedTime[lane];
       if (stoppedDuration > STOPPED_TIMEOUT) return 0;
     }
-    if (dist > 0.20) return 0;
-    return (1.0 - dist) * 50 * LANE_PRIORITY[lane];
+    // Only score stopped targets if they're close to impact (> 80%)
+    if (dist < 0.80) return 0;
+    return dist * 50 * LANE_PRIORITY[lane];
   }
   if (ProxSensors[lane].direction != FORWARD) return 0;
   float effectiveTTI = getEffectiveTTI(lane);
@@ -3121,14 +3155,16 @@ float calculateThreatScore(int lane) {
       score = 50 + (5000 - effectiveTTI) * 0.02;
     }
   } else {
-    if (dist < 0.10) {
-      score = 800 + (0.10 - dist) * 2000;
-    } else if (dist < 0.20) {
-      score = 400 + (0.20 - dist) * 4000;
-    } else if (dist < 0.35) {
-      score = 150 + (0.35 - dist) * 1700;
+    // Distance-based scoring when TTI unavailable
+    // NEW SEMANTICS: Higher dist = more urgent
+    if (dist > 0.90) {
+      score = 800 + (dist - 0.90) * 2000;
+    } else if (dist > 0.80) {
+      score = 400 + (dist - 0.80) * 4000;
+    } else if (dist > 0.65) {
+      score = 150 + (dist - 0.65) * 1700;
     } else {
-      score = 30 + (1.0 - dist) * 80;
+      score = 30 + dist * 80;
     }
   }
   int dynamicTravel = getDynamicTravelTime(lane);
@@ -3136,33 +3172,38 @@ float calculateThreatScore(int lane) {
   if (!canReachInTime(lane) && score < 500) {
     score *= 0.5;
   }
-  
+
   //============================================
+  // Lane-specific bonuses
+  // NEW SEMANTICS: Higher dist = closer to impact
   if (lane == 1 || lane == 2) {
-    if (dist < 0.30) {
-      score += 300 + (0.30 - dist) * 667;
-    } else if (dist < 0.60) {
-      score += 150 + (0.60 - dist) * 500;
+    // Short lanes (L2/L3) - bonus for being further through
+    if (dist > 0.70) {
+      score += 300 + (dist - 0.70) * 667;
+    } else if (dist > 0.40) {
+      score += 150 + (dist - 0.40) * 500;
     } else {
-      score += 50 + (1.0 - dist) * 250;
+      score += 50 + dist * 250;
     }
-    if (dist < SHORT_LANE_CRITICAL_DISTANCE) {
-      score += (SHORT_LANE_CRITICAL_DISTANCE - dist) * 5000;
-    } else if (dist < 0.35) {
-      score += (0.35 - dist) * 2000;
-    } else if (dist < 0.55) {
-      score += (0.55 - dist) * 500;
-    } else if (dist < 0.80) {
-      score += (0.80 - dist) * 300;
+    // Critical distance bonus
+    if (dist > SHORT_LANE_CRITICAL_DISTANCE) {
+      score += (dist - SHORT_LANE_CRITICAL_DISTANCE) * 5000;
+    } else if (dist > 0.65) {
+      score += (dist - 0.65) * 2000;
+    } else if (dist > 0.45) {
+      score += (dist - 0.45) * 500;
+    } else if (dist > 0.20) {
+      score += (dist - 0.20) * 300;
     }
-    if (dist > 0.70) score += 300;
+    // No bonus for early targets - prioritize targets closer to impact
   } else {
-    if (dist < LONG_LANE_CRITICAL_DISTANCE) {
-      score += (LONG_LANE_CRITICAL_DISTANCE - dist) * 3000;
-    } else if (dist < 0.30) {
-      score += (0.30 - dist) * 1500;
-    } else if (dist < 0.45) {
-      score += (0.45 - dist) * 400;
+    // Long lanes (L1/L4)
+    if (dist > LONG_LANE_CRITICAL_DISTANCE) {
+      score += (dist - LONG_LANE_CRITICAL_DISTANCE) * 3000;
+    } else if (dist > 0.70) {
+      score += (dist - 0.70) * 1500;
+    } else if (dist > 0.55) {
+      score += (dist - 0.55) * 400;
     }
   }
   score *= LANE_PRIORITY[lane];
