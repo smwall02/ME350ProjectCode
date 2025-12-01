@@ -156,9 +156,12 @@ const int TTI_MIN_ENGAGE[4] = {500, 800, 800, 500};
 const int TTI_MAX_ENGAGE[4] = {2200, 3000, 3000, 2200};
 
 const int SHORT_LANE_BOOST = 150;
-const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.92, 0.92};
-const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.95, 0.95};
-const float MIN_ENGAGE_THRESHOLD = 0.05;
+// NEW SEMANTICS: 0% = start, 100% = impact
+// EARLY_ENGAGE = minimum % through lane to engage (lower = engage earlier)
+// MIN_ENGAGE = maximum % through lane to engage (don't engage if past this = about to impact)
+const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
+const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
+const float MIN_ENGAGE_THRESHOLD = 0.95;  // Don't engage when > 95% through (about to impact)
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
@@ -169,17 +172,19 @@ float getEarlyEngageThreshold(int lane) {
   }
 }
 
-const float OVERRIDE_THRESHOLD[4] = {0.10, 0.50, 0.50, 0.10};  // L2/L3: Override at 50% through lane (much earlier!)
-const float ABSOLUTE_OVERRIDE_DISTANCE = 0.08;
+// NEW SEMANTICS: 0% = at start, 100% = at impact (traveled through lane)
+// Higher values = more urgent (closer to impact)
+const float OVERRIDE_THRESHOLD[4] = {0.90, 0.50, 0.50, 0.90};  // Override when > this % through lane
+const float ABSOLUTE_OVERRIDE_DISTANCE = 0.92;  // Critical when > 92% through lane
 const float SHORT_LANE_CRITICAL_DISTANCE = 0.50;  // L2/L3 critical at 50% through lane
-const float LONG_LANE_CRITICAL_DISTANCE = 0.15;
+const float LONG_LANE_CRITICAL_DISTANCE = 0.85;  // L1/L4 critical at 85% through lane
 const unsigned long MIN_COMMITMENT_TIME = 800;  // Minimum 800ms commitment before allowing overrides
 const unsigned long TARGET_SWITCH_COOLDOWN = 1500;  // 1.5s cooldown after switching targets
 
-const float RETREAT_CONFIRMED_DISTANCE = 0.35;
-const float ZOMBIE_GONE_DISTANCE = 0.92;
-const float L2_L3_GONE_DISTANCE = 0.95;
-const float L4_GONE_DISTANCE = 0.90;
+const float RETREAT_CONFIRMED_DISTANCE = 0.65;  // Retreat confirmed when drops below 65% through
+const float ZOMBIE_GONE_DISTANCE = 0.08;  // Zombie gone when < 8% through (near start)
+const float L2_L3_GONE_DISTANCE = 0.05;  // L2/L3 gone when < 5% through
+const float L4_GONE_DISTANCE = 0.10;  // L4 gone when < 10% through
 
 //============================================
 // DYNAMIC CALIBRATION
@@ -275,12 +280,12 @@ int pendingQueueSize = 0;
 
 //============================================
 // SEQUENCING SYSTEM
-// Sequences targets in groups of exactly 2
+// Sequences targets in groups of 4 (3/4 unique, 1 repeat allowed for short lanes L2/L3)
 // Primary sort: distance from end of lane (using calibration ranges)
 // Secondary sort: velocity and direction
 //============================================
-const int SEQUENCE_SIZE = 2;              // Exactly 2 targets per sequence
-int targetSequence[SEQUENCE_SIZE] = {-1, -1};  // Ordered list of lanes in current sequence
+const int SEQUENCE_SIZE = 4;              // 4 targets per sequence
+int targetSequence[SEQUENCE_SIZE] = {-1, -1, -1, -1};  // Ordered list of lanes in current sequence
 int sequenceIndex = 0;                    // Current position in sequence
 bool sequenceActive = false;              // Is a sequence currently active?
 bool sequenceLocked = false;              // Is sequence locked? (stick to sequence)
@@ -298,8 +303,9 @@ const unsigned long STOPPED_TIMEOUT = 2000;            // Skip lanes that have b
 // DWELL TRACKING
 //============================================
 unsigned long arrivalTime = 0;
-float peakZombieDistance = 1.0;
-float arrivalZombieDistance = 1.0;
+// NEW SEMANTICS: 0.0 = at start (reset value), higher = closer to impact
+float peakZombieDistance = 0.0;
+float arrivalZombieDistance = 0.0;
 
 const unsigned long MIN_DWELL_TIME = 350;
 const unsigned long NORMAL_DWELL_TIME = 450;
@@ -543,12 +549,14 @@ void commitToTarget(int lane) {
   }
   
   float dist = zombieDistances[lane];
-  
+
   if (ProxSensors[lane].direction == BACKWARD) return;
-  bool isEmergency = (dist < ABSOLUTE_OVERRIDE_DISTANCE && ProxSensors[lane].direction == FORWARD);
+  // NEW SEMANTICS: Higher dist = more urgent (closer to impact)
+  bool isEmergency = (dist > ABSOLUTE_OVERRIDE_DISTANCE && ProxSensors[lane].direction == FORWARD);
   if (!isEmergency) {
     float laneThreshold = getEarlyEngageThreshold(lane);
-    if (dist > laneThreshold || dist < MIN_ENGAGE_THRESHOLD) return;
+    // Valid range: dist > laneThreshold (past minimum) AND dist < MIN_ENGAGE (not too close to impact)
+    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) return;
     if (ProxSensors[lane].direction != FORWARD) return;
     if (sequenceLocked && sequenceActive && committedLane >= 0) {
       bool isInSequence = false;
@@ -560,34 +568,34 @@ void commitToTarget(int lane) {
       }
       if (!isInSequence) {
         float committedDist = zombieDistances[committedLane];
-        float distanceGap = dist - committedDist;
+        float distanceGap = dist - committedDist;  // Positive = this lane further through
         float velocity = abs(zombieVelocities[lane]);
         bool isFastMoving = (velocity > 0.0005);
         float effectiveTTI = getEffectiveTTI(lane);
         bool isUrgent = (effectiveTTI < 800);
         bool isCritical = laneIsCritical[lane];
         bool committedIsCritical = (committedLane >= 0) ? laneIsCritical[committedLane] : false;
-        float breakThreshold = laneIsShort[lane] ? -0.20 : -0.25;
-        bool shouldBreak = (distanceGap < breakThreshold) ||
+        float breakThreshold = laneIsShort[lane] ? 0.20 : 0.25;  // Positive gap = further through = more urgent
+        bool shouldBreak = (distanceGap > breakThreshold) ||
                            (isCritical && !committedIsCritical) ||
-                           (isFastMoving && distanceGap < -0.15 && dist < 0.50) ||
-                           (isUrgent && distanceGap < -0.10 && dist < 0.40);
+                           (isFastMoving && distanceGap > 0.15 && dist > 0.50) ||
+                           (isUrgent && distanceGap > 0.10 && dist > 0.60);
         if (!shouldBreak) return;
       }
     }
     bool isCritical = laneIsCritical[lane];
-    
+
     if (!sequenceLocked || !sequenceActive || committedLane < 0 || isCritical) {
-      float closestDist = 1.0;
+      float closestDist = 0.0;  // Track highest dist (closest to impact)
       int closestLane = -1;
-      
+
       for (int i = 0; i < 4; i++) {
         // Only consider forward-moving targets in valid range - use lane-specific threshold
-        if (i != lane && 
+        if (i != lane &&
             ProxSensors[i].direction == FORWARD &&
-            zombieDistances[i] < getEarlyEngageThreshold(i) &&
-            zombieDistances[i] > MIN_ENGAGE_THRESHOLD) {
-          if (zombieDistances[i] < closestDist) {
+            zombieDistances[i] > getEarlyEngageThreshold(i) &&
+            zombieDistances[i] < MIN_ENGAGE_THRESHOLD) {
+          if (zombieDistances[i] > closestDist) {  // Higher = closer to impact
             closestDist = zombieDistances[i];
             closestLane = i;
           }
@@ -877,8 +885,9 @@ int getBestTarget() {
     
     float dist = zombieDistances[i];
     // Use lane-specific threshold - L2/L3 engage earlier
+    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
     float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < MIN_ENGAGE_THRESHOLD || dist > laneThreshold) continue;
+    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;
     
     float score = calculateThreatScore(i);
     if (score > bestScore) {
@@ -934,15 +943,16 @@ void calculateNewSequence() {
   int activeLanes = 0;
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
-    lanes[i].distanceFromEnd = 1.0f - zombieDistances[i];  // Distance from end (primary)
+    // NEW SEMANTICS: zombieDistances[i] = % through lane (0% at start, 100% at impact)
+    lanes[i].distanceFromEnd = zombieDistances[i];  // Distance through lane (higher = closer to impact)
     lanes[i].velocity = abs(zombieVelocities[i]);
     lanes[i].direction = ProxSensors[i].direction;
-    
+
     // Only include forward-moving targets in valid range
     bool isForwardMoving = (ProxSensors[i].direction == FORWARD);
     float laneThreshold = getEarlyEngageThreshold(i);
-    bool isInRange = (zombieDistances[i] < laneThreshold &&
-                      zombieDistances[i] > MIN_ENGAGE_THRESHOLD);
+    bool isInRange = (zombieDistances[i] > laneThreshold &&
+                      zombieDistances[i] < MIN_ENGAGE_THRESHOLD);
     
     // Check if lane was recently attempted - exclude if within cooldown
     bool recentlyAttempted = false;
@@ -1055,8 +1065,9 @@ int getNextSequenceTarget() {
     bool isForward = (ProxSensors[lane].direction == FORWARD);
     bool isBackward = (ProxSensors[lane].direction == BACKWARD);
     float laneThreshold = getEarlyEngageThreshold(lane);
-    bool isInRange = (zombieDistances[lane] < laneThreshold &&
-                      zombieDistances[lane] > MIN_ENGAGE_THRESHOLD);
+    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
+    bool isInRange = (zombieDistances[lane] > laneThreshold &&
+                      zombieDistances[lane] < MIN_ENGAGE_THRESHOLD);
     
     // If target is backward-moving, skip it
     if (isBackward) {
@@ -1136,9 +1147,10 @@ int checkSequenceEmergency() {
     // Only check forward-moving targets
     if (ProxSensors[i].direction != FORWARD) continue;
     
-    // Emergency threshold - very close to wall
-    // Use lane-specific thresholds (L1/L4 at 15%, L2/L3 at 20%)
-    if (zombieDistances[i] < OVERRIDE_THRESHOLD[i]) {
+    // Emergency threshold - very close to impact
+    // Use lane-specific thresholds (L1/L4 at 90%, L2/L3 at 50%)
+    // NEW SEMANTICS: Higher dist = closer to impact
+    if (zombieDistances[i] > OVERRIDE_THRESHOLD[i]) {
       return i;
     }
   }
@@ -1190,9 +1202,10 @@ void updatePendingQueue() {
       
       // Keep if zombie present and moving forward
       // Use lane-specific threshold - L2/L3 engage earlier
+      // NEW SEMANTICS: Keep if dist > laneThreshold (past minimum engagement point)
       if (ProxSensors[lane].direction == FORWARD) {
         float laneThreshold = getEarlyEngageThreshold(lane);
-        if (zombieDistances[lane] < laneThreshold) {
+        if (zombieDistances[lane] > laneThreshold) {
           pendingQueue[newSize++] = lane;
         }
       }
@@ -1418,12 +1431,13 @@ void loop() {
   updateSensors();
   
   // OPTIMIZATION: Update cached critical status efficiently
+  // NEW SEMANTICS: Higher dist = closer to impact = critical
   if (now - lastCriticalUpdate >= CRITICAL_UPDATE_INTERVAL) {
     for (int i = 0; i < 4; i++) {
       if (laneIsShort[i]) {
-        laneIsCritical[i] = (zombieDistances[i] < SHORT_LANE_CRITICAL_DISTANCE);
+        laneIsCritical[i] = (zombieDistances[i] > SHORT_LANE_CRITICAL_DISTANCE);
       } else {
-        laneIsCritical[i] = (zombieDistances[i] < LONG_LANE_CRITICAL_DISTANCE);
+        laneIsCritical[i] = (zombieDistances[i] > LONG_LANE_CRITICAL_DISTANCE);
       }
     }
     lastCriticalUpdate = now;
@@ -1498,19 +1512,20 @@ void loop() {
         if (ProxSensors[i].direction == BACKWARD) continue;
         // CRITICAL: Allow STOPPED lanes if they're at 95%+ through lane (about to impact!)
         // Also allow FORWARD lanes
+        // NEW SEMANTICS: Higher dist = closer to impact
         float dist = zombieDistances[i];
-        bool isAboutToImpact = (dist < 0.05 && dist > 0.01);  // 95%+ through lane
+        bool isAboutToImpact = (dist > 0.95 && dist < 0.99);  // 95%+ through lane
         if (ProxSensors[i].direction != FORWARD && !(ProxSensors[i].direction == STOPPED && isAboutToImpact)) {
           continue;  // Skip non-forward lanes, unless they're stopped and about to impact
         }
         // TIGHTER: Longer anti-return period - prevent overriding back to same lane
         // CRITICAL FIX: Increase anti-return time to prevent loops
         if (i == lastOverrideLane && timeSinceOverride < 5000) continue;  // 5s anti-return to prevent loops (increased from 3s)
-        
+
         // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
         // EXCEPTION: Allow STOPPED lanes if they're at 95%+ through lane (about to impact!)
         dist = zombieDistances[i];
-        isAboutToImpact = (dist < 0.05 && dist > 0.01);  // 95%+ through lane
+        isAboutToImpact = (dist > 0.95 && dist < 0.99);  // 95%+ through lane
         if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0 && !isAboutToImpact) {
           unsigned long stoppedDuration = millis() - laneStoppedTime[i];
           if (stoppedDuration > STOPPED_TIMEOUT) {
@@ -1585,37 +1600,38 @@ void loop() {
           // L2/L3 have shorter lanes and must be protected to prevent impact
           bool isLongLane = laneIsLong[i];
           bool committedIsShortLane = laneIsShort[committedLane];
-          
+
           if (isLongLane && committedIsShortLane && !isCritical) {
             // Long lane (L1/L4) trying to override short lane (L2/L3) when not critical
-            // STRICT: Only allow if new lane is MUCH closer (at least 50% closer) OR is critical
-            // This ensures L2/L3 have priority when distances are similar
-            if (dist >= committedDist * 0.5) {
+            // STRICT: Only allow if new lane is MUCH further through (50%+ more than committed)
+            // NEW SEMANTICS: Higher dist = closer to impact
+            if (dist <= committedDist + 0.50) {
               continue;  // Skip - don't allow override, protect short lanes
             }
           }
-          
+
           // When batch is locked, only override for:
           // 0. HIGHEST: ANY lane at 95%+ through lane (about to impact!) - OVERRIDE EVERYTHING
           // 1. Critical vs non-critical (game-ending threat)
-          // 2. Short lane getting close (< 50%) while committed to long lane - MUCH EARLIER!
-          // 3. Extreme emergency (< 10% distance)
-          // 4. Both critical but new is significantly closer (at least 30% closer, not 20%)
-          // 5. L4 at 90%+ through lane (dist < 0.10) - HIGH PRIORITY
-          if (dist < 0.05 && ProxSensors[i].direction == FORWARD && dist > 0.01) {
-            // ANY lane at 95%+ through lane (about to impact!) - override immediately, even if batch locked!
+          // 2. Short lane getting close (> 50%) while committed to long lane - MUCH EARLIER!
+          // 3. Extreme emergency (> 90% through)
+          // 4. Both critical but new is significantly further through (at least 30% more)
+          // 5. L4 at 90%+ through lane - HIGH PRIORITY
+          // NEW SEMANTICS: Higher dist = closer to impact
+          if (dist > 0.95 && ProxSensors[i].direction == FORWARD && dist < 0.99) {
+            // ANY lane at 95%+ through lane (about to impact!) - override immediately!
             shouldOverride = true;
-          } else if (i == 3 && dist < 0.10 && ProxSensors[i].direction == FORWARD && dist > 0.02) {
+          } else if (i == 3 && dist > 0.90 && ProxSensors[i].direction == FORWARD && dist < 0.98) {
             // L4 at 90%+ through lane - override immediately!
             shouldOverride = true;
           } else if (isCritical && !committedIsCritical) {
             shouldOverride = true;  // Critical vs non-critical = always override
-          } else if (isShortLane && committedIsLongLane && dist < 0.50) {
-            shouldOverride = true;  // Short lane at 50% through lane while at long lane - override immediately!
-          } else if (dist < 0.10) {
-            shouldOverride = true;  // Extreme emergency
-          } else if (isCritical && committedIsCritical && dist < committedDist * 0.7) {
-            shouldOverride = true;  // Both critical, new is 30%+ closer (stricter)
+          } else if (isShortLane && committedIsLongLane && dist > 0.50) {
+            shouldOverride = true;  // Short lane past 50% while at long lane - override!
+          } else if (dist > 0.90) {
+            shouldOverride = true;  // Extreme emergency (90%+ through)
+          } else if (isCritical && committedIsCritical && dist > committedDist + 0.30) {
+            shouldOverride = true;  // Both critical, new is 30%+ further through
           }
           // Otherwise, stick to batch sequence
         } else {
@@ -1653,72 +1669,72 @@ void loop() {
           // L2/L3 have shorter lanes and must be protected to prevent impact
           bool isLongLane = laneIsLong[i];
           bool committedIsShortLane = laneIsShort[committedLane];
-          
+
           if (isLongLane && committedIsShortLane && !isCritical) {
             // Long lane (L1/L4) trying to override short lane (L2/L3) when not critical
-            // STRICT: Only allow if new lane is MUCH closer (at least 50% closer) OR is critical
-            // This ensures L2/L3 have priority when distances are similar
-            if (dist >= committedDist * 0.5) {
+            // STRICT: Only allow if new lane is MUCH further through (50%+ more than committed)
+            // NEW SEMANTICS: Higher dist = closer to impact
+            if (dist <= committedDist + 0.50) {
               continue;  // Skip - don't allow override, protect short lanes
             }
           }
-          
+
           // Batch not locked - use normal override criteria
           // CRITICAL: Check if L4 is also close - if so, reduce L2/L3 override aggressiveness
-          // Only consider L4 "close" if it's actually moving forward and not at start position
-          bool l4AlsoClose = (zombieDistances[3] < 0.10 && 
-                              ProxSensors[3].direction == FORWARD && 
-                              zombieDistances[3] > 0.02);  // L4 at 90%+ through lane (very close!) and moving forward
-          
-          // HIGHEST PRIORITY 0: ANY lane at 95%+ through lane (dist < 0.05) = IMMEDIATE OVERRIDE
+          // Only consider L4 "close" if it's actually moving forward and past start position
+          // NEW SEMANTICS: Higher dist = closer to impact
+          bool l4AlsoClose = (zombieDistances[3] > 0.90 &&
+                              ProxSensors[3].direction == FORWARD &&
+                              zombieDistances[3] < 0.98);  // L4 at 90%+ through lane and moving forward
+
+          // HIGHEST PRIORITY 0: ANY lane at 95%+ through lane = IMMEDIATE OVERRIDE
           // This is game-ending - zombie is about to impact!
-          // CRITICAL: Only if actually moving forward and not at start position
-          if (dist < 0.05 && ProxSensors[i].direction == FORWARD && dist > 0.01) {
-            // ANY lane at 95%+ through lane (about to impact!) - override immediately, no questions asked!
+          // NEW SEMANTICS: Higher dist = closer to impact
+          if (dist > 0.95 && ProxSensors[i].direction == FORWARD && dist < 0.99) {
+            // ANY lane at 95%+ through lane (about to impact!) - override immediately!
             shouldOverride = true;
           }
           // PRIORITY 1: Long lane (L4) getting very close = HIGH PRIORITY
-          // L4 at 90%+ through lane (dist < 0.10) needs immediate attention
-          // CRITICAL: Only override if L4 is actually moving FORWARD and not at start position
-          else if (i == 3 && dist < 0.10 && ProxSensors[i].direction == FORWARD && dist > 0.02) {
-            // L4 is at 90%+ through lane (but not at start) and moving forward - override immediately!
+          // L4 at 90%+ through lane needs immediate attention
+          else if (i == 3 && dist > 0.90 && ProxSensors[i].direction == FORWARD && dist < 0.98) {
+            // L4 is at 90%+ through lane and moving forward - override immediately!
             shouldOverride = true;
           }
           // PRIORITY 2: Short lane getting close while committed to long lane = IMMEDIATE OVERRIDE
           // BUT: Reduce aggressiveness if L4 is also very close
-          // CRITICAL FIX: Distance is LOW when close to impact (0.0 = impact, 1.0 = far)
-          // So check for LOW distance values, not HIGH ones
-          // FIXED: Override at 50% through lane, but only if L4 isn't also critical
-          else if (isShortLane && committedIsLongLane && dist < 0.50) {
-            // If L4 is also very close, require short lane to be closer (40% through lane)
-            if (l4AlsoClose && dist > 0.40) {
+          // NEW SEMANTICS: Higher dist = closer to impact
+          else if (isShortLane && committedIsLongLane && dist > 0.50) {
+            // If L4 is also very close, require short lane to be even closer (60%+ through)
+            if (l4AlsoClose && dist < 0.60) {
               shouldOverride = false;  // L4 is more urgent - don't override to short lane yet
             } else {
-              // Short lane at < 50% distance (50%+ through lane) while at long lane = override immediately!
+              // Short lane past 50% while at long lane = override immediately!
               shouldOverride = true;
             }
           }
           // PRIORITY 3: Short lane getting close while committed to another short lane
-          else if (isShortLane && !committedIsLongLane && dist < 0.70) {
-            // Short lane at < 70% distance (30%+ through lane) while at another lane = override
+          else if (isShortLane && !committedIsLongLane && dist > 0.30) {
+            // Short lane past 30% while at another lane = override
             shouldOverride = true;
           }
           // PRIORITY 4: Critical vs non-critical = override
           else if (isCritical && !committedIsCritical) {
             shouldOverride = true;
           }
-          // PRIORITY 5: Critical and much closer (at least 30% closer)
-          else if (isCritical && committedIsCritical && dist < committedDist * 0.7) {
+          // PRIORITY 5: Critical and much further through (at least 30% more)
+          // NEW SEMANTICS: Higher dist = closer to impact
+          else if (isCritical && committedIsCritical && dist > committedDist + 0.30) {
             shouldOverride = true;
           }
-          // PRIORITY 6: Short lane getting close while long lane is at less urgent distance
-          // CRITICAL FIX: Check for LOW distance (close to impact), not HIGH
-          else if (isShortLane && dist < 0.60 && committedIsLongLane && committedDist > 0.30) {
-            // Short lane at < 60% distance (40%+ through lane) while long lane still has 30%+ distance = override
+          // PRIORITY 6: Short lane getting close while long lane is less urgent
+          // NEW SEMANTICS: Higher dist = closer to impact
+          else if (isShortLane && dist > 0.40 && committedIsLongLane && committedDist < 0.70) {
+            // Short lane past 40% while long lane still below 70% = override
             shouldOverride = true;
           }
-          // PRIORITY 7: Below override threshold and committed is not critical
-          else if (dist < OVERRIDE_THRESHOLD[i] && !committedIsCritical) {
+          // PRIORITY 7: Above override threshold and committed is not critical
+          // NEW SEMANTICS: Higher dist = closer to impact
+          else if (dist > OVERRIDE_THRESHOLD[i] && !committedIsCritical) {
             shouldOverride = true;
           }
         }
@@ -1896,28 +1912,30 @@ void chooseAndCommitTarget() {
     
     float dist = zombieDistances[lane];
     // Use lane-specific threshold - L2/L3 engage earlier
+    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
     float laneThreshold = getEarlyEngageThreshold(lane);
-    if (dist < MIN_ENGAGE_THRESHOLD || dist > laneThreshold) continue;
-    
+    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;
+
     float score = calculateThreatScore(lane);
     if (score > bestScore) {
       bestScore = score;
       bestLane = lane;
     }
   }
-  
+
   // Now check all lanes for new targets - might be better than queued
   for (int i = 0; i < 4; i++) {
     // CRITICAL: NEVER target backward-moving zombies - they're retreating!
     if (ProxSensors[i].direction == BACKWARD) continue;
     // Skip non-forward targets
     if (ProxSensors[i].direction != FORWARD) continue;
-    
+
     float dist = zombieDistances[i];
-    
+
     // Skip if zombie is outside valid engagement range - use lane-specific threshold
+    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
     float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < MIN_ENGAGE_THRESHOLD || dist > laneThreshold) continue;
+    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;
     
     float score = calculateThreatScore(i);
     
@@ -2109,7 +2127,8 @@ void dwellAtTarget() {
     if (ProxSensors[i].direction != FORWARD) continue;  // Only forward-moving
     
     float dist = zombieDistances[i];
-    bool isExtremeEmergency = (dist < 0.08);  // Only extreme emergencies can override during cooldown
+    // NEW SEMANTICS: Higher dist = closer to impact
+    bool isExtremeEmergency = (dist > 0.92);  // Only extreme emergencies can override during cooldown
     
     // ANTI-OSCILLATION: Require minimum commitment time unless extreme emergency
     if (commitmentDuration < MIN_COMMITMENT_TIME && !isExtremeEmergency) {
@@ -2180,17 +2199,18 @@ void dwellAtTarget() {
       
       // When batch is locked, only override for:
       // 1. Critical vs non-critical (game-ending threat)
-      // 2. Short lane getting very close (< 15%) while committed to long lane
-      // 3. Extreme emergency (< 10% distance)
-      // 4. Both critical but new is significantly closer (at least 20% closer)
+      // 2. Short lane getting very close (> 85%) while committed to long lane
+      // 3. Extreme emergency (> 90% through)
+      // 4. Both critical but new is significantly further through (at least 20% more)
+      // NEW SEMANTICS: Higher dist = closer to impact
       if (isCritical && !laneIsCritical[activeTargetIndex]) {
         shouldOverride = true;  // Critical vs non-critical = always override
-      } else if (isShortLane && committedIsLongLane && dist < 0.15) {
+      } else if (isShortLane && committedIsLongLane && dist > 0.85) {
         shouldOverride = true;  // Short lane very close while at long lane
-      } else if (dist < 0.10) {
+      } else if (dist > 0.90) {
         shouldOverride = true;  // Extreme emergency
-      } else if (isCritical && laneIsCritical[activeTargetIndex] && dist < committedDist * 0.8) {
-        shouldOverride = true;  // Both critical, new is 20%+ closer
+      } else if (isCritical && laneIsCritical[activeTargetIndex] && dist > committedDist + 0.20) {
+        shouldOverride = true;  // Both critical, new is 20%+ further through
       }
       // Otherwise, stick to batch sequence
     } else {
@@ -2225,42 +2245,43 @@ void dwellAtTarget() {
       }
       
       // Batch not locked - use normal override criteria
-      // CRITICAL FIX: Distance is normalized where 0.0 = at impact, 1.0 = far
-      // So LOW distance values mean close to impact (urgent!)
-      // If L3 shows "83%" remaining, distance = 0.17 (17% through lane, 83% remaining)
-      // We want to override when distance is LOW (close to impact)
-      // FIXED: Override MUCH earlier for short lanes, but prioritize L4 when it's close!
-      
-      // HIGHEST PRIORITY 0: ANY lane at 95%+ through lane (dist < 0.05) = IMMEDIATE OVERRIDE
+      // NEW SEMANTICS: Higher dist = closer to impact (0% = at start, 100% = at impact)
+      // So HIGH distance values mean close to impact (urgent!)
+      // If L3 shows "83%" through lane, distance = 0.83 (urgent!)
+      // We want to override when distance is HIGH (close to impact)
+
+      // HIGHEST PRIORITY 0: ANY lane at 95%+ through lane = IMMEDIATE OVERRIDE
       // This is game-ending - zombie is about to impact!
-      // CRITICAL: Only if actually moving forward and not at start position
-      if (dist < 0.05 && ProxSensors[i].direction == FORWARD && dist > 0.01) {
-        // ANY lane at 95%+ through lane (about to impact!) - override immediately, no questions asked!
+      // NEW SEMANTICS: Higher dist = closer to impact
+      if (dist > 0.95 && ProxSensors[i].direction == FORWARD && dist < 0.99) {
+        // ANY lane at 95%+ through lane (about to impact!) - override immediately!
         shouldOverride = true;
       }
       // PRIORITY 1: L4 getting very close (90%+ through lane) = highest priority
-      // CRITICAL: Only override if L4 is actually moving FORWARD and not at start position
-      else if (i == 3 && dist < 0.10 && ProxSensors[i].direction == FORWARD && dist > 0.02) {
-        // L4 at 90%+ through lane (but not at start) and moving forward - override immediately!
+      else if (i == 3 && dist > 0.90 && ProxSensors[i].direction == FORWARD && dist < 0.98) {
+        // L4 at 90%+ through lane and moving forward - override immediately!
         shouldOverride = true;
       } else if (isShortLane && committedIsLongLane) {
         // Short lane at 50% through lane while at long lane = override immediately!
         // BUT: Check if L4 is also very close - if so, require short lane to be closer
-        // Only consider L4 "close" if it's actually moving forward and not at start position
-        bool l4AlsoClose = (zombieDistances[3] < 0.10 && 
-                            ProxSensors[3].direction == FORWARD && 
-                            zombieDistances[3] > 0.02);
-        if (l4AlsoClose && dist > 0.40) {
-          shouldOverride = false;  // L4 is more urgent
+        // NEW SEMANTICS: Higher dist = closer to impact
+        bool l4AlsoClose = (zombieDistances[3] > 0.90 &&
+                            ProxSensors[3].direction == FORWARD &&
+                            zombieDistances[3] < 0.98);
+        // NEW SEMANTICS: Higher dist = closer to impact
+        if (l4AlsoClose && dist < 0.60) {
+          shouldOverride = false;  // L4 is more urgent - short lane not close enough yet
         } else {
-          if (isCritical || dist < 0.50) shouldOverride = true;
+          if (isCritical || dist > 0.50) shouldOverride = true;
         }
       } else if (isShortLane && !committedIsLongLane) {
-        // Short lane at 70% through lane while at another lane = override
-        if (dist < 0.70) shouldOverride = true;
+        // Short lane past 30% while at another lane = override
+        // NEW SEMANTICS: Higher dist = closer to impact
+        if (dist > 0.30) shouldOverride = true;
       } else if (isCritical && !laneIsCritical[activeTargetIndex]) {
         shouldOverride = true;
-      } else if (dist < OVERRIDE_THRESHOLD[i]) {
+      } else if (dist > OVERRIDE_THRESHOLD[i]) {
+        // NEW SEMANTICS: Higher dist = closer to impact
         shouldOverride = true;
       }
     }
@@ -2313,8 +2334,8 @@ void dwellAtTarget() {
     // CRITICAL: Clean up all dwell state variables before transitioning
     stoppedStartTime = 0;
     backwardStartTime = 0;
-    peakZombieDistance = 1.0;  // Reset for next target
-    arrivalZombieDistance = 1.0;  // Reset for next target
+    peakZombieDistance = 0.0;  // Reset for next target (NEW SEMANTICS: 0 = at start)
+    arrivalZombieDistance = 0.0;  // Reset for next target
     arrivalTime = 0;  // Reset for next target
     
     DBG_PRINT(F("!!! OVERRIDE L"));
@@ -2349,10 +2370,11 @@ void dwellAtTarget() {
   
   float currentDist = zombieDistances[activeTargetIndex];
   int currentDir = ProxSensors[activeTargetIndex].direction;
-  
+
   unsigned long maxDwell = (activeTargetIndex == 3) ? L4_DWELL_TIME : MAX_DWELL_TIME;
-  
-  if (currentDist < peakZombieDistance) {
+
+  // NEW SEMANTICS: Higher dist = closer to impact, so peak is the HIGHEST value
+  if (currentDist > peakZombieDistance) {
     peakZombieDistance = currentDist;
   }
   
@@ -2365,8 +2387,8 @@ void dwellAtTarget() {
     // CRITICAL: Clean up all dwell state variables before transitioning
     backwardStartTime = 0;
     stoppedStartTime = 0;
-    peakZombieDistance = 1.0;  // Reset for next target
-    arrivalZombieDistance = 1.0;  // Reset for next target
+    peakZombieDistance = 0.0;  // Reset for next target (NEW SEMANTICS: 0 = at start)
+    arrivalZombieDistance = 0.0;  // Reset for next target
     arrivalTime = 0;  // Reset for next target
     
     // Record hit with previous lane (before releaseCommitment clears it)
@@ -2411,17 +2433,19 @@ void dwellAtTarget() {
     return;  // Exit immediately - no further dwell checks
   }
   
-  if (dwellTime >= MIN_DWELL_TIME && peakZombieDistance < 0.15) {
-    // Zombie got to within 15% (close to wall)
-    float retreatAmount = currentDist - peakZombieDistance;
+  // NEW SEMANTICS: Higher peakZombieDistance = got closer to impact
+  if (dwellTime >= MIN_DWELL_TIME && peakZombieDistance > 0.85) {
+    // Zombie got past 85% (close to impact)
+    // Retreat = currentDist < peakZombieDistance (moved back toward start)
+    float retreatAmount = peakZombieDistance - currentDist;
     if (retreatAmount > 0.04) {  // Moved back 4%+ from peak
       int previousLane = activeTargetIndex;  // Save for recordHit
-      
+
       // CRITICAL: Clean up all dwell state variables before transitioning
       stoppedStartTime = 0;
       backwardStartTime = 0;
-      peakZombieDistance = 1.0;  // Reset for next target
-      arrivalZombieDistance = 1.0;  // Reset for next target
+      peakZombieDistance = 0.0;  // Reset for next target (NEW SEMANTICS: 0 = at start)
+      arrivalZombieDistance = 0.0;  // Reset for next target
       arrivalTime = 0;  // Reset for next target
       
       // Record hit with previous lane (before releaseCommitment clears it)
@@ -2464,16 +2488,18 @@ void dwellAtTarget() {
     }
   }
   
+  // NEW SEMANTICS: Lower dist = retreated toward start
+  // Retreat confirmed when dist drops below threshold AND has retreated at least 15%
   if (dwellTime >= MIN_DWELL_TIME &&
-      currentDist > RETREAT_CONFIRMED_DISTANCE && 
-      currentDist > arrivalZombieDistance + 0.15) {
+      currentDist < RETREAT_CONFIRMED_DISTANCE &&
+      currentDist < arrivalZombieDistance - 0.15) {
     int previousLane = activeTargetIndex;  // Save for recordHit
     
     // CRITICAL: Clean up all dwell state variables before transitioning
     stoppedStartTime = 0;
     backwardStartTime = 0;
-    peakZombieDistance = 1.0;  // Reset for next target
-    arrivalZombieDistance = 1.0;  // Reset for next target
+    peakZombieDistance = 0.0;  // Reset for next target (NEW SEMANTICS: 0 = at start)
+    arrivalZombieDistance = 0.0;  // Reset for next target
     arrivalTime = 0;  // Reset for next target
     
     // Record hit with previous lane (before releaseCommitment clears it)
@@ -2523,15 +2549,16 @@ void dwellAtTarget() {
       // Check if distance barely changed - zombie truly stalled
       float distChange = abs(currentDist - stoppedStartDistance);
       if (distChange < 0.08) {  // Increased from 5% to 8% - more tolerant
-        // If zombie was close, probably a hit - be generous
-        if (peakZombieDistance < 0.30) {  // INCREASED threshold - more generous hit credit (was 0.25)
+        // If zombie was close (past 70%), probably a hit - be generous
+        // NEW SEMANTICS: Higher peakZombieDistance = got closer to impact
+        if (peakZombieDistance > 0.70) {
           int previousLane = activeTargetIndex;  // Save for recordHit
-          
+
           // CRITICAL: Clean up all dwell state variables before transitioning
           stoppedStartTime = 0;
           backwardStartTime = 0;
-          peakZombieDistance = 1.0;  // Reset for next target
-          arrivalZombieDistance = 1.0;  // Reset for next target
+          peakZombieDistance = 0.0;  // Reset for next target (NEW SEMANTICS: 0 = at start)
+          arrivalZombieDistance = 0.0;  // Reset for next target
           arrivalTime = 0;  // Reset for next target
           
           // Record hit with previous lane (before releaseCommitment clears it)
@@ -2749,8 +2776,8 @@ void dwellAtTarget() {
     // CRITICAL: Clean up all dwell state variables before transitioning
     stoppedStartTime = 0;
     backwardStartTime = 0;
-    peakZombieDistance = 1.0;  // Reset for next target
-    arrivalZombieDistance = 1.0;  // Reset for next target
+    peakZombieDistance = 0.0;  // Reset for next target (NEW SEMANTICS: 0 = at start)
+    arrivalZombieDistance = 0.0;  // Reset for next target
     arrivalTime = 0;  // Reset for next target
     
     // IMPROVED: Mark lane as attempted - prevent immediate re-engagement
@@ -3175,18 +3202,18 @@ void updateSensors() {
     const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
     float currentDistance = 0.0f;
     if (range != 0.0f) {
-      // Distance calculation: Measures how far target has traveled from start toward impact
+      // Distance calculation: Uses RAW sensor value for accurate calibration
       // ProxRange[0] = high reading = target at START (close to sensor)
       // ProxRange[1] = low reading = target at IMPACT (far from sensor)
-      // Formula: high sensor (at start) → 100%, low sensor (at impact) → 0%
-      // NOTE: This is inverted - 100% means at START, 0% means at IMPACT
-      float normalized = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
+      // Formula: 0% at start (rawVal=high), 100% at impact (rawVal=low)
+      // normalized = (ProxRange[0] - rawVal) / range
+      float normalized = (float)(ProxRange[i][0] - rawVal) / range;
       currentDistance = constrain(normalized, 0.0f, 1.0f);
-      
-      // CRITICAL: Make L2/L3 appear 12% shorter to prioritize them earlier
-      // This makes them appear closer than they really are, triggering priority sooner
+
+      // CRITICAL: Make L2/L3 appear 12% further through lane to prioritize them earlier
+      // This makes them appear closer to impact than they really are
       if (i == 1 || i == 2) {  // L2 or L3 (short lanes)
-        currentDistance = currentDistance * 0.88f;  // Make appear 12% closer (shorter)
+        currentDistance = currentDistance * 1.12f;  // Make appear 12% further through lane
         currentDistance = constrain(currentDistance, 0.0f, 1.0f);
       }
     }
