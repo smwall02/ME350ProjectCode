@@ -269,51 +269,25 @@ int pendingQueue[4] = {-1, -1, -1, -1};
 int pendingQueueSize = 0;
 
 //============================================
-// BATCH TARGETING SYSTEM
-// Execute targets in planned batches of up to 2 (reduced from 3)
-// Each lane appears at most ONCE per batch
-// Recalculate only when batch complete or true emergency
+// SEQUENCING SYSTEM
+// Sequences targets in groups of exactly 3
+// Primary sort: distance from end of lane (using calibration ranges)
+// Secondary sort: velocity and direction
 //============================================
-const int MAX_BATCH_SIZE = 2;            // Reduced from 3 - gives more time to reach distant targets
-int targetBatch[4] = {-1, -1, -1, -1};   // Ordered list of lanes to hit (max 2 used, no repeats)
-int batchSize = 0;                       // How many targets in current batch
-int batchIndex = 0;                      // Current position in batch
-unsigned long batchStartTime = 0;        // When current batch was created
-bool batchActive = false;                // Is a batch currently being executed?
-bool batchLocked = false;                // Is batch sequence locked? (stick to sequence)
-
-// Anti-consecutive-lane tracking
-int lastHitLane = -1;                    // Last lane we successfully hit
-unsigned long lastHitTime = 0;           // When we hit it
-int consecutiveSameLane = 0;             // How many times we've hit same lane consecutively
-const int MAX_CONSECUTIVE_SAME = 2;      // Max times to hit same lane before forcing rotation
+const int SEQUENCE_SIZE = 3;              // Exactly 3 targets per sequence
+int targetSequence[SEQUENCE_SIZE] = {-1, -1, -1};  // Ordered list of lanes in current sequence
+int sequenceIndex = 0;                    // Current position in sequence
+bool sequenceActive = false;              // Is a sequence currently active?
+bool sequenceLocked = false;              // Is sequence locked? (stick to sequence)
 
 // ATTEMPTED LANES TRACKING - Prevent re-engaging lanes already attempted
 bool laneAttempted[4] = {false, false, false, false};  // Track which lanes we've already attempted
 unsigned long laneAttemptTime[4] = {0, 0, 0, 0};       // When we attempted each lane
-const unsigned long ATTEMPT_COOLDOWN = 1000;           // CRITICAL FIX: Reduced from 3s to 1s - allow faster re-engagement
+const unsigned long ATTEMPT_COOLDOWN = 1000;           // Allow faster re-engagement
 
 // STOPPED LANES TRACKING - Prevent targeting lanes that have been stopped too long
 unsigned long laneStoppedTime[4] = {0, 0, 0, 0};       // When each lane became STOPPED (0 = not stopped)
 const unsigned long STOPPED_TIMEOUT = 2000;            // Skip lanes that have been STOPPED for > 2 seconds
-
-// Batch statistics for debugging
-int batchesCompleted = 0;
-int batchesReset = 0;
-
-// Lane coverage tracking: Ensure all 4 lanes hit at least once every 3 batches (6 targets)
-bool laneHitInSequence[4] = {false, false, false, false};  // Track which lanes hit in current sequence
-int targetsInSequence = 0;  // Count targets hit in current sequence (reset after 6)
-const int SEQUENCE_TARGET_COUNT = 6;  // 3 batches * 2 targets = 6 targets per sequence
-
-// Cooldown tracking to prevent spam and rapid retries
-unsigned long lastSkipMessageTime = 0;
-unsigned long lastBatchSkipTime = 0;
-int lastSkippedLane = -1;
-const unsigned long SKIP_MESSAGE_COOLDOWN = 2000;
-const unsigned long BATCH_SKIP_COOLDOWN = 500;
-unsigned long lastBatchRecalcTime = 0;
-const unsigned long BATCH_RECALC_COOLDOWN = 300;
 
 //============================================
 // DWELL TRACKING
@@ -566,15 +540,15 @@ void commitToTarget(int lane) {
     float laneThreshold = getEarlyEngageThreshold(lane);
     if (dist > laneThreshold || dist < MIN_ENGAGE_THRESHOLD) return;
     if (ProxSensors[lane].direction != FORWARD) return;
-    if (batchLocked && batchActive && committedLane >= 0) {
-      bool isInBatch = false;
-      for (int i = 0; i < batchSize; i++) {
-        if (targetBatch[i] == lane) {
-          isInBatch = true;
+    if (sequenceLocked && sequenceActive && committedLane >= 0) {
+      bool isInSequence = false;
+      for (int i = 0; i < SEQUENCE_SIZE; i++) {
+        if (targetSequence[i] == lane) {
+          isInSequence = true;
           break;
         }
       }
-      if (!isInBatch) {
+      if (!isInSequence) {
         float committedDist = zombieDistances[committedLane];
         float distanceGap = dist - committedDist;
         float velocity = abs(zombieVelocities[lane]);
@@ -593,7 +567,7 @@ void commitToTarget(int lane) {
     }
     bool isCritical = laneIsCritical[lane];
     
-    if (!batchLocked || !batchActive || committedLane < 0 || isCritical) {
+    if (!sequenceLocked || !sequenceActive || committedLane < 0 || isCritical) {
       float closestDist = 1.0;
       int closestLane = -1;
       
@@ -629,11 +603,11 @@ void commitToTarget(int lane) {
   
   isCommitted = true;
   
-  // LOCK BATCH: Once we commit to first target in a batch, lock the sequence
-  if (batchActive && !batchLocked && batchSize > 0) {
-    // Check if this lane is the first target in the batch
-    if (targetBatch[0] == lane) {
-      batchLocked = true;
+  // LOCK SEQUENCE: Once we commit to first target in a sequence, lock the sequence
+  if (sequenceActive && !sequenceLocked && targetSequence[0] >= 0) {
+    // Check if this lane is the first target in the sequence
+    if (targetSequence[0] == lane) {
+      sequenceLocked = true;
     }
   }
   // Track target switch for cooldown period
@@ -697,7 +671,7 @@ bool shouldOverride(int newLane) {
   if (newIsLongLane && committedIsShortLane && !newIsCritical) {
     if (newDist >= committedDist * 0.5) return false;
   }
-  if (batchLocked && batchActive) {
+  if (sequenceLocked && sequenceActive) {
     bool newIsShortLane = laneIsShort[newLane];
     bool committedIsLongLane = laneIsLong[committedLane];
     
@@ -920,109 +894,28 @@ int getBestTarget() {
 }
 
 //============================================
-// BATCH TARGETING SYSTEM
-// Creates ordered batches of targets to hit
-// More predictable than reactive targeting
+// SEQUENCING SYSTEM
+// Creates ordered sequences of exactly 3 targets
+// Primary sort: distance from end of lane
+// Secondary sort: velocity and direction
 //============================================
 
-// Calculate and create a new target batch
-void calculateNewBatch() {
-  // CRITICAL FIX: Rate limit batch recalculation to prevent excessive recalculations
-  // This prevents the system from constantly recalculating and missing targets
+// Calculate and create a new target sequence
+void calculateNewSequence() {
   unsigned long now = millis();
-  if (lastBatchRecalcTime > 0 && (now - lastBatchRecalcTime) < BATCH_RECALC_COOLDOWN) {
-    // Still in cooldown - don't recalculate yet
-    return;
-  }
-  lastBatchRecalcTime = now;
   
-  // Clear existing batch
-  for (int i = 0; i < 4; i++) {
-    targetBatch[i] = -1;
+  // Clear existing sequence
+  for (int i = 0; i < SEQUENCE_SIZE; i++) {
+    targetSequence[i] = -1;
   }
-  batchSize = 0;
-  batchIndex = 0;
-  batchStartTime = millis();
-  
-  //============================================
-  // DETECTION: All zombies stopped and close to sensors
-  // When all zombies are at the start position (stopped, close to sensors),
-  // use a fixed sequence: L2 -> L3 -> L4 -> L1 (repeating)
-  // CRITICAL: L2 and L3 MUST be prioritized to prevent impact
-  //============================================
-  int stoppedCloseCount = 0;
-  int closeCount = 0;
-  const float CLOSE_TO_SENSOR_THRESHOLD = 0.20;  // 20% or less = close to sensor
-  
-  for (int i = 0; i < 4; i++) {
-    bool isStopped = (ProxSensors[i].direction == STOPPED || 
-                      ProxSensors[i].direction == BACKWARD ||
-                      abs(zombieVelocities[i]) < 0.0001);
-    bool isClose = (zombieDistances[i] < CLOSE_TO_SENSOR_THRESHOLD);
-    
-    if (isClose) {
-      closeCount++;
-      if (isStopped) {
-        stoppedCloseCount++;
-      }
-    }
-  }
-  
-  // CRITICAL: If ALL lanes are close (< 20%), ALWAYS use fixed sequence
-  // This ensures L2/L3 are prioritized when all zombies are at start position
-  // Also use fixed sequence if 3+ are stopped and close
-  // EXPANDED: Also trigger if all lanes are close (< 30%) - more aggressive detection
-  bool allClose = (closeCount >= 4);
-  bool allCloseExpanded = true;
-  for (int i = 0; i < 4; i++) {
-    if (zombieDistances[i] > 0.30) {
-      allCloseExpanded = false;
-      break;
-    }
-  }
-  
-  if (allClose || allCloseExpanded || stoppedCloseCount >= 3) {
-    // Fixed sequence: L2 -> L3 -> L4 -> L1 (repeating)
-    // L2 = index 1, L3 = index 2, L4 = index 3, L1 = index 0
-    const int fixedSequence[4] = {1, 2, 3, 0};  // L2, L3, L4, L1
-    
-    // Build the full sequence, including all lanes that are valid
-    // CRITICAL: Accept forward-moving targets too - they're starting to approach
-    // CRITICAL: Skip STOPPED lanes that have been stopped for too long (> 2 seconds)
-    for (int i = 0; i < 4 && batchSize < MAX_BATCH_SIZE; i++) {
-      int lane = fixedSequence[i];
-      
-      // Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
-      bool stoppedTooLong = false;
-      if (ProxSensors[lane].direction == STOPPED && laneStoppedTime[lane] > 0) {
-        unsigned long stoppedDuration = now - laneStoppedTime[lane];
-        if (stoppedDuration > STOPPED_TIMEOUT) {
-          stoppedTooLong = true;  // Skip this lane - it's been frozen too long
-        }
-      }
-      
-      bool laneValid = !stoppedTooLong && (zombieDistances[lane] < 0.35) && 
-                       (ProxSensors[lane].direction == FORWARD || 
-                        (ProxSensors[lane].direction == STOPPED && !stoppedTooLong));
-      
-      if (laneValid) {
-        targetBatch[batchSize++] = lane;
-      }
-    }
-    
-    if (batchSize > 0) {
-      batchIndex = 0;
-      batchActive = true;
-      batchLocked = true;
-      return;
-    }
-  }
+  sequenceIndex = 0;
   
   // Structure to hold lane info for sorting
   struct LaneInfo {
     int lane;
-    float effectiveTTI;
-    float distance;
+    float distanceFromEnd;  // 1.0 - zombieDistances[i] (primary sort)
+    float velocity;         // zombieVelocities[i] (secondary sort)
+    int direction;          // FORWARD=1, STOPPED=0, BACKWARD=-1 (secondary sort)
     bool isActive;
   };
   LaneInfo lanes[4];
@@ -1031,193 +924,70 @@ void calculateNewBatch() {
   int activeLanes = 0;
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
-    lanes[i].distance = zombieDistances[i];
+    lanes[i].distanceFromEnd = 1.0f - zombieDistances[i];  // Distance from end (primary)
+    lanes[i].velocity = abs(zombieVelocities[i]);
+    lanes[i].direction = ProxSensors[i].direction;
     
-    // CRITICAL: Only include forward-moving targets - exclude backward/stoppe
-    // Backward-moving targets are retreating and should NEVER be in batches
-    // Use lane-specific threshold - L2/L3 engage much earlier
-    // IMPROVED: Exclude lanes that have already been attempted (within cooldown)
-    // CRITICAL: Skip STOPPED lanes that have been stopped for too long (> 2 seconds)
+    // Only include forward-moving targets in valid range
     bool isForwardMoving = (ProxSensors[i].direction == FORWARD);
     float laneThreshold = getEarlyEngageThreshold(i);
-    bool isInRange = (lanes[i].distance < laneThreshold &&
-                      lanes[i].distance > MIN_ENGAGE_THRESHOLD);
+    bool isInRange = (zombieDistances[i] < laneThreshold &&
+                      zombieDistances[i] > MIN_ENGAGE_THRESHOLD);
     
-    // IMPROVED: Check if lane was recently attempted - exclude if within cooldown
+    // Check if lane was recently attempted - exclude if within cooldown
     bool recentlyAttempted = false;
     if (laneAttempted[i]) {
       unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
       if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
         recentlyAttempted = true;
       } else {
-        // Cooldown expired - reset attempted flag
-        laneAttempted[i] = false;
+        laneAttempted[i] = false;  // Cooldown expired
       }
     }
     
-    // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
+    // Skip STOPPED lanes that have been stopped for > 2 seconds
     bool stoppedTooLong = false;
     if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0) {
       unsigned long stoppedDuration = millis() - laneStoppedTime[i];
       if (stoppedDuration > STOPPED_TIMEOUT) {
-        stoppedTooLong = true;  // Skip this lane - it's been frozen too long
+        stoppedTooLong = true;
       }
     }
     
     lanes[i].isActive = (isForwardMoving && isInRange && !recentlyAttempted && !stoppedTooLong);
     
     if (lanes[i].isActive) {
-      lanes[i].effectiveTTI = getEffectiveTTI(i);
-      
-      // ANTI-CONSECUTIVE PENALTY: If this lane was just hit and we've hit it multiple times,
-      // add a large penalty to force rotation to other lanes
-      if (i == lastHitLane && consecutiveSameLane >= MAX_CONSECUTIVE_SAME) {
-        // Only penalize if hit recently (within 1.5 seconds)
-        if (millis() - lastHitTime < 1500) {
-          lanes[i].effectiveTTI += 1500;  // Add 1.5 second penalty
-        }
-      }
-      // Smaller penalty for just being the last hit lane (encourage rotation)
-      else if (i == lastHitLane && millis() - lastHitTime < 800) {
-        lanes[i].effectiveTTI += 300;  // Add 300ms penalty to encourage others first
-      }
-      
       activeLanes++;
-    } else {
-      lanes[i].effectiveTTI = 99999;
-      // Mark as inactive if backward-moving (even if in range)
-      if (!isForwardMoving) {
-        lanes[i].isActive = false;
-      }
     }
   }
   
-  // If no active lanes, no batch needed
+  // If no active lanes, no sequence needed
   if (activeLanes == 0) {
-    batchActive = false;
+    sequenceActive = false;
     return;
   }
   
-  // ANTI-REPETITION: If only ONE lane is active and it's the same lane we just hit,
-  // don't create a batch yet - wait for other targets or cooldown
-  if (activeLanes == 1 && consecutiveSameLane >= MAX_CONSECUTIVE_SAME) {
-    // Find which lane is active
-    int activeLane = -1;
-    for (int i = 0; i < 4; i++) {
-      if (lanes[i].isActive) {
-        activeLane = i;
-        break;
-      }
-    }
-    // If it's the same lane we've been hitting repeatedly, skip this batch
-    if (activeLane == lastHitLane && millis() - lastHitTime < 1000) {
-      batchActive = false;
-      
-      // Rate-limited skip message - only print once per cooldown period
-      unsigned long now = millis();
-      bool shouldPrint = (now - lastSkipMessageTime >= SKIP_MESSAGE_COOLDOWN) || 
-                         (lastSkippedLane != activeLane);
-      
-      
-      // Record skip time for cooldown
-      lastBatchSkipTime = now;
-      return;
-    }
-  }
-  
-  // Sort lanes by TIME TO IMPACT (TTI) - which zombie will hit first?
-  // PRIMARY SORT: Effective TTI (lowest TTI = will hit first = highest priority)
-  // SECONDARY: Lane coverage (prioritize lanes not hit in current sequence if we're close to sequence end)
-  // TERTIARY: Distance (closer = lower distance = higher priority) as tiebreaker
-  // QUATERNARY: Critical status (critical targets get slight boost)
-  // This ensures we target the zombie that will impact FIRST, but also ensures all lanes hit every 6 targets
-  // Simple bubble sort for 4 elements
-  
-  // Check if we need to prioritize coverage (getting close to end of 6-target sequence)
-  bool needCoverage = (targetsInSequence >= 4);  // After 4 targets, ensure remaining lanes are covered
-  int lanesNotHit = 0;
-  for (int k = 0; k < 4; k++) {
-    if (!laneHitInSequence[k]) lanesNotHit++;
-  }
-  
+  // Sort lanes by:
+  // PRIMARY: Distance from end of lane (higher = closer to end = higher priority)
+  // SECONDARY: Velocity (higher = faster = higher priority)
+  // TERTIARY: Direction (FORWARD > STOPPED > BACKWARD)
   for (int i = 0; i < 3; i++) {
     for (int j = i + 1; j < 4; j++) {
       bool shouldSwap = false;
       
-      // Check coverage priority (if we need coverage and one lane hasn't been hit)
-      bool iNotHit = !laneHitInSequence[lanes[i].lane];
-      bool jNotHit = !laneHitInSequence[lanes[j].lane];
-      
-      // PRIMARY: Sort by effective TTI (lower TTI = will hit sooner = higher priority)
-      // If TTI is invalid (99999), treat it as very low priority
-      float iTTI = lanes[i].effectiveTTI;
-      float jTTI = lanes[j].effectiveTTI;
-      
-      // Handle invalid TTI values
-      if (iTTI >= 99999 && jTTI < 99999) {
-        shouldSwap = true;  // j has valid TTI, i doesn't - j comes first
-      } else if (iTTI < 99999 && jTTI >= 99999) {
-        shouldSwap = false;  // i has valid TTI, j doesn't - keep i first
-      } else if (iTTI < 99999 && jTTI < 99999) {
-        // Both have valid TTI - compare them
-        // COVERAGE BOOST: If we need coverage and TTI is similar (within 20%), prioritize lanes not hit
-        float ttiDifference = abs(jTTI - iTTI);
-        float ttiPercentDiff = (ttiDifference / max(iTTI, jTTI)) * 100.0;
+      // PRIMARY: Sort by distance from end (higher = closer to end = higher priority)
+      if (lanes[j].distanceFromEnd > lanes[i].distanceFromEnd) {
+        shouldSwap = true;
+      } else if (lanes[j].distanceFromEnd == lanes[i].distanceFromEnd) {
+        // Same distance from end - use secondary criteria
         
-        if (needCoverage && lanesNotHit > 0 && ttiPercentDiff < 20.0) {
-          // TTI is similar (within 20%) - prioritize coverage
-          if (jNotHit && !iNotHit) {
-            shouldSwap = true;  // j hasn't been hit, i has - prioritize j
-          } else if (!jNotHit && iNotHit) {
-            shouldSwap = false;  // i hasn't been hit, j has - keep i first
-          } else {
-            // Both hit or both not hit - use TTI
-            if (jTTI < iTTI) {
-              shouldSwap = true;
-            }
-          }
-        } else {
-          // Normal TTI comparison
-          if (jTTI < iTTI) {
-            // j will hit sooner - higher priority
-            shouldSwap = true;
-          } else if (jTTI == iTTI) {
-            // Same TTI - prioritize coverage if needed, then distance
-            if (needCoverage && lanesNotHit > 0) {
-              if (jNotHit && !iNotHit) {
-                shouldSwap = true;  // j hasn't been hit
-              } else if (!jNotHit && iNotHit) {
-                shouldSwap = false;  // i hasn't been hit
-              } else if (lanes[j].distance < lanes[i].distance) {
-                shouldSwap = true;  // Same coverage status - use distance
-              }
-            } else {
-              // No coverage needed - use distance as tiebreaker
-              if (lanes[j].distance < lanes[i].distance) {
-                shouldSwap = true;  // j is closer at same TTI
-              } else if (lanes[j].distance == lanes[i].distance) {
-                // Same TTI and distance - use critical status as final tiebreaker
-                bool iIsCritical = laneIsCritical[lanes[i].lane];
-                bool jIsCritical = laneIsCritical[lanes[j].lane];
-                if (jIsCritical && !iIsCritical) {
-                  shouldSwap = true;  // j is critical, i is not
-                }
-              }
-            }
-          }
-        }
-      } else {
-        // Both invalid TTI - prioritize coverage if needed, then use distance
-        if (needCoverage && lanesNotHit > 0) {
-          if (jNotHit && !iNotHit) {
-            shouldSwap = true;
-          } else if (!jNotHit && iNotHit) {
-            shouldSwap = false;
-          } else if (lanes[j].distance < lanes[i].distance) {
-            shouldSwap = true;
-          }
-        } else {
-          if (lanes[j].distance < lanes[i].distance) {
+        // SECONDARY: Sort by velocity (higher = faster = higher priority)
+        if (lanes[j].velocity > lanes[i].velocity) {
+          shouldSwap = true;
+        } else if (lanes[j].velocity == lanes[i].velocity) {
+          // Same velocity - use direction as tiebreaker
+          // FORWARD (1) > STOPPED (0) > BACKWARD (-1)
+          if (lanes[j].direction > lanes[i].direction) {
             shouldSwap = true;
           }
         }
@@ -1231,251 +1001,124 @@ void calculateNewBatch() {
     }
   }
   
-  // Build batch: Add each active lane ONCE in priority order (lowest TTI first = will hit first)
-  // NO DUPLICATES - each lane appears at most once per batch
-  // LIMITED TO MAX_BATCH_SIZE (2) to allow time to reach all targets
-  // DOUBLE-CHECK: Ensure we never add backward-moving lanes to batch
-  // COVERAGE: If close to end of sequence (4+ targets), prioritize lanes not yet hit
-  
-  // First, add lanes in TTI priority order
-  for (int i = 0; i < 4; i++) {
-    if (lanes[i].isActive && batchSize < MAX_BATCH_SIZE) {
+  // Build sequence: Add exactly 3 active lanes in priority order
+  int sequenceCount = 0;
+  for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
+    if (lanes[i].isActive) {
       int lane = lanes[i].lane;
       
-      // Final safety check: Never add backward-moving lanes to batch
+      // Final safety check: Never add backward-moving lanes
       if (ProxSensors[lane].direction == FORWARD) {
-        targetBatch[batchSize++] = lane;
-      }
-      // If lane became backward since we checked, skip it
-    }
-  }
-  
-  // COVERAGE CHECK: If we're at 4+ targets and some lanes haven't been hit, ensure they're in batch
-  // This guarantees all 4 lanes are hit within every 6 targets (3 batches of 2)
-  if (needCoverage && lanesNotHit > 0 && batchSize < MAX_BATCH_SIZE) {
-    // Find lanes that haven't been hit and are active/forward
-    for (int i = 0; i < 4 && batchSize < MAX_BATCH_SIZE; i++) {
-      if (!laneHitInSequence[i] && ProxSensors[i].direction == FORWARD) {
-        // Check if this lane is already in batch
-        bool alreadyInBatch = false;
-        for (int j = 0; j < batchSize; j++) {
-          if (targetBatch[j] == i) {
-            alreadyInBatch = true;
-            break;
-          }
-        }
-        
-        if (!alreadyInBatch) {
-          // Check if lane is in valid range
-          float laneThreshold = getEarlyEngageThreshold(i);
-          if (zombieDistances[i] < laneThreshold && zombieDistances[i] > MIN_ENGAGE_THRESHOLD) {
-            targetBatch[batchSize++] = i;  // Add missing lane to ensure coverage
-          }
-        }
+        targetSequence[sequenceCount++] = lane;
       }
     }
   }
   
-  // If batch is still not full and we need coverage, replace lowest priority with missing lane
-  if (needCoverage && lanesNotHit > 0 && batchSize == MAX_BATCH_SIZE) {
-    // Find a lane that hasn't been hit and is valid
-    for (int i = 0; i < 4; i++) {
-      if (!laneHitInSequence[i] && ProxSensors[i].direction == FORWARD) {
-        // Check if already in batch
-        bool alreadyInBatch = false;
-        for (int j = 0; j < batchSize; j++) {
-          if (targetBatch[j] == i) {
-            alreadyInBatch = true;
-            break;
-          }
-        }
-        
-        if (!alreadyInBatch) {
-          float laneThreshold = getEarlyEngageThreshold(i);
-          if (zombieDistances[i] < laneThreshold && zombieDistances[i] > MIN_ENGAGE_THRESHOLD) {
-            // Replace last entry (lowest priority) with this missing lane
-            targetBatch[batchSize - 1] = i;
-            break;
-          }
-        }
-      }
-    }
+  // If we have fewer than 3 active lanes, fill remaining slots with -1
+  for (int i = sequenceCount; i < SEQUENCE_SIZE; i++) {
+    targetSequence[i] = -1;
   }
   
-  batchActive = (batchSize > 0);
-  batchLocked = false;  // Batch not locked yet - will lock when first target is committed
-  
-  // Reset skip tracking on successful batch creation
-  if (batchActive) {
-    lastBatchSkipTime = 0;
-    lastSkippedLane = -1;
-  }
-  
+  sequenceActive = (sequenceCount > 0);
+  sequenceLocked = false;  // Sequence not locked yet - will lock when first target is committed
 }
 
-// Get the next target from the current batch
-int getNextBatchTarget() {
-  // If batch is empty or exhausted, calculate new one
-  if (!batchActive || batchIndex >= batchSize) {
-    // Check cooldown - don't recalculate immediately after a skip
-    unsigned long now = millis();
-    if (lastBatchSkipTime > 0 && (now - lastBatchSkipTime) < BATCH_SKIP_COOLDOWN) {
-      // Still in cooldown period, return -1 without recalculating
-      return -1;
-    }
-    
-    calculateNewBatch();
-    if (!batchActive) return -1;
-    
-    // Reset skip cooldown on successful batch creation
-    if (batchActive) {
-      lastBatchSkipTime = 0;
-      lastSkippedLane = -1;
-    }
+// Get the next target from the current sequence
+int getNextSequenceTarget() {
+  // If sequence is empty or exhausted, calculate new one
+  if (!sequenceActive || sequenceIndex >= SEQUENCE_SIZE) {
+    calculateNewSequence();
+    if (!sequenceActive) return -1;
   }
   
-  // Find next valid target in batch
-  while (batchIndex < batchSize) {
-    int lane = targetBatch[batchIndex];
+  // Find next valid target in sequence
+  while (sequenceIndex < SEQUENCE_SIZE) {
+    int lane = targetSequence[sequenceIndex];
     
-    // CRITICAL: Remove backward-moving lanes from batch - they're retreating!
-    // Also validate forward direction, range, and lane validity
-    // Use lane-specific threshold - L2/L3 have higher thresholds
-    bool isValid = (lane >= 0 && lane < 4);
+    // Check if lane is valid
+    if (lane < 0 || lane >= 4) {
+      sequenceIndex++;
+      continue;
+    }
+    
+    // Validate forward direction, range, and lane validity
     bool isForward = (ProxSensors[lane].direction == FORWARD);
     bool isBackward = (ProxSensors[lane].direction == BACKWARD);
-    bool isStopped = (ProxSensors[lane].direction == STOPPED);
     float laneThreshold = getEarlyEngageThreshold(lane);
     bool isInRange = (zombieDistances[lane] < laneThreshold &&
                       zombieDistances[lane] > MIN_ENGAGE_THRESHOLD);
     
-    // CRITICAL: For L2/L3 in batch sequence, allow targeting even at high distance (85-100%)
-    // Short lanes move fast, so even at 85-100% we might still catch them
-    bool isShortLane = (lane == 1 || lane == 2);  // L2 or L3
-    bool isAtHighDistance = (zombieDistances[lane] >= 0.85f && zombieDistances[lane] <= 1.0f);
-    bool isStoppedBriefly = (isStopped && 
-                             (laneStoppedTime[lane] == 0 || 
-                              (millis() - laneStoppedTime[lane]) < 500));  // Only recently stopped
-    
-    // For short lanes at high distance, be more lenient - allow if forward or recently stopped
-    bool isValidForShortLane = isShortLane && isAtHighDistance && 
-                                (isForward || isStoppedBriefly) && 
-                                zombieDistances[lane] > MIN_ENGAGE_THRESHOLD;
-    
-    // If target is backward-moving, remove it from batch entirely
-    if (isValid && isBackward) {
-      // Remove this lane from batch by shifting remaining elements
-      for (int i = batchIndex; i < batchSize - 1; i++) {
-        targetBatch[i] = targetBatch[i + 1];
-      }
-      batchSize--;
-      // Don't increment batchIndex - check the same position again (now has different lane)
+    // If target is backward-moving, skip it
+    if (isBackward) {
+      sequenceIndex++;
       continue;
     }
     
-    // IMPROVED: Check if lane was recently attempted - skip if within cooldown
+    // Check if lane was recently attempted - skip if within cooldown
     bool recentlyAttempted = false;
     if (laneAttempted[lane]) {
       unsigned long timeSinceAttempt = millis() - laneAttemptTime[lane];
       if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
         recentlyAttempted = true;
       } else {
-        // Cooldown expired - reset attempted flag
-        laneAttempted[lane] = false;
+        laneAttempted[lane] = false;  // Cooldown expired
       }
     }
     
     // Check if this target is still valid (forward-moving, in range, not recently attempted)
-    // OR if it's a short lane at high distance (special case for batch sequence)
-    if (isValid && !recentlyAttempted && 
-        ((isForward && isInRange) || isValidForShortLane)) {
-      batchIndex++;  // Move to next for next call
+    if (isForward && isInRange && !recentlyAttempted) {
+      sequenceIndex++;  // Move to next for next call
       return lane;
     }
     
-    // Target no longer valid (stopped, out of range, or already attempted) - skip it
-    batchIndex++;
+    // Target no longer valid - skip it
+    sequenceIndex++;
   }
   
-  // Batch exhausted, calculate new one (with cooldown check)
-  unsigned long now = millis();
-  if (lastBatchSkipTime > 0 && (now - lastBatchSkipTime) < BATCH_SKIP_COOLDOWN) {
-    return -1;
-  }
+  // Sequence exhausted, calculate new one
+  calculateNewSequence();
+  if (!sequenceActive) return -1;
   
-  calculateNewBatch();
-  if (!batchActive) return -1;
-  
-  // Reset skip cooldown on successful batch creation
-  if (batchActive) {
-    lastBatchSkipTime = 0;
-    lastSkippedLane = -1;
-  }
-  
-  // Return first target of new batch
-  if (batchSize > 0) {
-    batchIndex = 1;
-    return targetBatch[0];
+  // Return first target of new sequence
+  if (targetSequence[0] >= 0) {
+    sequenceIndex = 1;
+    return targetSequence[0];
   }
   
   return -1;
 }
 
-// Reset the batch (called on emergency override or major change)
-void resetBatch() {
-  batchActive = false;
-  batchLocked = false;  // Unlock batch on reset
-  batchIndex = 0;
-  batchSize = 0;
-  batchesReset++;
-  
-  // Clear skip tracking on reset to allow immediate recalculation
-  lastBatchSkipTime = 0;
-  lastSkippedLane = -1;
+// Reset the sequence (called on emergency override or major change)
+void resetSequence() {
+  sequenceActive = false;
+  sequenceLocked = false;  // Unlock sequence on reset
+  sequenceIndex = 0;
+  for (int i = 0; i < SEQUENCE_SIZE; i++) {
+    targetSequence[i] = -1;
+  }
 }
 
-// Mark current batch target as complete (hit registered)
-// For batches of 2: After each target is hit, recalculate batch based on TTI
-// This ensures we always target the next 2 zombies that will impact soonest
-void advanceBatch() {
-  // Track that this lane was hit in the current sequence
-  if (activeTargetIndex >= 0 && activeTargetIndex < 4) {
-    laneHitInSequence[activeTargetIndex] = true;
-    targetsInSequence++;
-    
-    // After 6 targets (3 batches of 2), reset coverage tracking
-    if (targetsInSequence >= SEQUENCE_TARGET_COUNT) {
-      // Check if all lanes were hit - if not, prioritize missing ones in next sequence
-      for (int i = 0; i < 4; i++) {
-        laneHitInSequence[i] = false;  // Reset for next sequence
-      }
-      targetsInSequence = 0;
-    }
-  }
+// Mark current sequence target as complete (hit registered)
+// After each target is hit, advance to next in sequence
+void advanceSequence() {
+  sequenceIndex++;  // Move to next target in sequence
   
-  batchIndex++;  // Move to next target in batch
-  
-  // For batches of 2: After hitting first target, recalculate for next 2 based on current TTI
-  // This ensures we always prioritize by which will impact next
-  if (batchIndex >= batchSize) {
-    // Batch complete - mark as done
-    batchesCompleted++;
-    batchLocked = false;
-    batchActive = false;
-    batchIndex = 0;
-    batchSize = 0;
+  // If sequence is complete, calculate new one
+  if (sequenceIndex >= SEQUENCE_SIZE) {
+    sequenceLocked = false;
+    sequenceActive = false;
+    sequenceIndex = 0;
     
-    // Immediately recalculate new batch based on current TTI (which will impact next)
-    calculateNewBatch();
+    // Immediately recalculate new sequence
+    calculateNewSequence();
   } else {
-    // Still targets remaining in current batch - keep going
-    // But unlock batch to allow recalculation if needed
-    batchLocked = false;
+    // Still targets remaining in current sequence
+    sequenceLocked = false;  // Allow recalculation if needed
   }
 }
 
-// Check if any lane needs emergency attention (outside batch order)
-int checkBatchEmergency() {
+// Check if any lane needs emergency attention (outside sequence order)
+int checkSequenceEmergency() {
   for (int i = 0; i < 4; i++) {
     // Skip the lane we're currently committed to
     if (i == committedLane) continue;
@@ -1833,7 +1476,7 @@ void loop() {
         
         // CRITICAL: If batch is locked, be MUCH more restrictive
         // Prevent switching when targets are at similar distances
-        if (batchLocked && batchActive) {
+        if (sequenceLocked && sequenceActive) {
           float committedDist = zombieDistances[committedLane];
           float distanceGap = abs(dist - committedDist);
           
@@ -2070,7 +1713,7 @@ void loop() {
           DBG_PRINTLN(F("% !!!"));
           
           // Reset batch on emergency - will recalculate after this target
-          resetBatch();
+          resetSequence();
           
           releaseCommitment();
           commitToTarget(overrideLane);
@@ -2122,7 +1765,7 @@ void loop() {
           break;
         
         case CHOOSE_TARGET:
-          chooseAndCommitTargetFromBatch();
+          chooseAndCommitTargetFromSequence();
           break;
         
         case MOVE_TO_TARGET:
@@ -2239,24 +1882,24 @@ void chooseAndCommitTarget() {
 // Uses the batch system for more predictable targeting
 // STICKS TO BATCH SEQUENCE when locked (groups of 2)
 //============================================
-void chooseAndCommitTargetFromBatch() {
-  // If batch is locked, ONLY get targets from the batch sequence
-  // Don't allow breaking sequence except for backward targets (handled in getNextBatchTarget)
-  if (batchLocked && batchActive) {
-    // Get next target from current batch sequence
-    // Try up to batchSize times to find a valid target
+void chooseAndCommitTargetFromSequence() {
+  // If sequence is locked, ONLY get targets from the sequence
+  // Don't allow breaking sequence except for backward targets (handled in getNextSequenceTarget)
+  if (sequenceLocked && sequenceActive) {
+    // Get next target from current sequence
+    // Try up to SEQUENCE_SIZE times to find a valid target
     int attempts = 0;
     int nextLane = -1;
     bool foundValidTarget = false;
     
-    while (attempts < batchSize && !foundValidTarget) {
-      nextLane = getNextBatchTarget();
+    while (attempts < SEQUENCE_SIZE && !foundValidTarget) {
+      nextLane = getNextSequenceTarget();
       attempts++;
       
       if (nextLane >= 0) {
         // CRITICAL: NEVER target backward-moving zombies - they're retreating!
         if (ProxSensors[nextLane].direction == BACKWARD) {
-          // Target is retreating - skip and get next from batch
+          // Target is retreating - skip and get next from sequence
           continue;
         }
         
@@ -2280,33 +1923,21 @@ void chooseAndCommitTargetFromBatch() {
           continue;
         }
         
-        // CRITICAL: For L2/L3 in batch sequence, still try to target even if at high distance (85-100%)
-        // Short lanes move fast, so even at 85-100% we might still catch them
-        bool isShortLane = (nextLane == 1 || nextLane == 2);  // L2 or L3
-        bool isAtHighDistance = (zombieDistances[nextLane] >= 0.85f && zombieDistances[nextLane] <= 1.0f);
-        bool isForwardOrStoppedBriefly = (ProxSensors[nextLane].direction == FORWARD) ||
-                                          (ProxSensors[nextLane].direction == STOPPED && 
-                                           (laneStoppedTime[nextLane] == 0 || 
-                                            (millis() - laneStoppedTime[nextLane]) < 500));  // Only recently stopped
-        
-        // For short lanes in batch sequence at high distance, be more lenient
-        bool isValidForShortLane = isShortLane && isAtHighDistance && isForwardOrStoppedBriefly && !recentlyAttempted;
-        
-        // Standard validation for all other cases
+        // Standard validation
         bool isValidStandard = (ProxSensors[nextLane].direction == FORWARD &&
                                 zombieDistances[nextLane] < laneThreshold &&
                                 zombieDistances[nextLane] > MIN_ENGAGE_THRESHOLD &&
                                 !recentlyAttempted);
         
-        if (isValidForShortLane || isValidStandard) {
-          // Target is valid - commit to it (batch sequence enforced)
+        if (isValidStandard) {
+          // Target is valid - commit to it (sequence enforced)
           foundValidTarget = true;
         } else {
           // Target is invalid - continue loop to try next
           continue;
         }
       } else {
-        // No more targets in batch
+        // No more targets in sequence
         break;
       }
     }
@@ -2319,15 +1950,15 @@ void chooseAndCommitTargetFromBatch() {
       return;
     }
     
-    // Batch exhausted but was locked - unlock and recalculate
-    if (batchIndex >= batchSize) {
-      batchLocked = false;
-      batchActive = false;
+    // Sequence exhausted but was locked - unlock and recalculate
+    if (sequenceIndex >= SEQUENCE_SIZE) {
+      sequenceLocked = false;
+      sequenceActive = false;
     }
   }
   
-  // Get next target from batch (will calculate new batch if needed)
-  int nextLane = getNextBatchTarget();
+  // Get next target from sequence (will calculate new sequence if needed)
+  int nextLane = getNextSequenceTarget();
   
   if (nextLane >= 0) {
     commitToTarget(nextLane);
@@ -2340,7 +1971,7 @@ void chooseAndCommitTargetFromBatch() {
     WAIT_POS = true;
     activeTargetIndex = -1;
     releaseCommitment();
-    batchActive = false;
+    sequenceActive = false;
   }
 }
 
@@ -2440,7 +2071,7 @@ void dwellAtTarget() {
     
     // CRITICAL: If batch is locked, be MUCH more restrictive
     // Prevent switching when targets are at similar distances
-    if (batchLocked && batchActive) {
+    if (sequenceLocked && sequenceActive) {
       float committedDist = zombieDistances[activeTargetIndex];
       float distanceGap = abs(dist - committedDist);
       
@@ -2609,7 +2240,7 @@ void dwellAtTarget() {
     DBG_PRINTLN(F("% !!!"));
     
     // Reset batch on emergency override
-    resetBatch();
+    resetSequence();
     
     releaseCommitment();
     commitToTarget(overrideLane);
@@ -2648,26 +2279,26 @@ void dwellAtTarget() {
       releaseCommitment();
       
       // Advance batch (will unlock if sequence complete)
-      advanceBatch();
+      advanceSequence();
       
       // Get next target from batch (respects batch lock) - IMMEDIATE transition, no delay
       // IMPROVED: Skip lanes that have already been attempted recently
-      int next = getNextBatchTarget();
+      int next = getNextSequenceTarget();
       if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
         commitToTarget(next);
         if (isCommitted) {
           state = MOVE_TO_TARGET;  // Immediately move to next target
         } else {
-          // If commit failed, try chooseAndCommitTargetFromBatch for immediate retry
+          // If commit failed, try chooseAndCommitTargetFromSequence for immediate retry
           state = CHOOSE_TARGET;
         }
       } else {
         // Batch complete or no valid targets - unlock and immediately choose next
-        if (batchLocked) {
-          batchLocked = false;
+        if (sequenceLocked) {
+          sequenceLocked = false;
         }
         // Immediately try to choose next target instead of waiting
-        chooseAndCommitTargetFromBatch();
+        chooseAndCommitTargetFromSequence();
         if (isCommitted) {
           state = MOVE_TO_TARGET;
         } else {
@@ -2698,22 +2329,22 @@ void dwellAtTarget() {
         laneAttemptTime[activeTargetIndex] = millis();
       }
       releaseCommitment();
-      advanceBatch();
-      int next = getNextBatchTarget();
+      advanceSequence();
+      int next = getNextSequenceTarget();
       if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
         commitToTarget(next);
         if (isCommitted) state = MOVE_TO_TARGET;
         else {
-          chooseAndCommitTargetFromBatch();
+          chooseAndCommitTargetFromSequence();
           if (isCommitted) state = MOVE_TO_TARGET;
           else state = CHOOSE_TARGET;
         }
       } else {
-        if (batchLocked) {
-          batchLocked = false;
+        if (sequenceLocked) {
+          sequenceLocked = false;
         }
         // Immediately try to choose next target
-        chooseAndCommitTargetFromBatch();
+        chooseAndCommitTargetFromSequence();
         if (isCommitted) state = MOVE_TO_TARGET;
         else state = CHOOSE_TARGET;
       }
@@ -2738,17 +2369,17 @@ void dwellAtTarget() {
         }
         releaseCommitment();
         stoppedStartTime = 0;
-        int next = getNextBatchTarget();
+        int next = getNextSequenceTarget();
         if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
           commitToTarget(next);
           if (isCommitted) state = MOVE_TO_TARGET;
           else {
-            chooseAndCommitTargetFromBatch();
+            chooseAndCommitTargetFromSequence();
             if (isCommitted) state = MOVE_TO_TARGET;
             else state = CHOOSE_TARGET;
           }
         } else {
-          chooseAndCommitTargetFromBatch();
+          chooseAndCommitTargetFromSequence();
           if (isCommitted) state = MOVE_TO_TARGET;
           else state = CHOOSE_TARGET;
         }
@@ -2785,18 +2416,18 @@ void dwellAtTarget() {
           releaseCommitment();
           stoppedStartTime = 0;
           // IMMEDIATE transition - no delay
-          int next = getNextBatchTarget();
+          int next = getNextSequenceTarget();
           if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
             commitToTarget(next);
             if (isCommitted) state = MOVE_TO_TARGET;
             else {
-              chooseAndCommitTargetFromBatch();
+              chooseAndCommitTargetFromSequence();
               if (isCommitted) state = MOVE_TO_TARGET;
               else state = CHOOSE_TARGET;
             }
           } else {
             // Immediately try to choose next target
-            chooseAndCommitTargetFromBatch();
+            chooseAndCommitTargetFromSequence();
             if (isCommitted) state = MOVE_TO_TARGET;
             else state = CHOOSE_TARGET;
           }
@@ -2826,18 +2457,18 @@ void dwellAtTarget() {
             releaseCommitment();
             stoppedStartTime = 0;
             // IMMEDIATE transition - no delay
-            int next = getNextBatchTarget();
+            int next = getNextSequenceTarget();
             if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
               commitToTarget(next);
               if (isCommitted) state = MOVE_TO_TARGET;
               else {
-                chooseAndCommitTargetFromBatch();
+                chooseAndCommitTargetFromSequence();
                 if (isCommitted) state = MOVE_TO_TARGET;
                 else state = CHOOSE_TARGET;
               }
             } else {
               // Immediately try to choose next target
-              chooseAndCommitTargetFromBatch();
+              chooseAndCommitTargetFromSequence();
               if (isCommitted) state = MOVE_TO_TARGET;
               else state = CHOOSE_TARGET;
             }
@@ -2928,18 +2559,18 @@ void dwellAtTarget() {
       
       releaseCommitment();
       // IMMEDIATE transition - don't skip attempted lanes since we're not marking as attempted
-      int next = getNextBatchTarget();
+      int next = getNextSequenceTarget();
       if (next >= 0 && ProxSensors[next].direction == FORWARD) {
         commitToTarget(next);
         if (isCommitted) state = MOVE_TO_TARGET;
         else {
-          chooseAndCommitTargetFromBatch();
+          chooseAndCommitTargetFromSequence();
           if (isCommitted) state = MOVE_TO_TARGET;
           else state = CHOOSE_TARGET;
         }
       } else {
         // Immediately try to choose next target
-        chooseAndCommitTargetFromBatch();
+        chooseAndCommitTargetFromSequence();
         if (isCommitted) state = MOVE_TO_TARGET;
         else state = CHOOSE_TARGET;
       }
@@ -2977,18 +2608,18 @@ void dwellAtTarget() {
     
     releaseCommitment();
     // IMMEDIATE transition - no delay (skip attempted lanes)
-    int next = getNextBatchTarget();
+    int next = getNextSequenceTarget();
     if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
       commitToTarget(next);
       if (isCommitted) state = MOVE_TO_TARGET;
       else {
-        chooseAndCommitTargetFromBatch();
+        chooseAndCommitTargetFromSequence();
         if (isCommitted) state = MOVE_TO_TARGET;
         else state = CHOOSE_TARGET;
       }
     } else {
       // Immediately try to choose next target (skip attempted lanes)
-      chooseAndCommitTargetFromBatch();
+      chooseAndCommitTargetFromSequence();
       if (isCommitted) state = MOVE_TO_TARGET;
       else state = CHOOSE_TARGET;
     }
@@ -3056,12 +2687,7 @@ void processSerialCommands() {
       Serial.println(F("MODE: HYBRID"));
       targetMode = MODE_HYBRID;
       resetTTITracking();
-      resetBatch();  // Reset batch system for new game
-      // Reset coverage tracking for new game
-      for (int i = 0; i < 4; i++) {
-        laneHitInSequence[i] = false;
-      }
-      targetsInSequence = 0;
+      resetSequence();  // Reset sequence system for new game
       startAutoMode();
       startCalibration();
       break;
@@ -3072,7 +2698,7 @@ void processSerialCommands() {
       Serial.println(F("STOP"));
       autoMode = false; systemEnabled = false; stopMotor();
       releaseCommitment(); pendingQueueSize = 0;
-      resetBatch();  // Reset batch system
+      resetSequence();  // Reset batch system
       calibrationActive = false;
       printScore();
       break;

@@ -400,6 +400,7 @@ void setup() {
   
   Serial.begin(115200);
   Serial.println(F("ME350 Zombie Defense v9"));
+  Serial.println(F("======================="));
   Serial.println(F("EARLY ENGAGE + AUTO-CAL"));
   
   loadFromEEPROM();
@@ -495,7 +496,7 @@ void saveToEEPROM() {
 // PRINT HELP
 //============================================
 void printHelp() {
-  Serial.println(F("\nCOMMANDS"));
+  Serial.println(F("\n--- COMMANDS ---"));
   Serial.println(F("T/Y - Start"));
   Serial.println(F("S - Stop, H - Home"));
   Serial.println(F("M - Mode info"));
@@ -510,7 +511,7 @@ void printHelp() {
 // PRINT SETTINGS
 //============================================
 void printCurrentSettings() {
-  Serial.println(F("SETTINGS"));
+  Serial.println(F("--- SETTINGS ---"));
   Serial.print(F("PID: "));
   Serial.print(KP, 4);
   Serial.print(F("/"));
@@ -529,7 +530,7 @@ void printCurrentSettings() {
     Serial.print(F(" "));
   }
   Serial.println();
-  Serial.println(F("Prox Ranges:"));
+  Serial.println(F("Prox Ranges [far,close]:"));
   for (int i = 0; i < 4; i++) {
     Serial.print(F("  L"));
     Serial.print(i + 1);
@@ -651,9 +652,9 @@ void commitToTarget(int lane) {
   targetLockTime = millis();
   WAIT_POS = false;
   
-  DBG_PRINT(F(">L"));
+  DBG_PRINT(F(">>LOCK L"));
   DBG_PRINT(lane + 1);
-  DBG_PRINT(F("@"));
+  DBG_PRINT(F(" @"));
   DBG_PRINT((int)((1.0 - zombieDistances[lane]) * 100));
   DBG_PRINTLN(F("%"));
 }
@@ -1560,7 +1561,7 @@ void updateCalibration() {
     // Calibration period over - apply results
     applyCalibration();
     calibrationActive = false;
-    Serial.println(F("CALIBRATION COMPLETE"));
+    Serial.println(F("=== CALIBRATION COMPLETE ==="));
     return;
   }
   
@@ -1588,7 +1589,7 @@ void updateCalibration() {
 // Be conservative - bad calibration causes override thrashing
 //============================================
 void applyCalibration() {
-  Serial.println(F("Applying cal:"));
+  Serial.println(F("Applying calibration:"));
   
   for (int i = 0; i < 4; i++) {
     if (calibrationUpdated[i]) {
@@ -1674,9 +1675,9 @@ void startCalibration() {
     calibrationUpdated[i] = false;
   }
   
-  Serial.println(F("CAL STARTED (15s)"));
-  Serial.println(F("Moving to home..."));
-  Serial.println(F("Move zombies!"));
+  Serial.println(F("=== CALIBRATION STARTED (15s) ==="));
+  Serial.println(F("Mechanism moving to home (position 0)..."));
+  Serial.println(F("Move zombies through all lanes!"));
 }
 
 //============================================
@@ -2062,11 +2063,11 @@ void loop() {
           // Already committed to this lane - don't override again
           overrideLane = -1;
         } else {
-          DBG_PRINT(F("!O"));
+          DBG_PRINT(F("!!! OVERRIDE L"));
           DBG_PRINT(overrideLane + 1);
-          DBG_PRINT(F("@"));
+          DBG_PRINT(F(" @"));
           DBG_PRINT((int)((1.0 - zombieDistances[overrideLane]) * 100));
-          DBG_PRINTLN(F("%"));
+          DBG_PRINTLN(F("% !!!"));
           
           // Reset batch on emergency - will recalculate after this target
           resetBatch();
@@ -2368,7 +2369,7 @@ void moveToTarget() {
     } else {
       state = DWELL_AT_TARGET;
       if (verboseMode) {
-        DBG_PRINT(F("~A"));
+        DBG_PRINT(F("~ARRIVE L"));
         DBG_PRINTLN(activeTargetIndex + 1);
       }
     }
@@ -2636,9 +2637,9 @@ void dwellAtTarget() {
       if (millis() - backwardStartTime >= BACKWARD_CONFIRM_TIME) {
       zombiesKilled++;
       recordHit(activeTargetIndex);  // Analysis mode tracking
-      DBG_PRINT(F("H"));
+      DBG_PRINT(F("HIT L"));
       DBG_PRINT(activeTargetIndex + 1);
-      DBG_PRINT(F("["));
+      DBG_PRINT(F(" ["));
       DBG_PRINT(zombiesKilled);
       DBG_PRINTLN(F("]"));
       
@@ -2685,9 +2686,9 @@ void dwellAtTarget() {
     if (retreatAmount > 0.04) {  // Moved back 4%+ from peak
       zombiesKilled++;
       recordHit(activeTargetIndex);  // Analysis mode tracking
-      DBG_PRINT(F("H"));
+      DBG_PRINT(F("HIT L"));
       DBG_PRINT(activeTargetIndex + 1);
-      DBG_PRINT(F("["));
+      DBG_PRINT(F(" ["));
       DBG_PRINT(zombiesKilled);
       DBG_PRINTLN(F("]"));
       
@@ -2725,9 +2726,9 @@ void dwellAtTarget() {
       currentDist > arrivalZombieDistance + 0.15) {
     zombiesKilled++;
     recordHit(activeTargetIndex);  // Analysis mode tracking
-    DBG_PRINT(F("H"));
+    DBG_PRINT(F("HIT L"));
     DBG_PRINT(activeTargetIndex + 1);
-    DBG_PRINT(F("f["));
+    DBG_PRINT(F(" (far) ["));
     DBG_PRINT(zombiesKilled);
     DBG_PRINTLN(F("]"));
     
@@ -2771,9 +2772,9 @@ void dwellAtTarget() {
         if (peakZombieDistance < 0.30) {  // INCREASED threshold - more generous hit credit (was 0.25)
           zombiesKilled++;
           recordHit(activeTargetIndex);
-          DBG_PRINT(F("H"));
+          DBG_PRINT(F("HIT L"));
           DBG_PRINT(activeTargetIndex + 1);
-          DBG_PRINT(F("s["));
+          DBG_PRINT(F(" (stop) ["));
           DBG_PRINT(zombiesKilled);
           DBG_PRINTLN(F("]"));
           
@@ -2815,7 +2816,7 @@ void dwellAtTarget() {
           // IMPROVED: Only exit on STOP if we've been dwelling for a long time
           // Be persistent - don't give up too easily
           if (dwellTime >= 400) {  // REDUCED: Only exit if we've been here 400ms+ without progress
-            DBG_PRINT(F("S"));
+            DBG_PRINT(F("STOP L"));
             DBG_PRINTLN(activeTargetIndex + 1);
             
             // Mark as attempted - prevent immediate re-engagement
@@ -2915,9 +2916,9 @@ void dwellAtTarget() {
     }
     
     if (shouldMarkGone) {
-      DBG_PRINT(F("G"));
+      DBG_PRINT(F("GONE L"));
       DBG_PRINT(activeTargetIndex + 1);
-      DBG_PRINT(F("@"));
+      DBG_PRINT(F(" @"));
       DBG_PRINT((int)((1.0 - currentDist) * 100));
       DBG_PRINTLN(F("%"));
       
@@ -2958,19 +2959,19 @@ void dwellAtTarget() {
     
     if (currentDir == FORWARD && currentDist < arrivalZombieDistance - 0.03) {
       zombiesMissed++;
-      DBG_PRINT(F("M"));
+      DBG_PRINT(F("MISS L"));
       DBG_PRINT(activeTargetIndex + 1);
-      DBG_PRINT(F("["));
+      DBG_PRINT(F(" ["));
       DBG_PRINT(zombiesMissed);
       DBG_PRINTLN(F("]"));
     } else if (currentDir == STOPPED) {
       // STOPPED at very close range = likely hit wall = miss
       if (currentDist < 0.08) {
       }
-      DBG_PRINT(F("S"));
+      DBG_PRINT(F("STOP L"));
       DBG_PRINTLN(activeTargetIndex + 1);
     } else {
-      DBG_PRINT(F("T"));
+      DBG_PRINT(F("TIME L"));
       DBG_PRINTLN(activeTargetIndex + 1);
     }
     
@@ -3085,7 +3086,7 @@ void processSerialCommands() {
       {
         // CRITICAL: Prevent manual lane selection during calibration
         if (calibrationActive) {
-          Serial.println(F("Cal active"));
+          Serial.println(F("Calibration active - cannot change lane"));
           break;
         }
         int lane = cmd - '1';
@@ -3109,7 +3110,7 @@ void processSerialCommands() {
       break;
     case 'X': case 'x':
       // Show current calibration values
-      Serial.println(F("CAL STATUS"));
+      Serial.println(F("=== CALIBRATION STATUS ==="));
       for (int i = 0; i < 4; i++) {
         Serial.print(F("L"));
         Serial.print(i + 1);
@@ -3123,7 +3124,7 @@ void processSerialCommands() {
         Serial.println(zombieDistances[i], 2);
       }
       if (calibrationActive) {
-        Serial.print(F("Cal: "));
+        Serial.print(F("Calibrating... "));
         Serial.print((millis() - calibrationStartTime) / 1000);
         Serial.println(F("s"));
       }
@@ -3518,7 +3519,7 @@ void homeToLeftLimit() {
   }
   
   // Hold against limit switch gently at 2.0V to eliminate bounce
-  Serial.println(F("Holding..."));
+  Serial.println(F("Holding at limit..."));
   unsigned long holdStart = millis();
   const unsigned long HOLD_TIME = 500;  // Hold for 500ms
   
@@ -3541,7 +3542,7 @@ void homeToLeftLimit() {
 }
 
 void printScore() {
-  Serial.print(F("K=")); Serial.print(zombiesKilled);
+  Serial.print(F("Score: K=")); Serial.print(zombiesKilled);
   Serial.print(F(" M=")); Serial.println(zombiesMissed);
 }
 
