@@ -981,9 +981,18 @@ void calculateNewSequence() {
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
     lanes[i].distance = zombieDistances[i];
-    // TARGETABLE: Must be FORWARD and at least 30% down the lane
+    // TARGETABLE: Must be FORWARD
+    // Lanes 1 and 4 (indices 0 and 3): require >= 30% threshold
+    // Lanes 2 and 3 (indices 1 and 2): no threshold (always eligible if FORWARD)
     bool isForward = (ProxSensors[i].direction == FORWARD);
-    bool isPastThreshold = (zombieDistances[i] >= 0.30);
+    bool isPastThreshold;
+    if (i == 1 || i == 2) {
+      // Lanes 2 and 3: no threshold
+      isPastThreshold = true;
+    } else {
+      // Lanes 1 and 4: require >= 30%
+      isPastThreshold = (zombieDistances[i] >= 0.30);
+    }
     lanes[i].isTargetable = (isForward && isPastThreshold);
     if (lanes[i].isTargetable) targetableCount++;
   }
@@ -1043,11 +1052,13 @@ int getNextSequenceTarget() {
       continue;
     }
     
-    // Validate: must be FORWARD and >= 30% down the lane
+    // Validate: must be FORWARD (lanes 1/4 need >= 30%, lanes 2/3 no threshold)
     bool isForward = (ProxSensors[lane].direction == FORWARD);
     bool isBackward = (ProxSensors[lane].direction == BACKWARD);
-    // Require >= 30% down the lane (and not past impact zone)
-    bool isInRange = (zombieDistances[lane] >= 0.30 &&
+    // Lanes 2 and 3 (indices 1 and 2): no threshold
+    // Lanes 1 and 4 (indices 0 and 3): require >= 30%
+    float minThreshold = (lane == 1 || lane == 2) ? 0.0 : 0.30;
+    bool isInRange = (zombieDistances[lane] >= minThreshold &&
                       zombieDistances[lane] < MIN_ENGAGE_THRESHOLD);
     
     // If target is backward-moving, skip it
@@ -1950,31 +1961,69 @@ void chooseAndCommitTarget() {
 //============================================
 // CHOOSE AND COMMIT TARGET FROM BATCH
 // Uses the batch system for more predictable targeting
-// STICKS TO BATCH SEQUENCE when locked (groups of 2)
+// BREAKS SEQUENCE if a better FORWARD target is farther along
 //============================================
 void chooseAndCommitTargetFromSequence() {
+  // FIRST: Check if any FORWARD lane is farther along than our sequence target
+  // If so, override the sequence and target that lane instead
+  int bestOverrideLane = -1;
+  float bestOverrideDist = -1.0;
+
+  // Find the best FORWARD target by distance
+  for (int i = 0; i < 4; i++) {
+    if (ProxSensors[i].direction == FORWARD) {
+      // Check lane-specific threshold (lanes 2/3 have no threshold)
+      float minThreshold = (i == 1 || i == 2) ? 0.0 : 0.30;
+      if (zombieDistances[i] >= minThreshold &&
+          zombieDistances[i] < MIN_ENGAGE_THRESHOLD &&
+          zombieDistances[i] > bestOverrideDist) {
+        // Check if not recently attempted
+        bool recentlyAttempted = false;
+        if (laneAttempted[i]) {
+          unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
+          if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
+            recentlyAttempted = true;
+          }
+        }
+        if (!recentlyAttempted) {
+          bestOverrideDist = zombieDistances[i];
+          bestOverrideLane = i;
+        }
+      }
+    }
+  }
+
+  // If we found a valid FORWARD target, use it (overrides sequence)
+  if (bestOverrideLane >= 0) {
+    // Recalculate sequence starting with this best target
+    calculateNewSequence();
+    commitToTarget(bestOverrideLane);
+    if (isCommitted) {
+      state = MOVE_TO_TARGET;
+    }
+    return;
+  }
+
   // If sequence is locked, ONLY get targets from the sequence
-  // Don't allow breaking sequence except for backward targets (handled in getNextSequenceTarget)
   if (sequenceLocked && sequenceActive) {
     // Get next target from current sequence
     // Try up to SEQUENCE_SIZE times to find a valid target
     int attempts = 0;
     int nextLane = -1;
     bool foundValidTarget = false;
-    
+
     while (attempts < SEQUENCE_SIZE && !foundValidTarget) {
       nextLane = getNextSequenceTarget();
       attempts++;
-      
+
       if (nextLane >= 0) {
         // CRITICAL: NEVER target backward-moving zombies - they're retreating!
         if (ProxSensors[nextLane].direction == BACKWARD) {
           // Target is retreating - skip and get next from sequence
           continue;
         }
-        
-        // Verify: must be FORWARD and >= 50% down the lane
-        // Also check if lane has already been attempted
+
+        // Check if lane has already been attempted
         bool recentlyAttempted = false;
         if (laneAttempted[nextLane]) {
           unsigned long timeSinceAttempt = millis() - laneAttemptTime[nextLane];
@@ -1985,18 +2034,19 @@ void chooseAndCommitTargetFromSequence() {
             laneAttempted[nextLane] = false;
           }
         }
-        
+
         // If recently attempted, skip this one and try next
         if (recentlyAttempted) {
           continue;
         }
-        
-        // Standard validation: FORWARD and >= 30% down the lane
+
+        // Lane-specific threshold: lanes 2/3 no threshold, lanes 1/4 need 30%
+        float minThreshold = (nextLane == 1 || nextLane == 2) ? 0.0 : 0.30;
         bool isValidStandard = (ProxSensors[nextLane].direction == FORWARD &&
-                                zombieDistances[nextLane] >= 0.30 &&
+                                zombieDistances[nextLane] >= minThreshold &&
                                 zombieDistances[nextLane] < MIN_ENGAGE_THRESHOLD &&
                                 !recentlyAttempted);
-        
+
         if (isValidStandard) {
           // Target is valid - commit to it (sequence enforced)
           foundValidTarget = true;
@@ -2009,7 +2059,7 @@ void chooseAndCommitTargetFromSequence() {
         break;
       }
     }
-    
+
     if (foundValidTarget && nextLane >= 0) {
       commitToTarget(nextLane);
       if (isCommitted) {
