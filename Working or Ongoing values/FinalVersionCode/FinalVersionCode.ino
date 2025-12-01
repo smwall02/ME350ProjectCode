@@ -939,16 +939,17 @@ int getBestTarget() {
 
 //============================================
 // SEQUENCING SYSTEM
-// Creates ordered sequences of exactly 3 targets
-// Primary sort: distance from end of lane
-// Secondary sort: velocity and direction
+// Creates ordered sequences prioritized by TIME TO IMPACT (TTI)
+// Primary sort: Effective TTI (lowest first = will hit soonest)
+// TTI = remaining distance / velocity, adjusted for travel time
 //============================================
 
 // Calculate and create a new target sequence
 // RULES:
-// - Only FORWARD-moving targets that are >= 30% down the lane
-// - Sorted by distance (highest first = closest to impact)
-// - Round start (all 0-5%): 4-lane sequence, each lane once
+// - Only FORWARD-moving targets that meet threshold criteria
+// - Sorted by EFFECTIVE TTI (lowest first = closest to impact)
+// - Effective TTI = raw TTI - travel time - lane priority boost
+// - Round start (all 0-5%): 4-lane sequence
 // - Otherwise: 2-lane sequence with repeats allowed
 void calculateNewSequence() {
   // Clear existing sequence
@@ -969,28 +970,47 @@ void calculateNewSequence() {
   // Determine sequence length: 4 at round start, 2 otherwise
   int maxSequenceLen = isRoundStart ? 4 : 2;
 
-  // Gather lane info
+  // Gather lane info - NOW USING TTI FOR PRIORITIZATION
   struct LaneInfo {
     int lane;
-    float distance;      // Higher = closer to impact = higher priority
-    float sortPriority;  // Combined priority score (distance + lane priority boost)
-    bool isTargetable;   // FORWARD and >= 30%
+    float distance;      // Current position (0-1, higher = closer to impact)
+    float tti;           // Time To Impact in ms (LOWER = more urgent!)
+    float effectiveTTI;  // TTI adjusted for travel time and lane priority
+    bool isTargetable;   // FORWARD and meets threshold
   };
   LaneInfo lanes[4];
   int targetableCount = 0;
 
-  // Priority boost for lanes 2 and 3 (indices 1 and 2) - 10% virtual distance bonus
-  const float LANE_2_3_PRIORITY_BOOST = 0.10;
+  // TTI boost for lanes 2 and 3 (indices 1 and 2) - subtract 200ms to make them more urgent
+  const float LANE_2_3_TTI_BOOST = 200.0;
+  // Lane 4 gets priority boost when at 70%+ (30% from impact)
+  const float LANE_4_CRITICAL_THRESHOLD = 0.70;
+  const float LANE_4_TTI_BOOST = 300.0;  // 300ms boost when critical
 
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
     lanes[i].distance = zombieDistances[i];
-    // Apply priority boost for lanes 2 and 3
+    lanes[i].tti = timeToImpact[i];
+
+    // Calculate effective TTI = raw TTI - travel time - lane boost
+    // Lower effective TTI = MORE URGENT
+    int travelTime = getDynamicTravelTime(i);
+    lanes[i].effectiveTTI = lanes[i].tti - travelTime;
+
+    // Apply TTI boost for lanes 2 and 3 (make them more urgent by subtracting)
     if (i == 1 || i == 2) {
-      lanes[i].sortPriority = lanes[i].distance + LANE_2_3_PRIORITY_BOOST;
-    } else {
-      lanes[i].sortPriority = lanes[i].distance;
+      lanes[i].effectiveTTI -= LANE_2_3_TTI_BOOST;
     }
+
+    // Lane 4 (index 3) gets priority boost when at 70%+ (30% from impact)
+    if (i == 3 && lanes[i].distance >= LANE_4_CRITICAL_THRESHOLD) {
+      lanes[i].effectiveTTI -= LANE_4_TTI_BOOST;
+    }
+
+    // Clamp to reasonable range
+    if (lanes[i].effectiveTTI < 0) lanes[i].effectiveTTI = 0;
+    if (lanes[i].tti >= 99999) lanes[i].effectiveTTI = 99999;  // Invalid TTI
+
     // TARGETABLE: Must be FORWARD
     // Lanes 1 and 4 (indices 0 and 3): require >= 30% threshold
     // Lanes 2 and 3 (indices 1 and 2): no threshold (always eligible if FORWARD)
@@ -1007,11 +1027,11 @@ void calculateNewSequence() {
     if (lanes[i].isTargetable) targetableCount++;
   }
 
-  // Sort by sortPriority (highest first = closest to impact + lane priority)
-  // Lanes 2 and 3 get a slight boost to be selected earlier at same distance
+  // Sort by EFFECTIVE TTI (LOWEST first = closest to impact = highest priority)
+  // This prioritizes targets that will hit soonest, accounting for travel time
   for (int i = 0; i < 3; i++) {
     for (int j = i + 1; j < 4; j++) {
-      if (lanes[j].sortPriority > lanes[i].sortPriority) {
+      if (lanes[j].effectiveTTI < lanes[i].effectiveTTI) {
         LaneInfo temp = lanes[i];
         lanes[i] = lanes[j];
         lanes[j] = temp;
@@ -1022,13 +1042,13 @@ void calculateNewSequence() {
   int sequenceCount = 0;
 
   if (isRoundStart) {
-    // ROUND START: Include all 4 lanes, sorted by distance
+    // ROUND START: Include all 4 lanes, sorted by TTI
     // Even if not all are forward yet, include them for coverage
     for (int i = 0; i < 4 && sequenceCount < 4; i++) {
       targetSequence[sequenceCount++] = lanes[i].lane;
     }
   } else {
-    // NORMAL: Build 2-lane sequence from targetable lanes only
+    // NORMAL: Build 2-lane sequence from targetable lanes, sorted by TTI
     for (int i = 0; i < 4 && sequenceCount < maxSequenceLen; i++) {
       if (lanes[i].isTargetable) {
         targetSequence[sequenceCount++] = lanes[i].lane;
@@ -1132,28 +1152,41 @@ void resetSequence() {
   }
 }
 
-// Check if any lane has 30% or less remaining (>= 70% progress) and is FORWARD-moving
+// Check if any lane needs urgent attention based on TTI or distance
 // Returns true if recalculation is needed (a critical lane is not the current sequence target)
-// This aggressive threshold helps ensure no targets reach the end of their lane
+// Uses TTI when available, falls back to distance threshold
 bool shouldRecalculateForLowLane() {
-  const float LOW_LANE_THRESHOLD = 0.70;  // 70% progress = 30% remaining (aggressive)
+  const float LOW_LANE_THRESHOLD = 0.70;  // 70% progress = 30% remaining
+  const float URGENT_TTI_THRESHOLD = 1500;  // 1.5 seconds to impact = urgent
 
   // Find the current sequence target (if any)
   int currentTarget = -1;
+  float currentTTI = 99999;
   if (sequenceActive && sequenceIndex < SEQUENCE_SIZE) {
     currentTarget = targetSequence[sequenceIndex];
+    if (currentTarget >= 0) {
+      currentTTI = getEffectiveTTI(currentTarget);
+    }
   }
 
-  // Check each lane for low remaining distance
+  // Check each lane for urgent TTI or low remaining distance
   for (int i = 0; i < 4; i++) {
     // Skip if this is already our current target
     if (i == currentTarget) continue;
 
-    // Check if lane has 20% or less remaining AND is moving forward
-    if (zombieDistances[i] >= LOW_LANE_THRESHOLD &&
-        zombieDistances[i] < MIN_ENGAGE_THRESHOLD &&
-        ProxSensors[i].direction == FORWARD) {
-      // Found a critical lane that's not our current target - need to recalculate
+    // Only check FORWARD-moving targets
+    if (ProxSensors[i].direction != FORWARD) continue;
+
+    float tti = getEffectiveTTI(i);
+    float dist = zombieDistances[i];
+
+    // URGENT if TTI is very low (will hit soon) and lower than current target
+    if (tti < URGENT_TTI_THRESHOLD && tti < currentTTI - 200) {
+      return true;  // This lane will hit sooner - recalculate!
+    }
+
+    // Also trigger on distance threshold as backup
+    if (dist >= LOW_LANE_THRESHOLD && dist < MIN_ENGAGE_THRESHOLD) {
       return true;
     }
   }
@@ -3149,17 +3182,21 @@ void recordHit(int lane) {
 
 //============================================
 // UPDATE TTI
-// More robust TTI calculation with better filtering
+// Calculates Time To Impact using velocity and REMAINING distance to impact
+// TTI = (1.0 - currentPosition) / velocity
+// Lower TTI = closer to impact = higher priority
 //============================================
 void updateTTI() {
   for (int i = 0; i < 4; i++) {
-    float distChange = prevZombieDistances[i] - zombieDistances[i];
-    float instantVel = distChange / TTI_UPDATE_INTERVAL;  // velocity in dist/ms
-    
+    // Calculate velocity: positive = moving TOWARD impact (distance increasing)
+    // zombieDistances: 0% = start, 100% = impact
+    float distChange = zombieDistances[i] - prevZombieDistances[i];  // Positive when approaching impact
+    float instantVel = distChange / (float)TTI_UPDATE_INTERVAL;  // velocity in dist%/ms
+
     // Store in history for median filtering
     velocityHistory[i][velocityHistoryIndex[i]] = instantVel;
     velocityHistoryIndex[i] = (velocityHistoryIndex[i] + 1) % VEL_HISTORY_SIZE;
-    
+
     // Calculate median velocity (more robust than average)
     float sortedVels[VEL_HISTORY_SIZE];
     for (int j = 0; j < VEL_HISTORY_SIZE; j++) sortedVels[j] = velocityHistory[i][j];
@@ -3171,20 +3208,31 @@ void updateTTI() {
       }
     }
     float medianVel = sortedVels[VEL_HISTORY_SIZE / 2];
-    
+
     // Smooth the velocity (EMA filter)
     zombieVelocities[i] = velocityAlpha * zombieVelocities[i] + (1 - velocityAlpha) * medianVel;
-    
-    // Calculate TTI only if moving forward with meaningful velocity
-    // Minimum velocity threshold: 0.00003 dist/ms = 30% distance in 10 seconds
-    // This filters out noise and nearly-stopped targets
-    if (zombieVelocities[i] > 0.00003 && ProxSensors[i].direction == FORWARD) {
-      timeToImpact[i] = zombieDistances[i] / zombieVelocities[i];
-    } else {
-      // Not moving forward meaningfully - set very high TTI
+
+    // Calculate TTI: REMAINING DISTANCE / VELOCITY
+    // Remaining distance = 1.0 - zombieDistances[i] (how far until impact)
+    // Only calculate if moving FORWARD (positive velocity) with meaningful speed
+    // Minimum velocity threshold: 0.0001 dist/ms = 10% distance per second
+    float remainingDist = 1.0 - zombieDistances[i];  // Distance left until impact
+
+    if (zombieVelocities[i] > 0.0001 && ProxSensors[i].direction == FORWARD && remainingDist > 0) {
+      // TTI in milliseconds = remaining distance / velocity
+      timeToImpact[i] = remainingDist / zombieVelocities[i];
+    } else if (zombieVelocities[i] <= 0 || ProxSensors[i].direction == BACKWARD) {
+      // Moving backward or stopped - set very high TTI (not urgent)
       timeToImpact[i] = 99999;
+    } else if (remainingDist <= 0) {
+      // Already at or past impact - extremely urgent!
+      timeToImpact[i] = 0;
+    } else {
+      // Very slow movement - estimate based on minimum expected velocity
+      // Assume worst case: target will reach impact eventually
+      timeToImpact[i] = remainingDist / 0.0001;  // Conservative estimate
     }
-    
+
     timeToImpact[i] = constrain(timeToImpact[i], 0, 99999);
     prevZombieDistances[i] = zombieDistances[i];
   }
