@@ -312,6 +312,11 @@ float stoppedStartDistance = 1.0;
 int zombiesKilled = 0;
 int zombiesMissed = 0;
 
+// Hit tracking for statistics
+int lastHitLane = -1;                    // Last lane we successfully hit
+unsigned long lastHitTime = 0;           // When we hit it
+int consecutiveSameLane = 0;             // How many times we've hit same lane consecutively
+
 //============================================
 // PID CONTROLLER
 //============================================
@@ -629,7 +634,7 @@ void commitToTarget(int lane) {
   DBG_PRINT(F(">>LOCK L"));
   DBG_PRINT(lane + 1);
   DBG_PRINT(F(" @"));
-  DBG_PRINT((int)((1.0 - zombieDistances[lane]) * 100));
+      DBG_PRINT((int)(zombieDistances[lane] * 100));
   DBG_PRINTLN(F("%"));
 }
 
@@ -1205,23 +1210,42 @@ void updateCalibration() {
     applyCalibration();
     calibrationActive = false;
     Serial.println(F("=== CALIBRATION COMPLETE ==="));
+    
+    // CRITICAL: Verify ranges are actually updated and will be used
+    Serial.println(F("=== VERIFICATION: Ranges now in use ==="));
+    for (int i = 0; i < 4; i++) {
+      Serial.print(F("L"));
+      Serial.print(i + 1);
+      Serial.print(F(": ProxRange["));
+      Serial.print(ProxRange[i][0]);
+      Serial.print(F(","));
+      Serial.print(ProxRange[i][1]);
+      Serial.print(F("] - Distance calculations will use these values"));
+      Serial.println();
+    }
+    Serial.println(F("All distance calculations now use calibrated ranges."));
     return;
   }
   
-  // Update min/max for each lane based on raw readings
+  // Update min/max for each lane based on RAW analog readings (not smoothed!)
+  // CRITICAL: Must use raw analogRead() to capture true min/max values
+  // Calibration mapping:
+  // - Start (0%): HIGH sensor reading (target far from sensor) = calibrationMax
+  // - Impact (100%): LOW sensor reading (target close to sensor) = calibrationMin
   for (int i = 0; i < 4; i++) {
-    int rawVal = (int)ProxSensors[i].currVal;
+    // Use raw analog reading directly - smoothed values won't capture true extremes
+    int rawVal = analogRead(ProxSensors[i].pin);
     
-    // Track minimum (far/no zombie - higher analog value typically)
-    // and maximum (close/zombie present - lower analog value)
-    // Note: This assumes lower value = closer object
+    // Track minimum (impact/100% = lowest sensor reading when target is closest)
+    // Track maximum (start/0% = highest sensor reading when target is at beginning)
+    // Sensor behavior: LOW value = target close (at impact/100%), HIGH value = target far (at start/0%)
     
     if (rawVal < calibrationMin[i]) {
-      calibrationMin[i] = rawVal;
+      calibrationMin[i] = rawVal;  // Minimum = target at impact/100% (lowest reading)
       calibrationUpdated[i] = true;
     }
     if (rawVal > calibrationMax[i]) {
-      calibrationMax[i] = rawVal;
+      calibrationMax[i] = rawVal;  // Maximum = target at start/0% (highest reading, may be slightly +/-)
       calibrationUpdated[i] = true;
     }
   }
@@ -1235,69 +1259,108 @@ void applyCalibration() {
   Serial.println(F("Applying calibration:"));
   
   for (int i = 0; i < 4; i++) {
-    if (calibrationUpdated[i]) {
-      // Validate the calibration data
-      int range = calibrationMax[i] - calibrationMin[i];
+    // Always check calibration data, even if not explicitly updated
+    // This ensures we apply calibration if any data was collected
+    int range = calibrationMax[i] - calibrationMin[i];
+    
+    // Debug: Print what we collected
+    Serial.print(F("  L"));
+    Serial.print(i + 1);
+    Serial.print(F(": Collected min="));
+    Serial.print(calibrationMin[i]);
+    Serial.print(F(", max="));
+    Serial.print(calibrationMax[i]);
+    Serial.print(F(", range="));
+    Serial.println(range);
+    
+    // Check if we have valid calibration data
+    // Very permissive threshold - apply calibration if we have ANY reasonable range
+    if (range > 50 && calibrationMin[i] < 1023 && calibrationMax[i] > 0 && calibrationMin[i] < calibrationMax[i]) {
+      // CRITICAL: Map calibration to distance ranges
+      // Start (0%) = calibrationMax (high reading when target at beginning)
+      // Impact (100%) = calibrationMin (low reading when target at impact)
+      // ProxRange[0] = far value (start/0%) = calibrationMax
+      // ProxRange[1] = close value (impact/100%) = calibrationMin
+      int newFar = calibrationMax[i];   // Start/0% = high reading
+      int newClose = calibrationMin[i]; // Impact/100% = low reading
       
-      // Need substantial range to be valid
-      if (range > 150) {
-        // Far = high value (no zombie), Close = low value (zombie close)
-        int newFar = calibrationMax[i];
-        int newClose = calibrationMin[i];
+      // CRITICAL: Don't add margins that prevent 0% from being 0%
+      // The calibration should directly map:
+      // - newFar (ProxRange[0]) = maximum reading = start/0%
+      // - newClose (ProxRange[1]) = minimum reading = impact/100%
+      // Only add tiny margins for sensor noise, not significant offsets
+      
+      // Far: add tiny margin (2) only for sensor noise at the high end
+      // This ensures "no target" reads slightly above 0% (like 1-2%), not exactly 0%
+      newFar = min(newFar + 2, 1023);
+      
+      // Close: subtract tiny margin (2) only for sensor noise at the low end  
+      // This ensures "at impact" reads slightly below 100% (like 98-99%), not exactly 100%
+      // But keep it reasonable - don't go below 0
+      newClose = max(newClose - 2, 0);
+      
+      // Final sanity check - ensure reasonable range remains (very permissive: 50)
+      if (newFar > newClose && (newFar - newClose) > 50) {
+        // Save OLD values before updating for comparison
+        int oldFar = ProxRange[i][0];
+        int oldClose = ProxRange[i][1];
         
-        // Add LARGE margins to prevent false 100% readings
-        // Far: add margin so "no zombie" reads as ~5% not 0%
-        newFar = min(newFar + 30, 950);
+        // CRITICAL: Update ProxRange with calibrated values
+        // ProxRange[0] = far value = start/0% (high reading)
+        // ProxRange[1] = close value = impact/100% (low reading)
+        ProxRange[i][0] = newFar;   // Start/0% (high reading when target at beginning)
+        ProxRange[i][1] = newClose; // Impact/100% (low reading when target at impact)
         
-        // Close: CRITICAL - cap maximum close value to prevent bad calibration
-        // If zombie didn't go all the way to wall during calibration, close value is too high
-        // Maximum reasonable close value is ~120 (based on typical sensor behavior)
-        const int MAX_CLOSE_VALUE = 120;
+        // Automatically save to EEPROM so calibration persists across power cycles
+        EEPROM.put(EEPROM_PROX_RANGE_BASE + i * 4, (int)newFar);
+        EEPROM.put(EEPROM_PROX_RANGE_BASE + i * 4 + 2, (int)newClose);
         
-        // Close: add margin for short lanes (L2, L3) 
-        if (i == 1 || i == 2) {
-          // Short lanes - zombie never gets as close, add 50% of range as buffer
-          newClose = max(newClose - (range / 2), 50);
-        } else {
-          // Long lanes (L1, L4) - smaller buffer but cap the close value
-          newClose = max(newClose - 30, 50);
-        }
-        
-        // CRITICAL: Cap close value to prevent bad calibration on L4
-        // If calibration didn't capture zombie at wall, close is too high
-        newClose = min(newClose, MAX_CLOSE_VALUE);
-        
-        // Final sanity check - ensure reasonable range remains
-        if (newFar - newClose > 100) {
-          ProxRange[i][0] = newFar;
-          ProxRange[i][1] = newClose;
-          
-          Serial.print(F("  L"));
-          Serial.print(i + 1);
-          Serial.print(F(": ["));
-          Serial.print(newFar);
-          Serial.print(F(","));
-          Serial.print(newClose);
-          Serial.print(F("] range="));
-          Serial.println(newFar - newClose);
-        } else {
-          Serial.print(F("  L"));
-          Serial.print(i + 1);
-          Serial.println(F(": range too small after margins, keeping default"));
-        }
+        Serial.print(F("  L"));
+        Serial.print(i + 1);
+        Serial.print(F(": OLD ["));
+        Serial.print(oldFar);
+        Serial.print(F(","));
+        Serial.print(oldClose);
+        Serial.print(F("] -> NEW ["));
+        Serial.print(newFar);
+        Serial.print(F(","));
+        Serial.print(newClose);
+        Serial.print(F("] range="));
+        Serial.print(newFar - newClose);
+        Serial.println(F(" [APPLIED & SAVED]"));
       } else {
         Serial.print(F("  L"));
         Serial.print(i + 1);
-        Serial.print(F(": insufficient range ("));
-        Serial.print(range);
+        Serial.print(F(": range too small after margins ("));
+        Serial.print(newFar - newClose);
         Serial.println(F("), keeping default"));
       }
     } else {
       Serial.print(F("  L"));
       Serial.print(i + 1);
-      Serial.println(F(": no updates"));
+      Serial.print(F(": insufficient calibration data (range="));
+      Serial.print(range);
+      Serial.print(F(", min="));
+      Serial.print(calibrationMin[i]);
+      Serial.print(F(", max="));
+      Serial.print(calibrationMax[i]);
+      Serial.println(F("), keeping default"));
     }
   }
+  
+  // Force a print of current ranges to verify they were updated
+  Serial.println(F("--- Updated Prox Ranges (NOW IN USE) ---"));
+  for (int i = 0; i < 4; i++) {
+    Serial.print(F("  L"));
+    Serial.print(i + 1);
+    Serial.print(F(": ["));
+    Serial.print(ProxRange[i][0]);
+    Serial.print(F(","));
+    Serial.print(ProxRange[i][1]);
+    Serial.print(F("] -> Distance calculation will use these values"));
+    Serial.println();
+  }
+  Serial.println(F("Calibration ranges are now active and will be used for all distance calculations."));
 }
 
 //============================================
@@ -1312,15 +1375,22 @@ void startCalibration() {
   systemEnabled = true;  // Ensure PID controller is active to maintain position
   
   // Reset calibration tracking
+  // CRITICAL: Calibration starts when targets are at 0% (beginning of lane)
+  // At start (0%): sensor reads HIGH (target far from sensor) = calibrationMax
+  // At impact (100%): sensor reads LOW (target close to sensor) = calibrationMin
+  // Initialize to track extremes: min starts high (will decrease), max starts low (will increase)
   for (int i = 0; i < 4; i++) {
-    calibrationMin[i] = 1023;
-    calibrationMax[i] = 0;
+    // Initialize to track true extremes
+    // calibrationMin starts at maximum value (1023) and will decrease to find true minimum (impact/100%)
+    // calibrationMax starts at minimum value (0) and will increase to find true maximum (start/0%)
+    calibrationMin[i] = 1023;  // Start high - will track down to find minimum (impact/100% = low reading)
+    calibrationMax[i] = 0;     // Start low - will track up to find maximum (start/0% = high reading)
     calibrationUpdated[i] = false;
   }
   
   Serial.println(F("=== CALIBRATION STARTED (15s) ==="));
   Serial.println(F("Mechanism moving to home (position 0)..."));
-  Serial.println(F("Move zombies through all lanes!"));
+  Serial.println(F("Targets should start at 0% (beginning) - move them to 100% (impact) and back!"));
 }
 
 //============================================
@@ -1709,7 +1779,7 @@ void loop() {
           DBG_PRINT(F("!!! OVERRIDE L"));
           DBG_PRINT(overrideLane + 1);
           DBG_PRINT(F(" @"));
-          DBG_PRINT((int)((1.0 - zombieDistances[overrideLane]) * 100));
+          DBG_PRINT((int)(zombieDistances[overrideLane] * 100));
           DBG_PRINTLN(F("% !!!"));
           
           // Reset batch on emergency - will recalculate after this target
@@ -2011,7 +2081,8 @@ void moveToTarget() {
 // DWELL AT TARGET
 //============================================
 void dwellAtTarget() {
-  if (activeTargetIndex < 0) {
+  // CRITICAL: Safety check - ensure activeTargetIndex is valid
+  if (activeTargetIndex < 0 || activeTargetIndex > 3) {
     releaseCommitment();
     state = CHOOSE_TARGET;
     return;
@@ -2230,13 +2301,22 @@ void dwellAtTarget() {
   }
   
   // EMERGENCY OVERRIDE while dwelling - handle immediately
-  if (overrideLane >= 0 && shouldOverride(overrideLane)) {
+  if (overrideLane >= 0 && overrideLane <= 3 && shouldOverride(overrideLane)) {
     int previousLane = activeTargetIndex;
+    
+    // CRITICAL: Clean up all dwell state variables before transitioning
+    stoppedStartTime = 0;
+    backwardStartTime = 0;
+    peakZombieDistance = 1.0;  // Reset for next target
+    arrivalZombieDistance = 1.0;  // Reset for next target
+    arrivalTime = 0;  // Reset for next target
     
     DBG_PRINT(F("!!! OVERRIDE L"));
     DBG_PRINT(overrideLane + 1);
     DBG_PRINT(F(" @"));
-    DBG_PRINT((int)((1.0 - zombieDistances[overrideLane]) * 100));
+    if (overrideLane >= 0 && overrideLane <= 3) {
+      DBG_PRINT((int)((1.0 - zombieDistances[overrideLane]) * 100));
+    }
     DBG_PRINTLN(F("% !!!"));
     
     // Reset batch on emergency override
@@ -2251,7 +2331,16 @@ void dwellAtTarget() {
     }
   }
   
-  unsigned long dwellTime = millis() - arrivalTime;
+  // CRITICAL: Safety check - ensure arrivalTime is valid (avoid overflow)
+  unsigned long dwellTime = (arrivalTime > 0) ? (millis() - arrivalTime) : 0;
+  
+  // CRITICAL: Safety check - ensure activeTargetIndex is valid before accessing arrays
+  if (activeTargetIndex < 0 || activeTargetIndex > 3) {
+    releaseCommitment();
+    state = CHOOSE_TARGET;
+    return;
+  }
+  
   float currentDist = zombieDistances[activeTargetIndex];
   int currentDir = ProxSensors[activeTargetIndex].direction;
   
@@ -2261,77 +2350,94 @@ void dwellAtTarget() {
     peakZombieDistance = currentDist;
   }
   
-  if (currentDir == BACKWARD && dwellTime >= 50) {
-    if (backwardStartTime == 0) {
-      backwardStartTime = millis();
-    }
-      if (millis() - backwardStartTime >= BACKWARD_CONFIRM_TIME) {
+  // CRITICAL: Wait until target begins to move back (direction changes to BACKWARD)
+  // Then immediately move to next target - no additional delays
+  if (currentDir == BACKWARD) {
+    // Target has started moving backward - immediately record hit and move to next
+    int previousLane = activeTargetIndex;  // Save for recordHit
+    
+    // CRITICAL: Clean up all dwell state variables before transitioning
+    backwardStartTime = 0;
+    stoppedStartTime = 0;
+    peakZombieDistance = 1.0;  // Reset for next target
+    arrivalZombieDistance = 1.0;  // Reset for next target
+    arrivalTime = 0;  // Reset for next target
+    
+    // Record hit with previous lane (before releaseCommitment clears it)
+    if (previousLane >= 0 && previousLane <= 3) {
       zombiesKilled++;
-      recordHit(activeTargetIndex);  // Analysis mode tracking
+      recordHit(previousLane);  // Analysis mode tracking
       DBG_PRINT(F("HIT L"));
-      DBG_PRINT(activeTargetIndex + 1);
+      DBG_PRINT(previousLane + 1);
       DBG_PRINT(F(" ["));
       DBG_PRINT(zombiesKilled);
       DBG_PRINTLN(F("]"));
-      
-      backwardStartTime = 0;
-      stoppedStartTime = 0;
-      releaseCommitment();
-      
-      // Advance batch (will unlock if sequence complete)
-      advanceSequence();
-      
-      // Get next target from batch (respects batch lock) - IMMEDIATE transition, no delay
-      // IMPROVED: Skip lanes that have already been attempted recently
-      int next = getNextSequenceTarget();
-      if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
-        commitToTarget(next);
-        if (isCommitted) {
-          state = MOVE_TO_TARGET;  // Immediately move to next target
-        } else {
-          // If commit failed, try chooseAndCommitTargetFromSequence for immediate retry
-          state = CHOOSE_TARGET;
-        }
-      } else {
-        // Batch complete or no valid targets - unlock and immediately choose next
-        if (sequenceLocked) {
-          sequenceLocked = false;
-        }
-        // Immediately try to choose next target instead of waiting
-        chooseAndCommitTargetFromSequence();
-        if (isCommitted) {
-          state = MOVE_TO_TARGET;
-        } else {
-          state = CHOOSE_TARGET;
-        }
-      }
-      return;
     }
-  } else {
-    backwardStartTime = 0;
+    
+    releaseCommitment();
+    
+    // Advance sequence (will unlock if sequence complete)
+    advanceSequence();
+    
+    // Get next target from sequence - IMMEDIATE transition, no delay
+    int next = getNextSequenceTarget();
+    if (next >= 0 && next <= 3 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+      commitToTarget(next);
+      if (isCommitted) {
+        state = MOVE_TO_TARGET;  // Immediately move to next target
+      } else {
+        // If commit failed, try chooseAndCommitTargetFromSequence for immediate retry
+        state = CHOOSE_TARGET;
+      }
+    } else {
+      // Sequence complete or no valid targets - unlock and immediately choose next
+      if (sequenceLocked) {
+        sequenceLocked = false;
+      }
+      // Immediately try to choose next target instead of waiting
+      chooseAndCommitTargetFromSequence();
+      if (isCommitted) {
+        state = MOVE_TO_TARGET;
+      } else {
+        state = CHOOSE_TARGET;
+      }
+    }
+    return;  // Exit immediately - no further dwell checks
   }
   
   if (dwellTime >= 100 && peakZombieDistance < 0.15) {
     // Zombie got to within 15% (close to wall)
     float retreatAmount = currentDist - peakZombieDistance;
     if (retreatAmount > 0.04) {  // Moved back 4%+ from peak
-      zombiesKilled++;
-      recordHit(activeTargetIndex);  // Analysis mode tracking
-      DBG_PRINT(F("HIT L"));
-      DBG_PRINT(activeTargetIndex + 1);
-      DBG_PRINT(F(" ["));
-      DBG_PRINT(zombiesKilled);
-      DBG_PRINTLN(F("]"));
+      int previousLane = activeTargetIndex;  // Save for recordHit
       
+      // CRITICAL: Clean up all dwell state variables before transitioning
       stoppedStartTime = 0;
-      if (!laneAttempted[activeTargetIndex]) {
-        laneAttempted[activeTargetIndex] = true;
-        laneAttemptTime[activeTargetIndex] = millis();
+      backwardStartTime = 0;
+      peakZombieDistance = 1.0;  // Reset for next target
+      arrivalZombieDistance = 1.0;  // Reset for next target
+      arrivalTime = 0;  // Reset for next target
+      
+      // Record hit with previous lane (before releaseCommitment clears it)
+      if (previousLane >= 0 && previousLane <= 3) {
+        zombiesKilled++;
+        recordHit(previousLane);  // Analysis mode tracking
+        DBG_PRINT(F("HIT L"));
+        DBG_PRINT(previousLane + 1);
+        DBG_PRINT(F(" ["));
+        DBG_PRINT(zombiesKilled);
+        DBG_PRINTLN(F("]"));
+        
+        if (!laneAttempted[previousLane]) {
+          laneAttempted[previousLane] = true;
+          laneAttemptTime[previousLane] = millis();
+        }
       }
+      
       releaseCommitment();
       advanceSequence();
       int next = getNextSequenceTarget();
-      if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+      if (next >= 0 && next <= 3 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
         commitToTarget(next);
         if (isCommitted) state = MOVE_TO_TARGET;
         else {
@@ -2355,35 +2461,47 @@ void dwellAtTarget() {
   if (dwellTime >= MIN_DWELL_TIME &&
       currentDist > RETREAT_CONFIRMED_DISTANCE && 
       currentDist > arrivalZombieDistance + 0.15) {
-    zombiesKilled++;
-    recordHit(activeTargetIndex);  // Analysis mode tracking
-    DBG_PRINT(F("HIT L"));
-    DBG_PRINT(activeTargetIndex + 1);
-    DBG_PRINT(F(" (far) ["));
-    DBG_PRINT(zombiesKilled);
-    DBG_PRINTLN(F("]"));
+    int previousLane = activeTargetIndex;  // Save for recordHit
     
-        if (!laneAttempted[activeTargetIndex]) {
-          laneAttempted[activeTargetIndex] = true;
-          laneAttemptTime[activeTargetIndex] = millis();
-        }
-        releaseCommitment();
-        stoppedStartTime = 0;
-        int next = getNextSequenceTarget();
-        if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
-          commitToTarget(next);
-          if (isCommitted) state = MOVE_TO_TARGET;
-          else {
-            chooseAndCommitTargetFromSequence();
-            if (isCommitted) state = MOVE_TO_TARGET;
-            else state = CHOOSE_TARGET;
-          }
-        } else {
-          chooseAndCommitTargetFromSequence();
-          if (isCommitted) state = MOVE_TO_TARGET;
-          else state = CHOOSE_TARGET;
-        }
-        return;
+    // CRITICAL: Clean up all dwell state variables before transitioning
+    stoppedStartTime = 0;
+    backwardStartTime = 0;
+    peakZombieDistance = 1.0;  // Reset for next target
+    arrivalZombieDistance = 1.0;  // Reset for next target
+    arrivalTime = 0;  // Reset for next target
+    
+    // Record hit with previous lane (before releaseCommitment clears it)
+    if (previousLane >= 0 && previousLane <= 3) {
+      zombiesKilled++;
+      recordHit(previousLane);  // Analysis mode tracking
+      DBG_PRINT(F("HIT L"));
+      DBG_PRINT(previousLane + 1);
+      DBG_PRINT(F(" (far) ["));
+      DBG_PRINT(zombiesKilled);
+      DBG_PRINTLN(F("]"));
+      
+      if (!laneAttempted[previousLane]) {
+        laneAttempted[previousLane] = true;
+        laneAttemptTime[previousLane] = millis();
+      }
+    }
+    
+    releaseCommitment();
+    int next = getNextSequenceTarget();
+    if (next >= 0 && next <= 3 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+      commitToTarget(next);
+      if (isCommitted) state = MOVE_TO_TARGET;
+      else {
+        chooseAndCommitTargetFromSequence();
+        if (isCommitted) state = MOVE_TO_TARGET;
+        else state = CHOOSE_TARGET;
+      }
+    } else {
+      chooseAndCommitTargetFromSequence();
+      if (isCommitted) state = MOVE_TO_TARGET;
+      else state = CHOOSE_TARGET;
+    }
+    return;
   }
   
   // Check for STOPPED direction OR very small velocity (pseudo-stopped)
@@ -2401,23 +2519,34 @@ void dwellAtTarget() {
       if (distChange < 0.08) {  // Increased from 5% to 8% - more tolerant
         // If zombie was close, probably a hit - be generous
         if (peakZombieDistance < 0.30) {  // INCREASED threshold - more generous hit credit (was 0.25)
-          zombiesKilled++;
-          recordHit(activeTargetIndex);
-          DBG_PRINT(F("HIT L"));
-          DBG_PRINT(activeTargetIndex + 1);
-          DBG_PRINT(F(" (stop) ["));
-          DBG_PRINT(zombiesKilled);
-          DBG_PRINTLN(F("]"));
+          int previousLane = activeTargetIndex;  // Save for recordHit
           
-          // Mark as attempted and hit
-          laneAttempted[activeTargetIndex] = true;
-          laneAttemptTime[activeTargetIndex] = millis();
+          // CRITICAL: Clean up all dwell state variables before transitioning
+          stoppedStartTime = 0;
+          backwardStartTime = 0;
+          peakZombieDistance = 1.0;  // Reset for next target
+          arrivalZombieDistance = 1.0;  // Reset for next target
+          arrivalTime = 0;  // Reset for next target
+          
+          // Record hit with previous lane (before releaseCommitment clears it)
+          if (previousLane >= 0 && previousLane <= 3) {
+            zombiesKilled++;
+            recordHit(previousLane);
+            DBG_PRINT(F("HIT L"));
+            DBG_PRINT(previousLane + 1);
+            DBG_PRINT(F(" (stop) ["));
+            DBG_PRINT(zombiesKilled);
+            DBG_PRINTLN(F("]"));
+            
+            // Mark as attempted and hit
+            laneAttempted[previousLane] = true;
+            laneAttemptTime[previousLane] = millis();
+          }
           
           releaseCommitment();
-          stoppedStartTime = 0;
           // IMMEDIATE transition - no delay
           int next = getNextSequenceTarget();
-          if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+          if (next >= 0 && next <= 3 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
             commitToTarget(next);
             if (isCommitted) state = MOVE_TO_TARGET;
             else {
@@ -2447,18 +2576,30 @@ void dwellAtTarget() {
           // IMPROVED: Only exit on STOP if we've been dwelling for a long time
           // Be persistent - don't give up too easily
           if (dwellTime >= 400) {  // REDUCED: Only exit if we've been here 400ms+ without progress
-            DBG_PRINT(F("STOP L"));
-            DBG_PRINTLN(activeTargetIndex + 1);
+            int previousLane = activeTargetIndex;  // Save for recordHit
             
-            // Mark as attempted - prevent immediate re-engagement
-            laneAttempted[activeTargetIndex] = true;
-            laneAttemptTime[activeTargetIndex] = millis();
+            // CRITICAL: Clean up all dwell state variables before transitioning
+            stoppedStartTime = 0;
+            backwardStartTime = 0;
+            peakZombieDistance = 1.0;  // Reset for next target
+            arrivalZombieDistance = 1.0;  // Reset for next target
+            arrivalTime = 0;  // Reset for next target
+            
+            DBG_PRINT(F("STOP L"));
+            if (previousLane >= 0 && previousLane <= 3) {
+              DBG_PRINTLN(previousLane + 1);
+              
+              // Mark as attempted - prevent immediate re-engagement
+              laneAttempted[previousLane] = true;
+              laneAttemptTime[previousLane] = millis();
+            } else {
+              DBG_PRINTLN(F("?"));
+            }
             
             releaseCommitment();
-            stoppedStartTime = 0;
             // IMMEDIATE transition - no delay
             int next = getNextSequenceTarget();
-            if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+            if (next >= 0 && next <= 3 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
               commitToTarget(next);
               if (isCommitted) state = MOVE_TO_TARGET;
               else {
@@ -2547,20 +2688,33 @@ void dwellAtTarget() {
     }
     
     if (shouldMarkGone) {
-      DBG_PRINT(F("GONE L"));
-      DBG_PRINT(activeTargetIndex + 1);
-      DBG_PRINT(F(" @"));
-      DBG_PRINT((int)((1.0 - currentDist) * 100));
-      DBG_PRINTLN(F("%"));
+      int previousLane = activeTargetIndex;  // Save for recordHit
       
-      // CRITICAL FIX: Reset attempted flag when GONE - allow immediate re-engagement if target reappears
-      // This allows the system to try again immediately if a new zombie appears in this lane
-      laneAttempted[activeTargetIndex] = false;  // Clear attempted flag - allow re-engagement
+      // CRITICAL: Clean up all dwell state variables before transitioning
+      stoppedStartTime = 0;
+      backwardStartTime = 0;
+      peakZombieDistance = 1.0;  // Reset for next target
+      arrivalZombieDistance = 1.0;  // Reset for next target
+      arrivalTime = 0;  // Reset for next target
+      
+      DBG_PRINT(F("GONE L"));
+      if (previousLane >= 0 && previousLane <= 3) {
+        DBG_PRINT(previousLane + 1);
+        DBG_PRINT(F(" @"));
+        DBG_PRINT((int)((1.0 - currentDist) * 100));
+        DBG_PRINTLN(F("%"));
+        
+        // CRITICAL FIX: Reset attempted flag when GONE - allow immediate re-engagement if target reappears
+        // This allows the system to try again immediately if a new zombie appears in this lane
+        laneAttempted[previousLane] = false;  // Clear attempted flag - allow re-engagement
+      } else {
+        DBG_PRINTLN(F("?"));
+      }
       
       releaseCommitment();
       // IMMEDIATE transition - don't skip attempted lanes since we're not marking as attempted
       int next = getNextSequenceTarget();
-      if (next >= 0 && ProxSensors[next].direction == FORWARD) {
+      if (next >= 0 && next <= 3 && ProxSensors[next].direction == FORWARD) {
         commitToTarget(next);
         if (isCommitted) state = MOVE_TO_TARGET;
         else {
@@ -2584,32 +2738,44 @@ void dwellAtTarget() {
   // IMPROVED: Mark lane as attempted on timeout - prevent immediate re-engagement
   //--------------------------------------------
   if (dwellTime >= maxDwell) {
-    // IMPROVED: Mark lane as attempted - prevent immediate re-engagement
-    laneAttempted[activeTargetIndex] = true;
-    laneAttemptTime[activeTargetIndex] = millis();
+    int previousLane = activeTargetIndex;  // Save for recordHit
     
-    if (currentDir == FORWARD && currentDist < arrivalZombieDistance - 0.03) {
-      zombiesMissed++;
-      DBG_PRINT(F("MISS L"));
-      DBG_PRINT(activeTargetIndex + 1);
-      DBG_PRINT(F(" ["));
-      DBG_PRINT(zombiesMissed);
-      DBG_PRINTLN(F("]"));
-    } else if (currentDir == STOPPED) {
-      // STOPPED at very close range = likely hit wall = miss
-      if (currentDist < 0.08) {
+    // CRITICAL: Clean up all dwell state variables before transitioning
+    stoppedStartTime = 0;
+    backwardStartTime = 0;
+    peakZombieDistance = 1.0;  // Reset for next target
+    arrivalZombieDistance = 1.0;  // Reset for next target
+    arrivalTime = 0;  // Reset for next target
+    
+    // IMPROVED: Mark lane as attempted - prevent immediate re-engagement
+    if (previousLane >= 0 && previousLane <= 3) {
+      laneAttempted[previousLane] = true;
+      laneAttemptTime[previousLane] = millis();
+      
+      if (currentDir == FORWARD && currentDist < arrivalZombieDistance - 0.03) {
+        zombiesMissed++;
+        DBG_PRINT(F("MISS L"));
+        DBG_PRINT(previousLane + 1);
+        DBG_PRINT(F(" ["));
+        DBG_PRINT(zombiesMissed);
+        DBG_PRINTLN(F("]"));
+      } else if (currentDir == STOPPED) {
+        // STOPPED at very close range = likely hit wall = miss
+        if (currentDist < 0.08) {
+          // Could be a miss
+        }
+        DBG_PRINT(F("STOP L"));
+        DBG_PRINTLN(previousLane + 1);
+      } else {
+        DBG_PRINT(F("TIME L"));
+        DBG_PRINTLN(previousLane + 1);
       }
-      DBG_PRINT(F("STOP L"));
-      DBG_PRINTLN(activeTargetIndex + 1);
-    } else {
-      DBG_PRINT(F("TIME L"));
-      DBG_PRINTLN(activeTargetIndex + 1);
     }
     
     releaseCommitment();
     // IMMEDIATE transition - no delay (skip attempted lanes)
     int next = getNextSequenceTarget();
-    if (next >= 0 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
+    if (next >= 0 && next <= 3 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
       commitToTarget(next);
       if (isCommitted) state = MOVE_TO_TARGET;
       else {
@@ -2735,7 +2901,7 @@ void processSerialCommands() {
       }
       break;
     case 'X': case 'x':
-      // Show current calibration values
+      // Show current calibration values and verify they're being used
       Serial.println(F("=== CALIBRATION STATUS ==="));
       for (int i = 0; i < 4; i++) {
         Serial.print(F("L"));
@@ -2747,12 +2913,27 @@ void processSerialCommands() {
         Serial.print(F("] Raw="));
         Serial.print((int)ProxSensors[i].currVal);
         Serial.print(F(" Dist="));
-        Serial.println(zombieDistances[i], 2);
+        Serial.print(zombieDistances[i], 3);
+        Serial.print(F(" ("));
+        Serial.print((int)(zombieDistances[i] * 100));
+        Serial.println(F("% through lane)"));
+        
+        // Verify the distance calculation is using the calibrated range
+        float calcRange = (float)(ProxRange[i][0] - ProxRange[i][1]);
+        if (calcRange > 0) {
+          float expectedDist = (ProxSensors[i].currVal - ProxRange[i][1]) / calcRange;
+          Serial.print(F("  -> Using range "));
+          Serial.print(calcRange);
+          Serial.print(F(" to calculate distance"));
+          Serial.println();
+        }
       }
       if (calibrationActive) {
         Serial.print(F("Calibrating... "));
         Serial.print((millis() - calibrationStartTime) / 1000);
         Serial.println(F("s"));
+      } else {
+        Serial.println(F("Calibration complete - ranges are active"));
       }
       break;
     case 'P': case 'p': printCurrentSettings(); break;
@@ -2988,7 +3169,10 @@ void updateSensors() {
     const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
     float currentDistance = 0.0f;
     if (range != 0.0f) {
-      // So: 1.0 = at impact (urgent!), 0.0 = at start
+      // Distance calculation: 0.0 = at start (0%), 1.0 = at impact (100%)
+      // ProxRange[0] = start/0% (high reading), ProxRange[1] = impact/100% (low reading)
+      // When sensor reads high (close to ProxRange[0]): distance is low (near start/0%)
+      // When sensor reads low (close to ProxRange[1]): distance is high (near impact/100%)
       float normalized = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
       currentDistance = constrain(normalized, 0.0f, 1.0f);
       
@@ -3194,7 +3378,9 @@ void printStatus() {
   }
   
   for (int i = 0; i < 4; i++) {
-    int pct = (int)((1.0 - zombieDistances[i]) * 100);
+    // Display: 0% = at start (beginning), 100% = at impact (end)
+    // zombieDistances[i] = 0.0 at start, 1.0 at impact
+    int pct = (int)(zombieDistances[i] * 100);
     Serial.print(pct);
     
     if (ProxSensors[i].direction == FORWARD) Serial.print(F("F"));
