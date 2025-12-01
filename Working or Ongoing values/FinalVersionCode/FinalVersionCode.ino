@@ -5,7 +5,7 @@
 // DEBUG OPTIMIZATION - Comment out to save flash memory
 //============================================
 // Uncomment the line below to enable debug Serial output
-#define DEBUG_SERIAL
+// #define DEBUG_SERIAL  // DISABLED for faster processing
 
 #ifdef DEBUG_SERIAL
   #define DBG_PRINT(x) Serial.print(x)
@@ -1502,14 +1502,64 @@ void loop() {
   if (calibrationActive) {
     // State machine disabled during calibration - PID controller will maintain position 0
   } else if (autoMode && systemEnabled && !gameOver) {
-    
+
+    //============================================
+    // ABSOLUTE EMERGENCY OVERRIDE - BYPASSES ALL COOLDOWNS
+    // If ANY lane is at 85%+ FORWARD, IMMEDIATELY target it
+    // This prevents lanes from reaching 100% (game over)
+    //============================================
+    const float ABSOLUTE_EMERGENCY_THRESHOLD = 0.85;  // 85% = 15% remaining
+    int absoluteEmergencyLane = -1;
+    float highestEmergencyDist = 0;
+
+    for (int i = 0; i < 4; i++) {
+      // Skip current target - we're already on it
+      if (i == committedLane) continue;
+
+      // Only check FORWARD-moving targets
+      if (ProxSensors[i].direction != FORWARD) continue;
+
+      float dist = zombieDistances[i];
+
+      // Check if this lane is in absolute emergency (85%+ and higher than any we've seen)
+      if (dist >= ABSOLUTE_EMERGENCY_THRESHOLD && dist < 0.99 && dist > highestEmergencyDist) {
+        absoluteEmergencyLane = i;
+        highestEmergencyDist = dist;
+      }
+    }
+
+    // If we found an absolute emergency lane, IMMEDIATELY commit to it
+    if (absoluteEmergencyLane >= 0) {
+      // Only switch if emergency lane is more critical than current target
+      float currentDist = (committedLane >= 0) ? zombieDistances[committedLane] : 0;
+      bool currentIsForward = (committedLane >= 0) ? (ProxSensors[committedLane].direction == FORWARD) : false;
+
+      // Switch if: no current target, current is backward, or emergency is further along
+      if (committedLane < 0 || !currentIsForward || highestEmergencyDist > currentDist + 0.05) {
+        Serial.print(F("!!!EMERGENCY L"));
+        Serial.print(absoluteEmergencyLane + 1);
+        Serial.print(F(" @"));
+        Serial.print((int)(highestEmergencyDist * 100));
+        Serial.println(F("%"));
+
+        // Force immediate commit - bypass all normal checks
+        releaseCommitment();
+        resetSequence();
+        commitToTarget(absoluteEmergencyLane);
+        desiredPosition = targetPositions[absoluteEmergencyLane];
+        state = MOVE_TO_TARGET;
+        lastOverrideCommit = millis();
+        lastOverrideLane = absoluteEmergencyLane;
+      }
+    }
+
     //============================================
     // EMERGENCY OVERRIDE CHECK
     // Interrupts batch execution for critical threats
     //============================================
     int overrideLane = -1;
     float bestOverrideScore = 0;
-    
+
     unsigned long timeSinceOverride = millis() - lastOverrideCommit;
     // CRITICAL FIX: Add cooldown after overrides to prevent rapid switching
     // After an override, wait at least 2 seconds before allowing another override
@@ -1925,7 +1975,7 @@ void loop() {
   //============================================
   // STATUS OUTPUT
   //============================================
-  if (autoMode && (millis() - lastPrintTime >= 200)) {
+  if (autoMode && (millis() - lastPrintTime >= 350)) {  // Reduced from 200ms to 350ms for faster processing
     lastPrintTime = millis();
     printStatus();
   }
