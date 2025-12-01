@@ -208,10 +208,10 @@ bool calibrationUpdated[4] = {false, false, false, false};
 // Sensor increasing = zombie moving away from impact (BACKWARD)
 //============================================
 int ProxRange[4][2] = {
-  {568, 93},   // Lane 1: [start, impact] - calibrated from logs
-  {587, 118},  // Lane 2: [start, impact] - calibrated from logs
-  {578, 104},  // Lane 3: [start, impact] - calibrated from logs
-  {597, 149}   // Lane 4: [start, impact] - calibrated from logs
+  {640, 80},   // Lane 1: [start/0%, impact/100%] - ~560 range
+  {620, 100},  // Lane 2: [start/0%, impact/100%] - ~520 range
+  {620, 90},   // Lane 3: [start/0%, impact/100%] - ~530 range
+  {650, 135}   // Lane 4: [start/0%, impact/100%] - ~515 range
 };
 
 //============================================
@@ -450,13 +450,20 @@ void loadFromEEPROM() {
   }
   
   // Load calibrated prox ranges if valid
+  // CRITICAL: Require minimum range of 300 to prevent using corrupted/tiny ranges
   for (int i = 0; i < 4; i++) {
     int farVal, closeVal;
     EEPROM.get(EEPROM_PROX_RANGE_BASE + i * 4, farVal);
     EEPROM.get(EEPROM_PROX_RANGE_BASE + i * 4 + 2, closeVal);
-    if (farVal > 100 && farVal < 900 && closeVal > 50 && closeVal < 800 && farVal > closeVal) {
+    int range = farVal - closeVal;
+    // Require: valid bounds AND minimum range of 300 (prevents corrupted tiny ranges)
+    if (farVal > 400 && farVal < 900 && closeVal > 50 && closeVal < 400 && range > 300) {
       ProxRange[i][0] = farVal;
       ProxRange[i][1] = closeVal;
+    } else {
+      Serial.print(F("L")); Serial.print(i+1);
+      Serial.print(F(": EEPROM range invalid (")); Serial.print(range);
+      Serial.println(F("), using default"));
     }
   }
 }
