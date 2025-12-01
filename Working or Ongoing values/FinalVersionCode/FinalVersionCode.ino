@@ -194,8 +194,9 @@ unsigned long calibrationStartTime = 0;
 const unsigned long CALIBRATION_DURATION = 10000;  // 10 seconds of calibration
 
 // Track min/max readings per lane during calibration
-int calibrationMin[4] = {1023, 1023, 1023, 1023};  // Far (no zombie)
-int calibrationMax[4] = {0, 0, 0, 0};              // Close (zombie near)
+int calibrationMin[4] = {1023, 1023, 1023, 1023};  // Impact (low reading)
+int calibrationMax[4] = {0, 0, 0, 0};              // Start (high reading)
+int calibrationStart[4] = {0, 0, 0, 0};            // Initial reading at calibration start (= 0%)
 bool calibrationUpdated[4] = {false, false, false, false};
 
 //============================================
@@ -1292,46 +1293,35 @@ void updateCalibration() {
 //============================================
 void applyCalibration() {
   Serial.println(F("Applying calibration:"));
-  
+
   for (int i = 0; i < 4; i++) {
-    // Always check calibration data, even if not explicitly updated
-    // This ensures we apply calibration if any data was collected
-    int range = calibrationMax[i] - calibrationMin[i];
-    
+    // Use calibrationStart (captured at begin) as 0% baseline
+    // Use calibrationMin (tracked during cal) as 100% impact point
+    int startVal = calibrationStart[i];  // Initial reading = 0%
+    int impactVal = calibrationMin[i];   // Minimum reading = 100%
+    int range = startVal - impactVal;
+
     // Debug: Print what we collected
     Serial.print(F("  L"));
     Serial.print(i + 1);
-    Serial.print(F(": Collected min="));
-    Serial.print(calibrationMin[i]);
-    Serial.print(F(", max="));
+    Serial.print(F(": Start(0%)="));
+    Serial.print(startVal);
+    Serial.print(F(", Impact(100%)="));
+    Serial.print(impactVal);
+    Serial.print(F(", Max seen="));
     Serial.print(calibrationMax[i]);
     Serial.print(F(", range="));
     Serial.println(range);
-    
-    // Check if we have valid calibration data
-    // Very permissive threshold - apply calibration if we have ANY reasonable range
-    if (range > 50 && calibrationMin[i] < 1023 && calibrationMax[i] > 0 && calibrationMin[i] < calibrationMax[i]) {
-      // CRITICAL: Map calibration to distance ranges
-      // Start (0%) = calibrationMax (high reading when target at beginning)
-      // Impact (100%) = calibrationMin (low reading when target at impact)
-      // ProxRange[0] = far value (start/0%) = calibrationMax
-      // ProxRange[1] = close value (impact/100%) = calibrationMin
-      int newFar = calibrationMax[i];   // Start/0% = high reading
-      int newClose = calibrationMin[i]; // Impact/100% = low reading
-      
-      // CRITICAL: Don't add margins that prevent 0% from being 0%
-      // The calibration should directly map:
-      // - newFar (ProxRange[0]) = maximum reading = start/0%
-      // - newClose (ProxRange[1]) = minimum reading = impact/100%
-      // Only add tiny margins for sensor noise, not significant offsets
-      
-      // Far: add tiny margin (2) only for sensor noise at the high end
-      // This ensures "no target" reads slightly above 0% (like 1-2%), not exactly 0%
+
+    // Check if we have valid calibration data (range > 100 for good resolution)
+    if (range > 100 && impactVal < startVal) {
+      // Use the INITIAL reading (calibrationStart) as 0%
+      // Use the MINIMUM seen (calibrationMin) as 100%
+      int newFar = startVal;    // Start/0% = initial reading
+      int newClose = impactVal; // Impact/100% = minimum reading
+
+      // Add tiny margins for sensor noise
       newFar = min(newFar + 2, 1023);
-      
-      // Close: subtract tiny margin (2) only for sensor noise at the low end  
-      // This ensures "at impact" reads slightly below 100% (like 98-99%), not exactly 100%
-      // But keep it reasonable - don't go below 0
       newClose = max(newClose - 2, 0);
       
       // Final sanity check - ensure reasonable range remains (very permissive: 50)
@@ -1383,26 +1373,8 @@ void applyCalibration() {
     }
   }
   
-  // CRITICAL NORMALIZATION FIX: Reset start values so current position = 0%
-  // ALWAYS set ProxRange[0] to current reading at end of calibration
-  // This ensures whatever position targets are in NOW = 0%
-  Serial.println(F("--- Resetting start positions to current readings (= 0%) ---"));
-  for (int i = 0; i < 4; i++) {
-    int currentReading = analogRead(ProxSensors[i].pin);
-    int oldStart = ProxRange[i][0];
-    // ALWAYS update start value to current reading
-    // This makes current position = 0% exactly
-    ProxRange[i][0] = currentReading;
-    // Save updated value to EEPROM
-    EEPROM.put(EEPROM_PROX_RANGE_BASE + i * 4, (int)currentReading);
-    Serial.print(F("  L"));
-    Serial.print(i + 1);
-    Serial.print(F(": Start reset from "));
-    Serial.print(oldStart);
-    Serial.print(F(" to "));
-    Serial.print(currentReading);
-    Serial.println(F(" (current = 0%)"));
-  }
+  // No additional normalization needed - we used calibrationStart (captured at begin) as 0%
+  // This ensures targets at their initial position = exactly 0%
 
   // Force a print of current ranges to verify they were updated
   Serial.println(F("--- Final Prox Ranges (NOW IN USE) ---"));
@@ -1432,21 +1404,25 @@ void startCalibration() {
   
   // Reset calibration tracking
   // CRITICAL: Calibration starts when targets are at 0% (beginning of lane)
-  // At start (0%): sensor reads HIGH (target far from sensor) = calibrationMax
-  // At impact (100%): sensor reads LOW (target close to sensor) = calibrationMin
-  // Initialize to track extremes: min starts high (will decrease), max starts low (will increase)
-  for (int i = 0; i < 4; i++) {
-    // Initialize to track true extremes
-    // calibrationMin starts at maximum value (1023) and will decrease to find true minimum (impact/100%)
-    // calibrationMax starts at minimum value (0) and will increase to find true maximum (start/0%)
-    calibrationMin[i] = 1023;  // Start high - will track down to find minimum (impact/100% = low reading)
-    calibrationMax[i] = 0;     // Start low - will track up to find maximum (start/0% = high reading)
-    calibrationUpdated[i] = false;
-  }
-  
+  // At start (0%): sensor reads HIGH (target close to sensor) = calibrationStart
+  // At impact (100%): sensor reads LOW (target far from sensor) = calibrationMin
   Serial.println(F("=== CALIBRATION STARTED (10s) ==="));
+  Serial.println(F("Capturing initial RAW readings as 0% baseline..."));
+  for (int i = 0; i < 4; i++) {
+    // Capture RAW initial reading - this is the 0% position
+    calibrationStart[i] = analogRead(ProxSensors[i].pin);
+    // Initialize min/max tracking
+    calibrationMin[i] = 1023;  // Will track down to find minimum (impact/100%)
+    calibrationMax[i] = calibrationStart[i];  // Start with initial reading as max
+    calibrationUpdated[i] = false;
+    Serial.print(F("  L"));
+    Serial.print(i + 1);
+    Serial.print(F(": Initial RAW = "));
+    Serial.print(calibrationStart[i]);
+    Serial.println(F(" (= 0%)"));
+  }
   Serial.println(F("Mechanism moving to home (position 0)..."));
-  Serial.println(F("Targets should start at 0% (beginning) - move them to 100% (impact) and back!"));
+  Serial.println(F("Move targets to 100% (impact) and back!"));
 }
 
 //============================================
