@@ -210,7 +210,7 @@ ProxSensor ProxSensors[4];
 
 const float alpha = 0.75;           // Lowered from 0.85 - much faster response (25% new data)
 const float velocityAlpha = 0.70;   // Lowered from 0.80 - faster velocity tracking  
-const int stopTimeout = 120;         // Increased from 80 - more robust against noise (requires 120ms of no change to be STOPPED)
+const int stopTimeout = 80;         // Lowered from 100 - faster STOPPED detection
 // Noise thresholds are derived per-sensor during updates to avoid cross-lane coupling.
 const int lowerNoiseLimit = 5;      // Lowered from 6
 const int upperNoiseLimit = 8;      // Lowered from 10
@@ -547,35 +547,13 @@ void commitToTarget(int lane) {
     return;
   }
   
-  // CRITICAL: Final check - NEVER commit to backward or stopped targets
-  // Check direction immediately before committing to prevent committing to targets that just changed
-  if (ProxSensors[lane].direction == BACKWARD) {
-    return;  // Target is moving backward - do not commit
-  }
-  if (ProxSensors[lane].direction == STOPPED) {
-    // Check if it's been stopped too long
-    if (laneStoppedTime[lane] > 0) {
-      unsigned long stoppedDuration = millis() - laneStoppedTime[lane];
-      if (stoppedDuration > 300) {  // Stopped for more than 300ms - don't commit
-        return;
-      }
-    } else {
-      // Just stopped - don't commit
-      return;
-    }
-  }
-  // Require FORWARD direction for non-emergency commits
-  if (ProxSensors[lane].direction != FORWARD) {
-    return;  // Not forward-moving - do not commit
-  }
-  
   float dist = zombieDistances[lane];
   
+  if (ProxSensors[lane].direction == BACKWARD) return;
   bool isEmergency = (dist < ABSOLUTE_OVERRIDE_DISTANCE && ProxSensors[lane].direction == FORWARD);
   if (!isEmergency) {
     float laneThreshold = getEarlyEngageThreshold(lane);
     if (dist > laneThreshold || dist < MIN_ENGAGE_THRESHOLD) return;
-    // Double-check direction after distance check
     if (ProxSensors[lane].direction != FORWARD) return;
     if (batchLocked && batchActive && committedLane >= 0) {
       bool isInBatch = false;
@@ -1010,11 +988,9 @@ void calculateNewBatch() {
         }
       }
       
-      // CRITICAL: NEVER include backward or stopped lanes in fixed sequence batch
-      // Only include FORWARD-moving lanes
-      bool laneValid = !stoppedTooLong && 
-                       (zombieDistances[lane] < 0.35) && 
-                       (ProxSensors[lane].direction == FORWARD);  // ONLY FORWARD - no STOPPED or BACKWARD allowed
+      bool laneValid = !stoppedTooLong && (zombieDistances[lane] < 0.35) && 
+                       (ProxSensors[lane].direction == FORWARD || 
+                        (ProxSensors[lane].direction == STOPPED && !stoppedTooLong));
       
       if (laneValid) {
         targetBatch[batchSize++] = lane;
@@ -1044,17 +1020,12 @@ void calculateNewBatch() {
     lanes[i].lane = i;
     lanes[i].distance = zombieDistances[i];
     
-    // CRITICAL: Only include forward-moving targets - exclude backward/stopped
+    // CRITICAL: Only include forward-moving targets - exclude backward/stoppe
     // Backward-moving targets are retreating and should NEVER be in batches
-    // CRITICAL: Require FORWARD direction - never include BACKWARD or STOPPED
     // Use lane-specific threshold - L2/L3 engage much earlier
     // IMPROVED: Exclude lanes that have already been attempted (within cooldown)
     // CRITICAL: Skip STOPPED lanes that have been stopped for too long (> 2 seconds)
-    // CRITICAL: Double-check direction is FORWARD (not BACKWARD or STOPPED)
     bool isForwardMoving = (ProxSensors[i].direction == FORWARD);
-    if (ProxSensors[i].direction == BACKWARD || ProxSensors[i].direction == STOPPED) {
-      isForwardMoving = false;  // Explicitly exclude backward and stopped
-    }
     float laneThreshold = getEarlyEngageThreshold(i);
     bool isInRange = (lanes[i].distance < laneThreshold &&
                       lanes[i].distance > MIN_ENGAGE_THRESHOLD);
@@ -3324,35 +3295,15 @@ void updateSensors() {
     bool fastMovement = changeMagnitude > sensorNoiseLimit * 2;  // Moving fast if >2x noise threshold
 
     if (changeMagnitude < sensorNoiseLimit) {
-      // No significant change detected - might be stopped
-      // CRITICAL: Require longer period of no change before marking as STOPPED
-      // This prevents noise from causing false STOPPED readings
+      // No significant change detected
       if (now - ProxSensors[i].prevChangeTime >= stopTimeout) {
-        // Only mark as STOPPED if we've had no significant change for stopTimeout
-        // But keep previous direction if it was FORWARD and we just started seeing no change
-        // This prevents rapid switching from FORWARD to STOPPED due to noise
-        if (ProxSensors[i].direction == FORWARD && ProxSensors[i].forwardCount >= 2) {
-          // Was moving forward recently - require longer stop time before marking STOPPED
-          // This prevents false STOPPED when zombie is still moving but slowly
-          if (now - ProxSensors[i].prevChangeTime >= stopTimeout * 2) {
-            // Really stopped - mark it
-            if (ProxSensors[i].direction != STOPPED) {
-              laneStoppedTime[i] = now;  // Record when it became STOPPED
-            }
-            ProxSensors[i].direction = STOPPED;
-            ProxSensors[i].forwardCount = 0;
-            ProxSensors[i].backwardCount = 0;
-          }
-          // Otherwise keep FORWARD direction (hysteresis)
-        } else {
-          // Not recently forward - can mark as STOPPED sooner
-          if (ProxSensors[i].direction != STOPPED) {
-            laneStoppedTime[i] = now;  // Record when it became STOPPED
-          }
-          ProxSensors[i].direction = STOPPED;
-          ProxSensors[i].forwardCount = 0;
-          ProxSensors[i].backwardCount = 0;
+        // Track when lane becomes STOPPED
+        if (ProxSensors[i].direction != STOPPED) {
+          laneStoppedTime[i] = now;  // Record when it became STOPPED
         }
+        ProxSensors[i].direction = STOPPED;
+        ProxSensors[i].forwardCount = 0;
+        ProxSensors[i].backwardCount = 0;
       }
     } else if (change < 0) {
       // Moving forward (sensor value decreasing = getting closer)
@@ -3364,13 +3315,8 @@ void updateSensors() {
       ProxSensors[i].backwardCount = 0;
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
       ProxSensors[i].prevChangeTime = now;
-      // CRITICAL: Require more consecutive forward readings to prevent noise from causing false FORWARD
-      // Increased from 2 to 4 to be more robust against sensor noise
-      if (ProxSensors[i].forwardCount >= 4) {
+      if (ProxSensors[i].forwardCount >= 2) {
         ProxSensors[i].direction = FORWARD;
-      } else if (ProxSensors[i].forwardCount < 4 && ProxSensors[i].direction == FORWARD) {
-        // If we had FORWARD but now have fewer than 4 counts, keep FORWARD (hysteresis)
-        // This prevents rapid switching due to noise
       }
     } else {
       // Moving backward (sensor value increasing = getting farther)
@@ -3383,24 +3329,19 @@ void updateSensors() {
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
       ProxSensors[i].prevChangeTime = now;
       
-      // CRITICAL: Require more consecutive backward readings to prevent noise from causing false BACKWARD
-      // Increased threshold to be more robust against sensor noise
-      int backwardThreshold = 3;  // Increased from 2 to 3 for all cases
+      int backwardThreshold = 2;
       if (fastMovement) {
-        backwardThreshold = 3;  // Even fast movement requires 3 readings
+        backwardThreshold = 2;
       } else if (currentDistance < 0.15f) {
-        backwardThreshold = 3;  // Close to impact - still require 3 readings
+        backwardThreshold = 2;
       } else if (currentDistance < 0.30f) {
-        backwardThreshold = 3;  // Still require 3 readings
+        backwardThreshold = 3;
       } else if (currentDistance < 0.50f) {
-        backwardThreshold = 3;  // Still require 3 readings
+        backwardThreshold = 2;
       }
       
       if (ProxSensors[i].backwardCount >= backwardThreshold) {
         ProxSensors[i].direction = BACKWARD;
-      } else if (ProxSensors[i].backwardCount < backwardThreshold && ProxSensors[i].direction == BACKWARD) {
-        // If we had BACKWARD but now have fewer counts, keep BACKWARD (hysteresis)
-        // This prevents rapid switching due to noise
       }
     }
     

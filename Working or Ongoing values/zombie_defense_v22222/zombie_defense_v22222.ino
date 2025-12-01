@@ -1650,6 +1650,10 @@ void startCalibration() {
   calibrationActive = true;
   calibrationStartTime = millis();
   
+  // CRITICAL: Move mechanism to encoder home (position 0) and keep it there during calibration
+  desiredPosition = 0;
+  systemEnabled = true;  // Ensure PID controller is active to maintain position
+  
   // Reset calibration tracking
   for (int i = 0; i < 4; i++) {
     calibrationMin[i] = 1023;
@@ -1658,6 +1662,7 @@ void startCalibration() {
   }
   
   Serial.println(F("=== CALIBRATION STARTED (15s) ==="));
+  Serial.println(F("Mechanism moving to home (position 0)..."));
   Serial.println(F("Move zombies through all lanes!"));
 }
 
@@ -1709,7 +1714,10 @@ void loop() {
   static int lastOverrideLane = -1;             // Track which lane we overrode to
   static unsigned long overrideCheckTime = 0;   // Rate limit override checks
   
-  if (autoMode && systemEnabled && !gameOver) {
+  // CRITICAL: Skip state machine during calibration - mechanism must stay at position 0
+  if (calibrationActive) {
+    // State machine disabled during calibration - PID controller will maintain position 0
+  } else if (autoMode && systemEnabled && !gameOver) {
     
     //============================================
     // EMERGENCY OVERRIDE CHECK
@@ -1769,8 +1777,8 @@ void loop() {
         
         // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
         // EXCEPTION: Allow STOPPED lanes if they're at 95%+ through lane (about to impact!)
-        float dist = zombieDistances[i];
-        bool isAboutToImpact = (dist < 0.05 && dist > 0.01);  // 95%+ through lane
+        dist = zombieDistances[i];
+        isAboutToImpact = (dist < 0.05 && dist > 0.01);  // 95%+ through lane
         if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0 && !isAboutToImpact) {
           unsigned long stoppedDuration = millis() - laneStoppedTime[i];
           if (stoppedDuration > STOPPED_TIMEOUT) {
@@ -1787,7 +1795,7 @@ void loop() {
         }
         
         // OPTIMIZATION: Use cached critical status instead of recalculating
-        float dist = zombieDistances[i];
+        dist = zombieDistances[i];
         bool isCritical = laneIsCritical[i];
         
         // CRITICAL: NEVER allow L1/L4 to override L2/L3 when L1/L4 are not critical
@@ -1817,8 +1825,8 @@ void loop() {
           
           // CRITICAL: Short lanes can override long lanes with smaller gap
           // Short lanes have less time - they need priority even at similar distances
-          bool isShortLane = laneIsShort[i];
-          bool committedIsLongLane = laneIsLong[committedLane];
+          // Reuse isShortLane and committedIsLongLane already declared above
+          committedIsLongLane = laneIsLong[committedLane];
           
           // MUCH STRICTER: Prevent switching when targets are at similar distances
           // When both are far (80-100%), require at least 20% gap to override
@@ -2072,7 +2080,8 @@ void loop() {
     //============================================
     else if (isCommitted && committedLane >= 0) {
       // Ensure we're targeting the committed lane
-      if (activeTargetIndex != committedLane) {
+      // CRITICAL: Don't change desiredPosition during calibration
+      if (activeTargetIndex != committedLane && !calibrationActive) {
         activeTargetIndex = committedLane;
         desiredPosition = targetPositions[committedLane];
       }
@@ -3061,6 +3070,11 @@ void processSerialCommands() {
       break;
     case '1': case '2': case '3': case '4':
       {
+        // CRITICAL: Prevent manual lane selection during calibration
+        if (calibrationActive) {
+          Serial.println(F("Calibration active - cannot change lane"));
+          break;
+        }
         int lane = cmd - '1';
         Serial.print(F("->L")); Serial.println(lane + 1);
         desiredPosition = targetPositions[lane];
@@ -3432,6 +3446,11 @@ void computeVelocity() {
 }
 
 void runPIDController() {
+  // CRITICAL: During calibration, force mechanism to stay at encoder home (position 0)
+  if (calibrationActive) {
+    desiredPosition = 0;
+  }
+  
   // OPTIMIZATION: Use cached encoder position
   long currentPos = cachedEncoderPos;
   float positionError = desiredPosition - currentPos;
