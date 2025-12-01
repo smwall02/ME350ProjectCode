@@ -973,14 +973,24 @@ void calculateNewSequence() {
   struct LaneInfo {
     int lane;
     float distance;      // Higher = closer to impact = higher priority
+    float sortPriority;  // Combined priority score (distance + lane priority boost)
     bool isTargetable;   // FORWARD and >= 30%
   };
   LaneInfo lanes[4];
   int targetableCount = 0;
 
+  // Priority boost for lanes 2 and 3 (indices 1 and 2) - 10% virtual distance bonus
+  const float LANE_2_3_PRIORITY_BOOST = 0.10;
+
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
     lanes[i].distance = zombieDistances[i];
+    // Apply priority boost for lanes 2 and 3
+    if (i == 1 || i == 2) {
+      lanes[i].sortPriority = lanes[i].distance + LANE_2_3_PRIORITY_BOOST;
+    } else {
+      lanes[i].sortPriority = lanes[i].distance;
+    }
     // TARGETABLE: Must be FORWARD
     // Lanes 1 and 4 (indices 0 and 3): require >= 30% threshold
     // Lanes 2 and 3 (indices 1 and 2): no threshold (always eligible if FORWARD)
@@ -997,10 +1007,11 @@ void calculateNewSequence() {
     if (lanes[i].isTargetable) targetableCount++;
   }
 
-  // Sort by distance (highest first = closest to impact)
+  // Sort by sortPriority (highest first = closest to impact + lane priority)
+  // Lanes 2 and 3 get a slight boost to be selected earlier at same distance
   for (int i = 0; i < 3; i++) {
     for (int j = i + 1; j < 4; j++) {
-      if (lanes[j].distance > lanes[i].distance) {
+      if (lanes[j].sortPriority > lanes[i].sortPriority) {
         LaneInfo temp = lanes[i];
         lanes[i] = lanes[j];
         lanes[j] = temp;
@@ -1121,10 +1132,11 @@ void resetSequence() {
   }
 }
 
-// Check if any lane has 20% or less remaining (>= 80% progress) and is FORWARD-moving
+// Check if any lane has 30% or less remaining (>= 70% progress) and is FORWARD-moving
 // Returns true if recalculation is needed (a critical lane is not the current sequence target)
+// This aggressive threshold helps ensure no targets reach the end of their lane
 bool shouldRecalculateForLowLane() {
-  const float LOW_LANE_THRESHOLD = 0.80;  // 80% progress = 20% remaining
+  const float LOW_LANE_THRESHOLD = 0.70;  // 70% progress = 30% remaining (aggressive)
 
   // Find the current sequence target (if any)
   int currentTarget = -1;
