@@ -945,127 +945,108 @@ int getBestTarget() {
 //============================================
 
 // Calculate and create a new target sequence
+// - Only FORWARD-moving targets
+// - Sorted by distance (highest first = closest to impact)
+// - At round start (all 0-5%), include each lane once
+// - Otherwise, repeats allowed
 void calculateNewSequence() {
-  unsigned long now = millis();
-  
   // Clear existing sequence
   for (int i = 0; i < SEQUENCE_SIZE; i++) {
     targetSequence[i] = -1;
   }
   sequenceIndex = 0;
-  
-  // Structure to hold lane info for sorting
+
+  // Check if this is round start (all lanes at 0-5%)
+  bool isRoundStart = true;
+  for (int i = 0; i < 4; i++) {
+    if (zombieDistances[i] > 0.05) {
+      isRoundStart = false;
+      break;
+    }
+  }
+
+  // Gather lane info: only FORWARD-moving targets
   struct LaneInfo {
     int lane;
-    float distanceFromEnd;  // 1.0 - zombieDistances[i] (primary sort)
-    float velocity;         // zombieVelocities[i] (secondary sort)
-    int direction;          // FORWARD=1, STOPPED=0, BACKWARD=-1 (secondary sort)
-    bool isActive;
+    float distance;  // Higher = closer to impact = higher priority
+    bool isForward;
   };
   LaneInfo lanes[4];
-  
-  // Gather info on all lanes
-  int activeLanes = 0;
+  int forwardCount = 0;
+
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
-    // NEW SEMANTICS: zombieDistances[i] = % through lane (0% at start, 100% at impact)
-    lanes[i].distanceFromEnd = zombieDistances[i];  // Distance through lane (higher = closer to impact)
-    lanes[i].velocity = abs(zombieVelocities[i]);
-    lanes[i].direction = ProxSensors[i].direction;
+    lanes[i].distance = zombieDistances[i];
+    lanes[i].isForward = (ProxSensors[i].direction == FORWARD);
+    if (lanes[i].isForward) forwardCount++;
+  }
 
-    // Only include forward-moving targets in valid range
-    bool isForwardMoving = (ProxSensors[i].direction == FORWARD);
-    float laneThreshold = getEarlyEngageThreshold(i);
-    bool isInRange = (zombieDistances[i] > laneThreshold &&
-                      zombieDistances[i] < MIN_ENGAGE_THRESHOLD);
-    
-    // Check if lane was recently attempted - exclude if within cooldown
-    bool recentlyAttempted = false;
-    if (laneAttempted[i]) {
-      unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
-      if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
-        recentlyAttempted = true;
-      } else {
-        laneAttempted[i] = false;  // Cooldown expired
-      }
-    }
-    
-    // Skip STOPPED lanes that have been stopped for > 2 seconds
-    bool stoppedTooLong = false;
-    if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0) {
-      unsigned long stoppedDuration = millis() - laneStoppedTime[i];
-      if (stoppedDuration > STOPPED_TIMEOUT) {
-        stoppedTooLong = true;
-      }
-    }
-    
-    lanes[i].isActive = (isForwardMoving && isInRange && !recentlyAttempted && !stoppedTooLong);
-    
-    if (lanes[i].isActive) {
-      activeLanes++;
-    }
-  }
-  
-  // If no active lanes, no sequence needed
-  if (activeLanes == 0) {
-    sequenceActive = false;
-    return;
-  }
-  
-  // Sort lanes by:
-  // PRIMARY: Distance from end of lane (higher = closer to end = higher priority)
-  // SECONDARY: Velocity (higher = faster = higher priority)
-  // TERTIARY: Direction (FORWARD > STOPPED > BACKWARD)
+  // Sort ALL lanes by distance (highest first) regardless of direction
+  // We'll filter by FORWARD when building sequence
   for (int i = 0; i < 3; i++) {
     for (int j = i + 1; j < 4; j++) {
-      bool shouldSwap = false;
-      
-      // PRIMARY: Sort by distance from end (higher = closer to end = higher priority)
-      if (lanes[j].distanceFromEnd > lanes[i].distanceFromEnd) {
-        shouldSwap = true;
-      } else if (lanes[j].distanceFromEnd == lanes[i].distanceFromEnd) {
-        // Same distance from end - use secondary criteria
-        
-        // SECONDARY: Sort by velocity (higher = faster = higher priority)
-        if (lanes[j].velocity > lanes[i].velocity) {
-          shouldSwap = true;
-        } else if (lanes[j].velocity == lanes[i].velocity) {
-          // Same velocity - use direction as tiebreaker
-          // FORWARD (1) > STOPPED (0) > BACKWARD (-1)
-          if (lanes[j].direction > lanes[i].direction) {
-            shouldSwap = true;
-          }
-        }
-      }
-      
-      if (shouldSwap) {
+      if (lanes[j].distance > lanes[i].distance) {
         LaneInfo temp = lanes[i];
         lanes[i] = lanes[j];
         lanes[j] = temp;
       }
     }
   }
-  
-  // Build sequence: Add exactly 3 active lanes in priority order
+
   int sequenceCount = 0;
-  for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
-    if (lanes[i].isActive) {
-      int lane = lanes[i].lane;
-      
-      // Final safety check: Never add backward-moving lanes
-      if (ProxSensors[lane].direction == FORWARD) {
-        targetSequence[sequenceCount++] = lane;
+
+  if (isRoundStart) {
+    // ROUND START: Include all 4 lanes (each once), sorted by distance
+    // Even if not all are forward-moving yet, we prepare for them
+    for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
+      // At round start, include all lanes that are FORWARD or will start moving soon
+      if (lanes[i].isForward || lanes[i].distance <= 0.05) {
+        targetSequence[sequenceCount++] = lanes[i].lane;
+      }
+    }
+    // Fill remaining with forward-moving lanes (allows some repeats if needed)
+    for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
+      if (lanes[i].isForward) {
+        // Check if already in sequence
+        bool alreadyIn = false;
+        for (int j = 0; j < sequenceCount; j++) {
+          if (targetSequence[j] == lanes[i].lane) {
+            alreadyIn = true;
+            break;
+          }
+        }
+        if (!alreadyIn) {
+          targetSequence[sequenceCount++] = lanes[i].lane;
+        }
+      }
+    }
+  } else {
+    // NORMAL: Build sequence from FORWARD-moving targets only, sorted by distance
+    // Repeats allowed - just pick the top 4 (or fewer) by distance
+    for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
+      if (lanes[i].isForward) {
+        targetSequence[sequenceCount++] = lanes[i].lane;
+      }
+    }
+    // If we have fewer than 4, allow repeats from highest-distance forward lanes
+    if (sequenceCount > 0 && sequenceCount < SEQUENCE_SIZE) {
+      int idx = 0;
+      while (sequenceCount < SEQUENCE_SIZE) {
+        // Find next forward lane to repeat
+        for (int i = 0; i < 4; i++) {
+          if (lanes[i].isForward && sequenceCount < SEQUENCE_SIZE) {
+            targetSequence[sequenceCount++] = lanes[i].lane;
+            break;
+          }
+        }
+        idx++;
+        if (idx > 4) break;  // Safety
       }
     }
   }
-  
-  // If we have fewer than 3 active lanes, fill remaining slots with -1
-  for (int i = sequenceCount; i < SEQUENCE_SIZE; i++) {
-    targetSequence[i] = -1;
-  }
-  
+
   sequenceActive = (sequenceCount > 0);
-  sequenceLocked = false;  // Sequence not locked yet - will lock when first target is committed
+  sequenceLocked = false;
 }
 
 // Get the next target from the current sequence
@@ -2038,9 +2019,10 @@ void chooseAndCommitTargetFromSequence() {
         }
         
         // Standard validation
+        // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
         bool isValidStandard = (ProxSensors[nextLane].direction == FORWARD &&
-                                zombieDistances[nextLane] < laneThreshold &&
-                                zombieDistances[nextLane] > MIN_ENGAGE_THRESHOLD &&
+                                zombieDistances[nextLane] > laneThreshold &&
+                                zombieDistances[nextLane] < MIN_ENGAGE_THRESHOLD &&
                                 !recentlyAttempted);
         
         if (isValidStandard) {
