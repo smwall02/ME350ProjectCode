@@ -308,7 +308,7 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 0.0;
 float arrivalZombieDistance = 0.0;
 
-const unsigned long MIN_DWELL_TIME = 400;  // Increased to 400ms - no early exits
+const unsigned long MIN_DWELL_TIME = 450;  // Increased to 450ms - no early exits
 const unsigned long NORMAL_DWELL_TIME = 450;
 const unsigned long MAX_DWELL_TIME = 850;
 const unsigned long L4_DWELL_TIME = 1050;
@@ -946,9 +946,10 @@ int getBestTarget() {
 
 // Calculate and create a new target sequence
 // RULES:
-// - Only FORWARD-moving targets that are >= 50% down the lane
+// - Only FORWARD-moving targets that are >= 30% down the lane
 // - Sorted by distance (highest first = closest to impact)
-// - Repeats allowed to fill sequence
+// - Round start (all 0-5%): 4-lane sequence, each lane once
+// - Otherwise: 2-lane sequence with repeats allowed
 void calculateNewSequence() {
   // Clear existing sequence
   for (int i = 0; i < SEQUENCE_SIZE; i++) {
@@ -956,11 +957,23 @@ void calculateNewSequence() {
   }
   sequenceIndex = 0;
 
+  // Check if this is round start (all lanes at 0-5%)
+  bool isRoundStart = true;
+  for (int i = 0; i < 4; i++) {
+    if (zombieDistances[i] > 0.05) {
+      isRoundStart = false;
+      break;
+    }
+  }
+
+  // Determine sequence length: 4 at round start, 2 otherwise
+  int maxSequenceLen = isRoundStart ? 4 : 2;
+
   // Gather lane info
   struct LaneInfo {
     int lane;
     float distance;      // Higher = closer to impact = higher priority
-    bool isTargetable;   // FORWARD and >= 50%
+    bool isTargetable;   // FORWARD and >= 30%
   };
   LaneInfo lanes[4];
   int targetableCount = 0;
@@ -968,10 +981,10 @@ void calculateNewSequence() {
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
     lanes[i].distance = zombieDistances[i];
-    // TARGETABLE: Must be FORWARD and at least 50% down the lane
+    // TARGETABLE: Must be FORWARD and at least 30% down the lane
     bool isForward = (ProxSensors[i].direction == FORWARD);
-    bool isPastHalfway = (zombieDistances[i] >= 0.50);
-    lanes[i].isTargetable = (isForward && isPastHalfway);
+    bool isPastThreshold = (zombieDistances[i] >= 0.30);
+    lanes[i].isTargetable = (isForward && isPastThreshold);
     if (lanes[i].isTargetable) targetableCount++;
   }
 
@@ -986,25 +999,25 @@ void calculateNewSequence() {
     }
   }
 
-  // Build sequence from targetable lanes only (FORWARD and >= 50%)
   int sequenceCount = 0;
-  for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
-    if (lanes[i].isTargetable) {
+
+  if (isRoundStart) {
+    // ROUND START: Include all 4 lanes, sorted by distance
+    // Even if not all are forward yet, include them for coverage
+    for (int i = 0; i < 4 && sequenceCount < 4; i++) {
       targetSequence[sequenceCount++] = lanes[i].lane;
     }
-  }
-
-  // If we have targets but fewer than 4, allow repeats from highest-distance
-  if (sequenceCount > 0 && sequenceCount < SEQUENCE_SIZE) {
-    int idx = 0;
-    while (sequenceCount < SEQUENCE_SIZE && idx < 4) {
-      for (int i = 0; i < 4; i++) {
-        if (lanes[i].isTargetable && sequenceCount < SEQUENCE_SIZE) {
-          targetSequence[sequenceCount++] = lanes[i].lane;
-          break;
-        }
+  } else {
+    // NORMAL: Build 2-lane sequence from targetable lanes only
+    for (int i = 0; i < 4 && sequenceCount < maxSequenceLen; i++) {
+      if (lanes[i].isTargetable) {
+        targetSequence[sequenceCount++] = lanes[i].lane;
       }
-      idx++;
+    }
+
+    // If we have 1 target but need 2, allow repeat
+    if (sequenceCount == 1 && maxSequenceLen == 2) {
+      targetSequence[sequenceCount++] = targetSequence[0];
     }
   }
 
@@ -1030,11 +1043,11 @@ int getNextSequenceTarget() {
       continue;
     }
     
-    // Validate: must be FORWARD and >= 50% down the lane
+    // Validate: must be FORWARD and >= 30% down the lane
     bool isForward = (ProxSensors[lane].direction == FORWARD);
     bool isBackward = (ProxSensors[lane].direction == BACKWARD);
-    // Require >= 50% down the lane (and not past impact zone)
-    bool isInRange = (zombieDistances[lane] >= 0.50 &&
+    // Require >= 30% down the lane (and not past impact zone)
+    bool isInRange = (zombieDistances[lane] >= 0.30 &&
                       zombieDistances[lane] < MIN_ENGAGE_THRESHOLD);
     
     // If target is backward-moving, skip it
@@ -1978,9 +1991,9 @@ void chooseAndCommitTargetFromSequence() {
           continue;
         }
         
-        // Standard validation: FORWARD and >= 50% down the lane
+        // Standard validation: FORWARD and >= 30% down the lane
         bool isValidStandard = (ProxSensors[nextLane].direction == FORWARD &&
-                                zombieDistances[nextLane] >= 0.50 &&
+                                zombieDistances[nextLane] >= 0.30 &&
                                 zombieDistances[nextLane] < MIN_ENGAGE_THRESHOLD &&
                                 !recentlyAttempted);
         
@@ -3234,17 +3247,10 @@ void updateSensors() {
       ProxSensors[i].prevVal = ProxSensors[i].currVal;
       ProxSensors[i].prevChangeTime = now;
       
-      int backwardThreshold = 2;
-      if (fastMovement) {
-        backwardThreshold = 2;
-      } else if (currentDistance < 0.15f) {
-        backwardThreshold = 2;
-      } else if (currentDistance < 0.30f) {
-        backwardThreshold = 3;
-      } else if (currentDistance < 0.50f) {
-        backwardThreshold = 2;
-      }
-      
+      // STABILITY FILTER: Require 4+ consecutive BACKWARD readings
+      // This prevents F-B-F flicker from falsely marking as BACKWARD
+      int backwardThreshold = 4;
+
       if (ProxSensors[i].backwardCount >= backwardThreshold) {
         ProxSensors[i].direction = BACKWARD;
       }
