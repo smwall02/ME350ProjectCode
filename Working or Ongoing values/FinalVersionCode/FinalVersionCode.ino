@@ -945,10 +945,10 @@ int getBestTarget() {
 //============================================
 
 // Calculate and create a new target sequence
-// - Only FORWARD-moving targets
+// RULES:
+// - Only FORWARD-moving targets that are >= 50% down the lane
 // - Sorted by distance (highest first = closest to impact)
-// - At round start (all 0-5%), include each lane once
-// - Otherwise, repeats allowed
+// - Repeats allowed to fill sequence
 void calculateNewSequence() {
   // Clear existing sequence
   for (int i = 0; i < SEQUENCE_SIZE; i++) {
@@ -956,33 +956,26 @@ void calculateNewSequence() {
   }
   sequenceIndex = 0;
 
-  // Check if this is round start (all lanes at 0-5%)
-  bool isRoundStart = true;
-  for (int i = 0; i < 4; i++) {
-    if (zombieDistances[i] > 0.05) {
-      isRoundStart = false;
-      break;
-    }
-  }
-
-  // Gather lane info: only FORWARD-moving targets
+  // Gather lane info
   struct LaneInfo {
     int lane;
-    float distance;  // Higher = closer to impact = higher priority
-    bool isForward;
+    float distance;      // Higher = closer to impact = higher priority
+    bool isTargetable;   // FORWARD and >= 50%
   };
   LaneInfo lanes[4];
-  int forwardCount = 0;
+  int targetableCount = 0;
 
   for (int i = 0; i < 4; i++) {
     lanes[i].lane = i;
     lanes[i].distance = zombieDistances[i];
-    lanes[i].isForward = (ProxSensors[i].direction == FORWARD);
-    if (lanes[i].isForward) forwardCount++;
+    // TARGETABLE: Must be FORWARD and at least 50% down the lane
+    bool isForward = (ProxSensors[i].direction == FORWARD);
+    bool isPastHalfway = (zombieDistances[i] >= 0.50);
+    lanes[i].isTargetable = (isForward && isPastHalfway);
+    if (lanes[i].isTargetable) targetableCount++;
   }
 
-  // Sort ALL lanes by distance (highest first) regardless of direction
-  // We'll filter by FORWARD when building sequence
+  // Sort by distance (highest first = closest to impact)
   for (int i = 0; i < 3; i++) {
     for (int j = i + 1; j < 4; j++) {
       if (lanes[j].distance > lanes[i].distance) {
@@ -993,55 +986,25 @@ void calculateNewSequence() {
     }
   }
 
+  // Build sequence from targetable lanes only (FORWARD and >= 50%)
   int sequenceCount = 0;
+  for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
+    if (lanes[i].isTargetable) {
+      targetSequence[sequenceCount++] = lanes[i].lane;
+    }
+  }
 
-  if (isRoundStart) {
-    // ROUND START: Include all 4 lanes (each once), sorted by distance
-    // Even if not all are forward-moving yet, we prepare for them
-    for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
-      // At round start, include all lanes that are FORWARD or will start moving soon
-      if (lanes[i].isForward || lanes[i].distance <= 0.05) {
-        targetSequence[sequenceCount++] = lanes[i].lane;
-      }
-    }
-    // Fill remaining with forward-moving lanes (allows some repeats if needed)
-    for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
-      if (lanes[i].isForward) {
-        // Check if already in sequence
-        bool alreadyIn = false;
-        for (int j = 0; j < sequenceCount; j++) {
-          if (targetSequence[j] == lanes[i].lane) {
-            alreadyIn = true;
-            break;
-          }
-        }
-        if (!alreadyIn) {
+  // If we have targets but fewer than 4, allow repeats from highest-distance
+  if (sequenceCount > 0 && sequenceCount < SEQUENCE_SIZE) {
+    int idx = 0;
+    while (sequenceCount < SEQUENCE_SIZE && idx < 4) {
+      for (int i = 0; i < 4; i++) {
+        if (lanes[i].isTargetable && sequenceCount < SEQUENCE_SIZE) {
           targetSequence[sequenceCount++] = lanes[i].lane;
+          break;
         }
       }
-    }
-  } else {
-    // NORMAL: Build sequence from FORWARD-moving targets only, sorted by distance
-    // Repeats allowed - just pick the top 4 (or fewer) by distance
-    for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
-      if (lanes[i].isForward) {
-        targetSequence[sequenceCount++] = lanes[i].lane;
-      }
-    }
-    // If we have fewer than 4, allow repeats from highest-distance forward lanes
-    if (sequenceCount > 0 && sequenceCount < SEQUENCE_SIZE) {
-      int idx = 0;
-      while (sequenceCount < SEQUENCE_SIZE) {
-        // Find next forward lane to repeat
-        for (int i = 0; i < 4; i++) {
-          if (lanes[i].isForward && sequenceCount < SEQUENCE_SIZE) {
-            targetSequence[sequenceCount++] = lanes[i].lane;
-            break;
-          }
-        }
-        idx++;
-        if (idx > 4) break;  // Safety
-      }
+      idx++;
     }
   }
 
@@ -1067,12 +1030,11 @@ int getNextSequenceTarget() {
       continue;
     }
     
-    // Validate forward direction, range, and lane validity
+    // Validate: must be FORWARD and >= 50% down the lane
     bool isForward = (ProxSensors[lane].direction == FORWARD);
     bool isBackward = (ProxSensors[lane].direction == BACKWARD);
-    float laneThreshold = getEarlyEngageThreshold(lane);
-    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
-    bool isInRange = (zombieDistances[lane] > laneThreshold &&
+    // Require >= 50% down the lane (and not past impact zone)
+    bool isInRange = (zombieDistances[lane] >= 0.50 &&
                       zombieDistances[lane] < MIN_ENGAGE_THRESHOLD);
     
     // If target is backward-moving, skip it
@@ -1998,10 +1960,8 @@ void chooseAndCommitTargetFromSequence() {
           continue;
         }
         
-        // Verify this lane is still valid (forward-moving, in range)
-        // Use lane-specific threshold
-        // IMPROVED: Also check if lane has already been attempted
-        float laneThreshold = getEarlyEngageThreshold(nextLane);
+        // Verify: must be FORWARD and >= 50% down the lane
+        // Also check if lane has already been attempted
         bool recentlyAttempted = false;
         if (laneAttempted[nextLane]) {
           unsigned long timeSinceAttempt = millis() - laneAttemptTime[nextLane];
@@ -2018,10 +1978,9 @@ void chooseAndCommitTargetFromSequence() {
           continue;
         }
         
-        // Standard validation
-        // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
+        // Standard validation: FORWARD and >= 50% down the lane
         bool isValidStandard = (ProxSensors[nextLane].direction == FORWARD &&
-                                zombieDistances[nextLane] > laneThreshold &&
+                                zombieDistances[nextLane] >= 0.50 &&
                                 zombieDistances[nextLane] < MIN_ENGAGE_THRESHOLD &&
                                 !recentlyAttempted);
         
