@@ -307,7 +307,7 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 0.0;
 float arrivalZombieDistance = 0.0;
 
-const unsigned long MIN_DWELL_TIME = 350;
+const unsigned long MIN_DWELL_TIME = 400;  // Increased to 400ms - no early exits
 const unsigned long NORMAL_DWELL_TIME = 450;
 const unsigned long MAX_DWELL_TIME = 850;
 const unsigned long L4_DWELL_TIME = 1050;
@@ -668,13 +668,19 @@ void releaseCommitment() {
 
 //============================================
 // SHOULD OVERRIDE CURRENT COMMITMENT?
-// VERY restrictive - only override for TRUE emergencies
-// Batch system handles normal cycling, overrides are RARE
+// DISABLED: User requested NO overrides
+// The batch system handles all target cycling
 //============================================
 bool shouldOverride(int newLane) {
+  // OVERRIDES DISABLED - always return false
+  // User explicitly requested no overrides
+  return false;
+
+  // --- DISABLED CODE BELOW ---
+  /*
   if (!isCommitted) return true;
   if (newLane == committedLane) return false;
-  
+
   // CRITICAL: NEVER override to backward-moving zombies - they're retreating!
   if (ProxSensors[newLane].direction == BACKWARD) return false;
   if (ProxSensors[newLane].direction != FORWARD) return false;
@@ -863,6 +869,7 @@ bool shouldOverride(int newLane) {
     return true;
   }
   return false;
+  */
 }
 
 void addToPendingQueue(int lane) {
@@ -1376,26 +1383,25 @@ void applyCalibration() {
     }
   }
   
-  // CRITICAL NORMALIZATION FIX: Ensure start position reads as 0%
-  // After calibration, sample current sensor values and use them as the "start" baseline
-  // This ensures that current position = 0%, not some offset percentage
-  Serial.println(F("--- Normalizing start positions to 0% ---"));
+  // CRITICAL NORMALIZATION FIX: Reset start values so current position = 0%
+  // ALWAYS set ProxRange[0] to current reading at end of calibration
+  // This ensures whatever position targets are in NOW = 0%
+  Serial.println(F("--- Resetting start positions to current readings (= 0%) ---"));
   for (int i = 0; i < 4; i++) {
     int currentReading = analogRead(ProxSensors[i].pin);
-    if (currentReading > ProxRange[i][0]) {
-      // Current reading is higher than calibrated max - update to current value
-      // This ensures start position = 0%
-      Serial.print(F("  L"));
-      Serial.print(i + 1);
-      Serial.print(F(": Adjusting start from "));
-      Serial.print(ProxRange[i][0]);
-      Serial.print(F(" to "));
-      Serial.print(currentReading);
-      Serial.println(F(" (current reading is higher)"));
-      ProxRange[i][0] = currentReading;
-      // Save updated value to EEPROM
-      EEPROM.put(EEPROM_PROX_RANGE_BASE + i * 4, (int)currentReading);
-    }
+    int oldStart = ProxRange[i][0];
+    // ALWAYS update start value to current reading
+    // This makes current position = 0% exactly
+    ProxRange[i][0] = currentReading;
+    // Save updated value to EEPROM
+    EEPROM.put(EEPROM_PROX_RANGE_BASE + i * 4, (int)currentReading);
+    Serial.print(F("  L"));
+    Serial.print(i + 1);
+    Serial.print(F(": Start reset from "));
+    Serial.print(oldStart);
+    Serial.print(F(" to "));
+    Serial.print(currentReading);
+    Serial.println(F(" (current = 0%)"));
   }
 
   // Force a print of current ranges to verify they were updated
