@@ -1540,49 +1540,63 @@ void loop() {
     // ABSOLUTE EMERGENCY OVERRIDE - BYPASSES ALL COOLDOWNS
     // If ANY lane is at 85%+ FORWARD, IMMEDIATELY target it
     // This prevents lanes from reaching 100% (game over)
+    // BUT: Do NOT interrupt dwell time - let the hit register first
     //============================================
     const float ABSOLUTE_EMERGENCY_THRESHOLD = 0.85;  // 85% = 15% remaining
     int absoluteEmergencyLane = -1;
     float highestEmergencyDist = 0;
 
-    for (int i = 0; i < 4; i++) {
-      // Skip current target - we're already on it
-      if (i == committedLane) continue;
+    // Check if we're currently dwelling - don't interrupt dwell!
+    bool isDwelling = (state == DWELL_AT_TARGET);
+    bool canEmergencyOverride = !isDwelling;  // Only override if NOT dwelling
 
-      // Only check FORWARD-moving targets
-      if (ProxSensors[i].direction != FORWARD) continue;
-
-      float dist = zombieDistances[i];
-
-      // Check if this lane is in absolute emergency (85%+ and higher than any we've seen)
-      if (dist >= ABSOLUTE_EMERGENCY_THRESHOLD && dist < 0.99 && dist > highestEmergencyDist) {
-        absoluteEmergencyLane = i;
-        highestEmergencyDist = dist;
+    // If dwelling, only allow emergency override if current target moved BACKWARD
+    if (isDwelling && committedLane >= 0) {
+      if (ProxSensors[committedLane].direction == BACKWARD) {
+        canEmergencyOverride = true;  // Target retreated - OK to override
       }
     }
 
-    // If we found an absolute emergency lane, IMMEDIATELY commit to it
-    if (absoluteEmergencyLane >= 0) {
-      // Only switch if emergency lane is more critical than current target
-      float currentDist = (committedLane >= 0) ? zombieDistances[committedLane] : 0;
-      bool currentIsForward = (committedLane >= 0) ? (ProxSensors[committedLane].direction == FORWARD) : false;
+    if (canEmergencyOverride) {
+      for (int i = 0; i < 4; i++) {
+        // Skip current target - we're already on it
+        if (i == committedLane) continue;
 
-      // Switch if: no current target, current is backward, or emergency is further along
-      if (committedLane < 0 || !currentIsForward || highestEmergencyDist > currentDist + 0.05) {
-        Serial.print(F("!!!EMERGENCY L"));
-        Serial.print(absoluteEmergencyLane + 1);
-        Serial.print(F(" @"));
-        Serial.print((int)(highestEmergencyDist * 100));
-        Serial.println(F("%"));
+        // Only check FORWARD-moving targets
+        if (ProxSensors[i].direction != FORWARD) continue;
 
-        // Force immediate commit - bypass all normal checks
-        releaseCommitment();
-        resetSequence();
-        commitToTarget(absoluteEmergencyLane);
-        desiredPosition = targetPositions[absoluteEmergencyLane];
-        state = MOVE_TO_TARGET;
-        lastOverrideCommit = millis();
-        lastOverrideLane = absoluteEmergencyLane;
+        float dist = zombieDistances[i];
+
+        // Check if this lane is in absolute emergency (85%+ and higher than any we've seen)
+        if (dist >= ABSOLUTE_EMERGENCY_THRESHOLD && dist < 0.99 && dist > highestEmergencyDist) {
+          absoluteEmergencyLane = i;
+          highestEmergencyDist = dist;
+        }
+      }
+
+      // If we found an absolute emergency lane, IMMEDIATELY commit to it
+      if (absoluteEmergencyLane >= 0) {
+        // Only switch if emergency lane is more critical than current target
+        float currentDist = (committedLane >= 0) ? zombieDistances[committedLane] : 0;
+        bool currentIsForward = (committedLane >= 0) ? (ProxSensors[committedLane].direction == FORWARD) : false;
+
+        // Switch if: no current target, current is backward, or emergency is further along
+        if (committedLane < 0 || !currentIsForward || highestEmergencyDist > currentDist + 0.05) {
+          Serial.print(F("!!!EMERGENCY L"));
+          Serial.print(absoluteEmergencyLane + 1);
+          Serial.print(F(" @"));
+          Serial.print((int)(highestEmergencyDist * 100));
+          Serial.println(F("%"));
+
+          // Force immediate commit - bypass all normal checks
+          releaseCommitment();
+          resetSequence();
+          commitToTarget(absoluteEmergencyLane);
+          desiredPosition = targetPositions[absoluteEmergencyLane];
+          state = MOVE_TO_TARGET;
+          lastOverrideCommit = millis();
+          lastOverrideLane = absoluteEmergencyLane;
+        }
       }
     }
 
@@ -2536,35 +2550,35 @@ void dwellAtTarget() {
     peakZombieDistance = currentDist;
   }
   
-  // CRITICAL: Wait until target begins to move back (direction changes to BACKWARD)
-  // Must wait MIN_DWELL_TIME before exiting to ensure proper hit detection
-  if (currentDir == BACKWARD && dwellTime >= MIN_DWELL_TIME) {
+  // IMMEDIATE EXIT when target moves BACKWARD - cut dwell short!
+  // No need to wait for MIN_DWELL_TIME - target retreating means hit registered
+  if (currentDir == BACKWARD) {
     // Target has started moving backward - immediately record hit and move to next
     int previousLane = activeTargetIndex;  // Save for recordHit
-    
+
     // CRITICAL: Clean up all dwell state variables before transitioning
     backwardStartTime = 0;
     stoppedStartTime = 0;
     peakZombieDistance = 0.0;  // Reset for next target (NEW SEMANTICS: 0 = at start)
     arrivalZombieDistance = 0.0;  // Reset for next target
     arrivalTime = 0;  // Reset for next target
-    
+
     // Record hit with previous lane (before releaseCommitment clears it)
     if (previousLane >= 0 && previousLane <= 3) {
       zombiesKilled++;
       recordHit(previousLane);  // Analysis mode tracking
-      DBG_PRINT(F("HIT L"));
-      DBG_PRINT(previousLane + 1);
-      DBG_PRINT(F(" ["));
-      DBG_PRINT(zombiesKilled);
-      DBG_PRINTLN(F("]"));
+      Serial.print(F("HIT L"));
+      Serial.print(previousLane + 1);
+      Serial.print(F(" ["));
+      Serial.print(zombiesKilled);
+      Serial.println(F("]"));
     }
-    
+
     releaseCommitment();
-    
+
     // Advance sequence (will unlock if sequence complete)
     advanceSequence();
-    
+
     // Get next target from sequence - IMMEDIATE transition, no delay
     int next = getNextSequenceTarget();
     if (next >= 0 && next <= 3 && ProxSensors[next].direction == FORWARD && !laneAttempted[next]) {
