@@ -2320,7 +2320,7 @@ void dwellAtTarget() {
     DBG_PRINT(overrideLane + 1);
     DBG_PRINT(F(" @"));
     if (overrideLane >= 0 && overrideLane <= 3) {
-      DBG_PRINT((int)((1.0 - zombieDistances[overrideLane]) * 100));
+      DBG_PRINT((int)(zombieDistances[overrideLane] * 100));  // remaining % (consistent with LOCK)
     }
     DBG_PRINTLN(F("% !!!"));
     
