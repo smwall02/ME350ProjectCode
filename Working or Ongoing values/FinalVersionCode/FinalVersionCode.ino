@@ -214,6 +214,10 @@ int ProxRange[4][2] = {
   {650, 135}   // Lane 4: [start/0%, impact/100%] - ~515 range
 };
 
+// Precomputed proximity scaling for faster sensor updates
+float proxRangeInv[4] = {0, 0, 0, 0};
+float laneDistanceScale[4] = {1.0f, 1.12f, 1.12f, 1.0f};
+
 //============================================
 // PROXIMITY SENSORS
 //============================================
@@ -375,6 +379,7 @@ void applyCalibration();
 void stopMotor();
 void setMotorVoltage(float voltage);
 void recordHit(int lane);
+void updateProxScaling();
 
 //============================================
 // SETUP
@@ -395,6 +400,7 @@ void setup() {
   Serial.println(F("EARLY ENGAGE + AUTO-CAL"));
   
   loadFromEEPROM();
+  updateProxScaling();
   
   ProxSensors[0].pin = PROX_SENSOR_1;
   ProxSensors[1].pin = PROX_SENSOR_2;
@@ -466,6 +472,8 @@ void loadFromEEPROM() {
       Serial.println(F("), using default"));
     }
   }
+
+  updateProxScaling();
 }
 
 //============================================
@@ -1429,7 +1437,9 @@ void applyCalibration() {
       Serial.println(F("), keeping default"));
     }
   }
-  
+
+  updateProxScaling();
+
   // No additional normalization needed - we used calibrationStart (captured at begin) as 0%
   // This ensures targets at their initial position = exactly 0%
 
@@ -1446,6 +1456,23 @@ void applyCalibration() {
     Serial.println();
   }
   Serial.println(F("Calibration ranges are now active and will be used for all distance calculations."));
+}
+
+//============================================
+// PRECOMPUTE PROXIMITY SCALING
+// Calculates spans and inverses to avoid repeated division in updateSensors()
+//============================================
+void updateProxScaling() {
+  for (int i = 0; i < 4; i++) {
+    float span = (float)(ProxRange[i][0] - ProxRange[i][1]);
+
+    // Prevent divide-by-zero and ensure reasonable defaults
+    if (span < 1.0f) {
+      span = 1.0f;
+    }
+
+    proxRangeInv[i] = 1.0f / span;
+  }
 }
 
 //============================================
@@ -3395,24 +3422,14 @@ void updateSensors() {
     ProxSensors[i].currVal = alpha * ProxSensors[i].currVal + (1.0 - alpha) * rawVal;
     ProxSensors[i].smoothVal = velocityAlpha * ProxSensors[i].smoothVal + (1.0 - velocityAlpha) * rawVal;
 
-    const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
     float currentDistance = 0.0f;
-    if (range != 0.0f) {
-      // Distance calculation: Uses RAW sensor value for accurate calibration
-      // ProxRange[0] = high reading = target at START (close to sensor)
-      // ProxRange[1] = low reading = target at IMPACT (far from sensor)
-      // Formula: 0% at start (rawVal=high), 100% at impact (rawVal=low)
-      // normalized = (ProxRange[0] - rawVal) / range
-      float normalized = (float)(ProxRange[i][0] - rawVal) / range;
-      currentDistance = constrain(normalized, 0.0f, 1.0f);
-
-      // CRITICAL: Make L2/L3 appear 12% further through lane to prioritize them earlier
-      // This makes them appear closer to impact than they really are
-      if (i == 1 || i == 2) {  // L2 or L3 (short lanes)
-        currentDistance = currentDistance * 1.12f;  // Make appear 12% further through lane
-        currentDistance = constrain(currentDistance, 0.0f, 1.0f);
-      }
-    }
+    // Distance calculation: Uses RAW sensor value for accurate calibration
+    // ProxRange[0] = high reading = target at START (close to sensor)
+    // ProxRange[1] = low reading = target at IMPACT (far from sensor)
+    // Formula: 0% at start (rawVal=high), 100% at impact (rawVal=low)
+    // normalized = (ProxRange[0] - rawVal) * proxRangeInv
+    float normalized = (float)(ProxRange[i][0] - rawVal) * proxRangeInv[i];
+    currentDistance = constrain(normalized * laneDistanceScale[i], 0.0f, 1.0f);
     zombieDistances[i] = currentDistance;
 
     // Derive sensor-specific noise limit rather than sharing across lanes
