@@ -1614,7 +1614,7 @@ void loop() {
     
     // CRITICAL FIX: Allow override checks while dwelling - but still respect cooldown
     // While dwelling, we need to continuously check for critical threats (especially short lanes)
-    bool isDwelling = (state == DWELL_AT_TARGET);
+    // Note: isDwelling already declared above in emergency override section
     bool canCheckOverride = false;
     
     // Always respect cooldown period after override
