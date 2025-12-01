@@ -231,6 +231,10 @@ void processCommand(char cmd) {
       Serial.println(F("Saved"));
       break;
 
+    case 'I':
+      setPIDValues();
+      break;
+
     case '?':
     case '/':
       printHelp();
@@ -1880,7 +1884,8 @@ void printStatus() {
 }
 
 void printHelp() {
-  Serial.println(F("\nR F Z S T M X H P C 1-4 L W ?"));
+  Serial.println(F("\nR F Z S T M X H P C 1-4 L W I ?"));
+  Serial.println(F("I = Input PID values manually"));
 }
 
 void printWelcome() {
@@ -1890,6 +1895,102 @@ void printWelcome() {
   } else {
     Serial.println(F("Run R"));
   }
+}
+
+// MANUAL PID INPUT
+
+void setPIDValues() {
+  Serial.println(F("\n=== SET PID VALUES ==="));
+  Serial.print(F("Current values: Kp="));
+  Serial.print(KP, 6);
+  Serial.print(F(" Ki="));
+  Serial.print(KI, 6);
+  Serial.print(F(" Kd="));
+  Serial.println(KD, 6);
+  Serial.println(F("\nEnter PID values as: Kp,Ki,Kd"));
+  Serial.println(F("Example: 0.020,0.005,0.004"));
+  Serial.print(F("> "));
+
+  // Flush any leftover input
+  while (Serial.available()) { Serial.read(); }
+
+  // Wait for input with timeout
+  unsigned long startTime = millis();
+  String inputString = "";
+  
+  while (millis() - startTime < 30000) {  // 30 second timeout
+    while (Serial.available()) {
+      char c = Serial.read();
+      
+      if (c == '\n' || c == '\r') {
+        // Process the input
+        inputString.trim();
+        if (inputString.length() > 0) {
+          // Parse comma-separated values
+          int comma1 = inputString.indexOf(',');
+          int comma2 = inputString.indexOf(',', comma1 + 1);
+          
+          if (comma1 > 0 && comma2 > comma1) {
+            String kpStr = inputString.substring(0, comma1);
+            String kiStr = inputString.substring(comma1 + 1, comma2);
+            String kdStr = inputString.substring(comma2 + 1);
+            
+            kpStr.trim();
+            kiStr.trim();
+            kdStr.trim();
+            
+            float newKp = kpStr.toFloat();
+            float newKi = kiStr.toFloat();
+            float newKd = kdStr.toFloat();
+            
+            // Validate values
+            if (newKp >= 0 && newKp <= 10.0 &&
+                newKi >= 0 && newKi <= 10.0 &&
+                newKd >= 0 && newKd <= 10.0 &&
+                (kpStr.length() > 0 && kiStr.length() > 0 && kdStr.length() > 0)) {
+              
+              KP = newKp;
+              KI = newKi;
+              KD = newKd;
+              
+              Serial.print(F("\nNew values: Kp="));
+              Serial.print(KP, 6);
+              Serial.print(F(" Ki="));
+              Serial.print(KI, 6);
+              Serial.print(F(" Kd="));
+              Serial.println(KD, 6);
+              
+              // Save to EEPROM
+              saveCalibration();
+              Serial.println(F("Saved to EEPROM"));
+              return;
+            } else {
+              Serial.println(F("ERROR: Invalid values. Must be 0-10.0"));
+              Serial.print(F("> "));
+              inputString = "";
+              continue;
+            }
+          } else {
+            Serial.println(F("ERROR: Invalid format. Use: Kp,Ki,Kd"));
+            Serial.print(F("> "));
+            inputString = "";
+            continue;
+          }
+        }
+      } else if (c == 8 || c == 127) {  // Backspace/Delete
+        if (inputString.length() > 0) {
+          inputString.remove(inputString.length() - 1);
+          Serial.print(c);  // Echo backspace
+        }
+      } else if (c >= 32 && c <= 126) {  // Printable ASCII
+        inputString += c;
+        Serial.print(c);  // Echo character
+      }
+    }
+    delay(10);
+  }
+  
+  Serial.println(F("\nTimeout - no input received"));
 }
 
 // EEPROM
