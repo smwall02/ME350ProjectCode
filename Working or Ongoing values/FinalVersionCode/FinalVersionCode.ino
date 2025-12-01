@@ -301,7 +301,7 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 1.0;
 float arrivalZombieDistance = 1.0;
 
-const unsigned long MIN_DWELL_TIME = 300;
+const unsigned long MIN_DWELL_TIME = 350;
 const unsigned long NORMAL_DWELL_TIME = 450;
 const unsigned long MAX_DWELL_TIME = 850;
 const unsigned long L4_DWELL_TIME = 1050;
@@ -2305,8 +2305,9 @@ void dwellAtTarget() {
     }
   }
   
-  // EMERGENCY OVERRIDE while dwelling - handle immediately
-  if (overrideLane >= 0 && overrideLane <= 3 && shouldOverride(overrideLane)) {
+  // EMERGENCY OVERRIDE while dwelling - but ONLY after MIN_DWELL_TIME has elapsed
+  unsigned long earlyDwellTime = (arrivalTime > 0) ? (millis() - arrivalTime) : 0;
+  if (overrideLane >= 0 && overrideLane <= 3 && earlyDwellTime >= MIN_DWELL_TIME && shouldOverride(overrideLane)) {
     int previousLane = activeTargetIndex;
     
     // CRITICAL: Clean up all dwell state variables before transitioning
@@ -2356,8 +2357,8 @@ void dwellAtTarget() {
   }
   
   // CRITICAL: Wait until target begins to move back (direction changes to BACKWARD)
-  // Then immediately move to next target - no additional delays
-  if (currentDir == BACKWARD) {
+  // Must wait MIN_DWELL_TIME before exiting to ensure proper hit detection
+  if (currentDir == BACKWARD && dwellTime >= MIN_DWELL_TIME) {
     // Target has started moving backward - immediately record hit and move to next
     int previousLane = activeTargetIndex;  // Save for recordHit
     
@@ -2410,7 +2411,7 @@ void dwellAtTarget() {
     return;  // Exit immediately - no further dwell checks
   }
   
-  if (dwellTime >= 100 && peakZombieDistance < 0.15) {
+  if (dwellTime >= MIN_DWELL_TIME && peakZombieDistance < 0.15) {
     // Zombie got to within 15% (close to wall)
     float retreatAmount = currentDist - peakZombieDistance;
     if (retreatAmount > 0.04) {  // Moved back 4%+ from peak
