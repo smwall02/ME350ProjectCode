@@ -275,12 +275,12 @@ int pendingQueueSize = 0;
 
 //============================================
 // SEQUENCING SYSTEM
-// Sequences targets in groups of exactly 3
+// Sequences targets in groups of exactly 2
 // Primary sort: distance from end of lane (using calibration ranges)
 // Secondary sort: velocity and direction
 //============================================
-const int SEQUENCE_SIZE = 3;              // Exactly 3 targets per sequence
-int targetSequence[SEQUENCE_SIZE] = {-1, -1, -1};  // Ordered list of lanes in current sequence
+const int SEQUENCE_SIZE = 2;              // Exactly 2 targets per sequence
+int targetSequence[SEQUENCE_SIZE] = {-1, -1};  // Ordered list of lanes in current sequence
 int sequenceIndex = 0;                    // Current position in sequence
 bool sequenceActive = false;              // Is a sequence currently active?
 bool sequenceLocked = false;              // Is sequence locked? (stick to sequence)
@@ -301,7 +301,7 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 1.0;
 float arrivalZombieDistance = 1.0;
 
-const unsigned long MIN_DWELL_TIME = 250;
+const unsigned long MIN_DWELL_TIME = 300;
 const unsigned long NORMAL_DWELL_TIME = 450;
 const unsigned long MAX_DWELL_TIME = 850;
 const unsigned long L4_DWELL_TIME = 1050;
@@ -2514,7 +2514,7 @@ void dwellAtTarget() {
                                (abs(zombieVelocities[activeTargetIndex]) < 0.0001);
   
   // IMPROVED: Only check STOPPED exit after minimum persistent dwell time
-  if (isEffectivelyStopped && dwellTime >= 200) {  // REDUCED: Require 200ms before checking STOPPED
+  if (isEffectivelyStopped && dwellTime >= MIN_DWELL_TIME) {  // Use MIN_DWELL_TIME for consistency
     if (stoppedStartTime == 0) {
       stoppedStartTime = millis();
       stoppedStartDistance = currentDist;
