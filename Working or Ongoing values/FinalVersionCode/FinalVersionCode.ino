@@ -195,12 +195,17 @@ bool calibrationUpdated[4] = {false, false, false, false};
 
 //============================================
 // SENSOR CALIBRATION
+// Sensor is at START of lane. Target at impact is FAR from sensor.
+// ProxRange[i][0] = high reading (target close to sensor = at START)
+// ProxRange[i][1] = low reading (target far from sensor = at IMPACT)
+// Sensor decreasing = zombie moving toward impact (FORWARD)
+// Sensor increasing = zombie moving away from impact (BACKWARD)
 //============================================
 int ProxRange[4][2] = {
-  {615, 88},   // Lane 1: [far, close]
-  {634, 124},  // Lane 2
-  {622, 147},  // Lane 3
-  {590, 80}    // Lane 4
+  {568, 93},   // Lane 1: [start, impact] - calibrated from logs
+  {587, 118},  // Lane 2: [start, impact] - calibrated from logs
+  {578, 104},  // Lane 3: [start, impact] - calibrated from logs
+  {597, 149}   // Lane 4: [start, impact] - calibrated from logs
 };
 
 //============================================
@@ -3169,10 +3174,11 @@ void updateSensors() {
     const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
     float currentDistance = 0.0f;
     if (range != 0.0f) {
-      // Distance calculation: 0.0 = at start (0%), 1.0 = at impact (100%)
-      // ProxRange[0] = start/0% (high reading), ProxRange[1] = impact/100% (low reading)
-      // When sensor reads high (close to ProxRange[0]): distance is low (near start/0%)
-      // When sensor reads low (close to ProxRange[1]): distance is high (near impact/100%)
+      // Distance calculation: Measures how far target has traveled from start toward impact
+      // ProxRange[0] = high reading = target at START (close to sensor)
+      // ProxRange[1] = low reading = target at IMPACT (far from sensor)
+      // Formula: high sensor (at start) → 100%, low sensor (at impact) → 0%
+      // NOTE: This is inverted - 100% means at START, 0% means at IMPACT
       float normalized = (ProxSensors[i].currVal - ProxRange[i][1]) / range;
       currentDistance = constrain(normalized, 0.0f, 1.0f);
       
