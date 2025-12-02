@@ -1279,200 +1279,135 @@ void loop() {
     
     if (canCheckOverride) {
       overrideCheckTime = millis();
-      
-      for (int i = 0; i < 4; i++) {
-        if (i == committedLane) continue;
-        // CRITICAL: NEVER target backward-moving zombies - they're retreating!
-        if (ProxSensors[i].direction == BACKWARD) continue;
-        // CRITICAL: Allow STOPPED lanes if they're at 95%+ through lane (about to impact!)
-        // Also allow FORWARD lanes
-        // NEW SEMANTICS: Higher dist = closer to impact
-        float dist = zombieDistances[i];
+
+      for (int lane = 0; lane < 4; lane++) {
+        if (lane == committedLane) continue;
+        if (ProxSensors[lane].direction == BACKWARD) continue;  // Only forward targets
+
+        float dist = zombieDistances[lane];
         bool isAboutToImpact = (dist > 0.95 && dist < 0.99);  // 95%+ through lane
-        if (ProxSensors[i].direction != FORWARD && !(ProxSensors[i].direction == STOPPED && isAboutToImpact)) {
-          continue;  // Skip non-forward lanes, unless they're stopped and about to impact
+        if (ProxSensors[lane].direction != FORWARD && !(ProxSensors[lane].direction == STOPPED && isAboutToImpact)) {
+          continue;  // Skip non-forward lanes unless they're stopped and about to impact
         }
+
         // TIGHTER: Longer anti-return period - prevent overriding back to same lane
-        // CRITICAL FIX: Increase anti-return time to prevent loops
-        if (i == lastOverrideLane && timeSinceOverride < 5000) continue;  // 5s anti-return to prevent loops (increased from 3s)
+        if (lane == lastOverrideLane && timeSinceOverride < 5000) continue;
 
         // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
-        // EXCEPTION: Allow STOPPED lanes if they're at 95%+ through lane (about to impact!)
-        dist = zombieDistances[i];
-        isAboutToImpact = (dist > 0.95 && dist < 0.99);  // 95%+ through lane
-        if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0 && !isAboutToImpact) {
-          unsigned long stoppedDuration = millis() - laneStoppedTime[i];
+        dist = zombieDistances[lane];
+        isAboutToImpact = (dist > 0.95 && dist < 0.99);
+        if (ProxSensors[lane].direction == STOPPED && laneStoppedTime[lane] > 0 && !isAboutToImpact) {
+          unsigned long stoppedDuration = millis() - laneStoppedTime[lane];
           if (stoppedDuration > STOPPED_TIMEOUT) {
             continue;  // Skip this lane - it's been frozen too long (unless about to impact)
           }
         }
-        
+
         // IMPROVED: Don't override to lanes that have already been attempted recently
-        if (laneAttempted[i]) {
-          unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
+        if (laneAttempted[lane]) {
+          unsigned long timeSinceAttempt = millis() - laneAttemptTime[lane];
           if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
             continue;  // Skip lanes attempted within cooldown period
           }
         }
-        
+
         // OPTIMIZATION: Use cached critical status instead of recalculating
-        dist = zombieDistances[i];
-        bool isCritical = laneIsCritical[i];
-        
+        dist = zombieDistances[lane];
+        bool isCritical = laneIsCritical[lane];
+
         // CRITICAL: NEVER allow L1/L4 to override L2/L3 when L1/L4 are not critical
-        // L2/L3 have shorter lanes and must be protected to prevent impact
-        bool newIsLongLane = laneIsLong[i];
+        bool newIsLongLane = laneIsLong[lane];
         bool committedIsShortLane = (committedLane >= 0) ? laneIsShort[committedLane] : false;
         if (newIsLongLane && committedIsShortLane && !isCritical) {
           continue;  // Skip - don't allow long lane to override short lane when not critical
         }
-        
-        // TIGHTER CRITERIA: Only override for truly critical threats
-        // OPTIMIZATION: Use cached critical status for committed lane
+
         bool committedIsCritical = (committedLane >= 0) ? laneIsCritical[committedLane] : false;
-        
-        // CRITICAL FIX: More aggressive override criteria, especially for short lanes
-        // Short lanes (L2/L3) can end the game - must override aggressively when they're getting close
-        bool isShortLane = laneIsShort[i];
+        bool isShortLane = laneIsShort[lane];
         bool committedIsLongLane = (committedLane >= 0) ? laneIsLong[committedLane] : false;
 
         bool shouldOverride = false;
 
-        // Prevent switching when targets are at similar distances
         float committedDist = zombieDistances[committedLane];
         float distanceGap = abs(dist - committedDist);
 
-        // CRITICAL: Short lanes can override long lanes with smaller gap
-        // Short lanes have less time - they need priority even at similar distances
         float minGapRequired;
         if (committedDist > 0.95 && dist > 0.95) {
-          // Both at 95-100% - require very large gap (30%) to prevent bouncing
-          minGapRequired = 0.30;
+          minGapRequired = 0.30;  // Prevent bouncing when both are at the end
         } else if (isShortLane && committedIsLongLane) {
-          // Short lane overriding long lane - only need 10% gap
-          minGapRequired = 0.10;
+          minGapRequired = 0.10;  // Short lanes can override long lanes with smaller gap
         } else {
-          // Normal case - require larger gap
           minGapRequired = (committedDist > 0.80 && dist > 0.80) ? 0.20 : 0.15;
         }
 
         if (distanceGap < minGapRequired) {
-          continue;  // Skip - targets too similar in distance
+          continue;  // Targets too similar in distance
         }
 
-        // CRITICAL: NEVER allow L1/L4 to override L2/L3 when L1/L4 are not critical
-        // L2/L3 have shorter lanes and must be protected to prevent impact
-        bool isLongLane = laneIsLong[i];
-
+        bool isLongLane = laneIsLong[lane];
         if (isLongLane && committedIsShortLane && !isCritical) {
-          // Long lane (L1/L4) trying to override short lane (L2/L3) when not critical
-          // STRICT: Only allow if new lane is MUCH further through (50%+ more than committed)
-          // NEW SEMANTICS: Higher dist = closer to impact
           if (dist <= committedDist + 0.50) {
-            continue;  // Skip - don't allow override, protect short lanes
+            continue;  // Protect short lanes unless long lane is much further along
           }
         }
 
-        // Check if L4 is also close - if so, reduce L2/L3 override aggressiveness
-        // Only consider L4 "close" if it's actually moving forward and past start position
-        // NEW SEMANTICS: Higher dist = closer to impact
         bool l4AlsoClose = (zombieDistances[3] > 0.90 &&
                             ProxSensors[3].direction == FORWARD &&
-                            zombieDistances[3] < 0.98);  // L4 at 90%+ through lane and moving forward
+                            zombieDistances[3] < 0.98);
 
-        // HIGHEST PRIORITY 0: ANY lane at 95%+ through lane = IMMEDIATE OVERRIDE
-          // This is game-ending - zombie is about to impact!
-          // NEW SEMANTICS: Higher dist = closer to impact
-          if (dist > 0.95 && ProxSensors[i].direction == FORWARD && dist < 0.99) {
-            // ANY lane at 95%+ through lane (about to impact!) - override immediately!
+        if (dist > 0.95 && ProxSensors[lane].direction == FORWARD && dist < 0.99) {
+          shouldOverride = true;
+        } else if (lane == 3 && dist > 0.90 && ProxSensors[lane].direction == FORWARD && dist < 0.98) {
+          shouldOverride = true;
+        } else if (isShortLane && committedIsLongLane && dist > 0.50) {
+          if (l4AlsoClose && dist < 0.60) {
+            shouldOverride = false;
+          } else {
             shouldOverride = true;
           }
-          // PRIORITY 1: Long lane (L4) getting very close = HIGH PRIORITY
-          // L4 at 90%+ through lane needs immediate attention
-          else if (i == 3 && dist > 0.90 && ProxSensors[i].direction == FORWARD && dist < 0.98) {
-            // L4 is at 90%+ through lane and moving forward - override immediately!
-            shouldOverride = true;
-          }
-          // PRIORITY 2: Short lane getting close while committed to long lane = IMMEDIATE OVERRIDE
-          // BUT: Reduce aggressiveness if L4 is also very close
-          // NEW SEMANTICS: Higher dist = closer to impact
-          else if (isShortLane && committedIsLongLane && dist > 0.50) {
-            // If L4 is also very close, require short lane to be even closer (60%+ through)
-            if (l4AlsoClose && dist < 0.60) {
-              shouldOverride = false;  // L4 is more urgent - don't override to short lane yet
-            } else {
-              // Short lane past 50% while at long lane = override immediately!
-              shouldOverride = true;
-            }
-          }
-          // PRIORITY 3: Short lane getting close while committed to another short lane
-          else if (isShortLane && !committedIsLongLane && dist > 0.30) {
-            // Short lane past 30% while at another lane = override
-            shouldOverride = true;
-          }
-          // PRIORITY 4: Critical vs non-critical = override
-          else if (isCritical && !committedIsCritical) {
-            shouldOverride = true;
-          }
-          // PRIORITY 5: Critical and much further through (at least 30% more)
-          // NEW SEMANTICS: Higher dist = closer to impact
-          else if (isCritical && committedIsCritical && dist > committedDist + 0.30) {
-            shouldOverride = true;
-          }
-          // PRIORITY 6: Short lane getting close while long lane is less urgent
-          // NEW SEMANTICS: Higher dist = closer to impact
-          else if (isShortLane && dist > 0.40 && committedIsLongLane && committedDist < 0.70) {
-            // Short lane past 40% while long lane still below 70% = override
-            shouldOverride = true;
-          }
-          // PRIORITY 7: Above override threshold and committed is not critical
-          // NEW SEMANTICS: Higher dist = closer to impact
-          else if (dist > OVERRIDE_THRESHOLD[i] && !committedIsCritical) {
-            shouldOverride = true;
-          }
+        } else if (isShortLane && !committedIsLongLane && dist > 0.30) {
+          shouldOverride = true;
+        } else if (isCritical && !committedIsCritical) {
+          shouldOverride = true;
+        } else if (isCritical && committedIsCritical && dist > committedDist + 0.30) {
+          shouldOverride = true;
+        } else if (isShortLane && dist > 0.40 && committedIsLongLane && committedDist < 0.70) {
+          shouldOverride = true;
+        } else if (dist > OVERRIDE_THRESHOLD[lane] && !committedIsCritical) {
+          shouldOverride = true;
         }
-        
+
         if (shouldOverride) {
-          // PRIORITIZE BY TIME TO IMPACT (TTI) - which will hit first?
-          // Use effective TTI to determine priority (lower TTI = will hit sooner = higher priority)
-          float effectiveTTI = getEffectiveTTI(i);
-          
-          // If TTI is invalid, use a very high value (low priority)
+          float effectiveTTI = getEffectiveTTI(lane);
           if (effectiveTTI >= 99999) {
-            effectiveTTI = 999999;  // Very low priority
+            effectiveTTI = 999999;  // Very low priority for invalid TTI
           }
-          
-          // Select the lane with the LOWEST TTI (will hit first)
-          // If TTI is the same, use score as tiebreaker
+
           bool shouldSelect = false;
           if (overrideLane < 0) {
-            // No override selected yet - select this one
             shouldSelect = true;
           } else {
             float currentTTI = getEffectiveTTI(overrideLane);
             if (currentTTI >= 99999) currentTTI = 999999;
-            
+
             if (effectiveTTI < currentTTI) {
-              // This lane will hit sooner - select it
               shouldSelect = true;
             } else if (effectiveTTI == currentTTI) {
-              // Same TTI - use score as tiebreaker
-              float thisScore = calculateThreatScore(i);
+              float thisScore = calculateThreatScore(lane);
               float currentScore = calculateThreatScore(overrideLane);
               if (thisScore > currentScore) {
                 shouldSelect = true;
               }
             }
           }
-          
+
           if (shouldSelect) {
-            overrideLane = i;
+            overrideLane = lane;
             bestOverrideScore = effectiveTTI;  // Store TTI for comparison
           }
         }
       }
     }
-    
     // EMERGENCY OVERRIDE - handle immediately
     // CRITICAL FIX: Only allow override if we haven't just overridden to this lane
     // Prevent override loops by checking if we're already committed to the override lane
@@ -1782,14 +1717,12 @@ void dwellAtTarget() {
     
     // CRITICAL: Short lanes (L2/L3) can override long lanes (L1/L4) when getting close
     // If we're dwelling at a long lane and a short lane is getting close, override immediately
-    bool shouldOverride = false;
-    float committedDist = zombieDistances[activeTargetIndex];
-    float distanceGap = abs(dist - committedDist);
-    bool isShortLane = laneIsShort[i];
-    bool committedIsLongLane = laneIsLong[activeTargetIndex];
+  bool shouldOverride = false;
+  float committedDist = zombieDistances[activeTargetIndex];
+  float distanceGap = abs(dist - committedDist);
 
-    // Prevent switching when targets are at similar distances
-    float minGapRequired;
+  // Prevent switching when targets are at similar distances
+  float minGapRequired;
     if (committedDist > 0.95 && dist > 0.95) {
       // Both at 95-100% - require very large gap (35%) to prevent bouncing
       minGapRequired = 0.35;
