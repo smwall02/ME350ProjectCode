@@ -1363,7 +1363,6 @@ void loop() {
         // CRITICAL: NEVER allow L1/L4 to override L2/L3 when L1/L4 are not critical
         // L2/L3 have shorter lanes and must be protected to prevent impact
         bool isLongLane = laneIsLong[i];
-        bool committedIsShortLane = laneIsShort[committedLane];
 
         if (isLongLane && committedIsShortLane && !isCritical) {
           // Long lane (L1/L4) trying to override short lane (L2/L3) when not critical
@@ -1559,12 +1558,10 @@ void loop() {
           break;
       }
     }
-  }
-  
-  //============================================
-  // MOTOR CONTROL
-  //============================================
-  if (systemEnabled && digitalRead(ON_OFF_SWITCH_PIN) == HIGH) {
+    //============================================
+    // MOTOR CONTROL
+    //============================================
+    if (systemEnabled && digitalRead(ON_OFF_SWITCH_PIN) == HIGH) {
     runPIDController();
   } else {
     stopMotor();
