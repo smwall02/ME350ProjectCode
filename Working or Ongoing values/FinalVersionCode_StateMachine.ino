@@ -2745,13 +2745,16 @@ void printStatus() {
 // HIGH-LEVEL STATE MACHINE HELPERS
 //============================================
 void runStateMachine(unsigned long nowMillis) {
-  if (autoMode && isCommitted && commitStartTime > 0) {
-    unsigned long serviceDuration = nowMillis - commitStartTime;
-    if (serviceDuration >= MAX_LANE_SERVICE_TIME) {
-      laserOff();
-      releaseCommitment();
-      state = CHOOSE_TARGET;
-      systemState = ST_SELECT_LANE;
+  if (autoMode && isCommitted) {
+    unsigned long referenceTime = (arrivalTime > 0) ? arrivalTime : commitStartTime;
+    if (referenceTime > 0) {
+      unsigned long serviceDuration = nowMillis - referenceTime;
+      if (serviceDuration >= MAX_LANE_SERVICE_TIME) {
+        laserOff();
+        releaseCommitment();
+        state = CHOOSE_TARGET;
+        systemState = ST_SELECT_LANE;
+      }
     }
   }
 
@@ -2848,11 +2851,20 @@ void updateThreatModel(unsigned long nowMillis) {
 int pickMostDangerousLane() {
   int bestIdx = -1;
   float bestTTI = 999999.0f;
+  float bestDist = -1.0f;
   for (int i = 0; i < 4; i++) {
     if (ProxSensors[i].direction != FORWARD) continue;
+    float dist = zombieDistances[i];
+    float laneThreshold = getEarlyEngageThreshold(i);
+    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
+
     float tti = laneTTI[i];
-    if (tti > 0 && tti < bestTTI) {
-      bestTTI = tti;
+    bool betterDistance = dist > bestDist;
+    bool tieOnDistance = fabs(dist - bestDist) < 0.01f;
+
+    if (betterDistance || (tieOnDistance && tti > 0 && tti < bestTTI)) {
+      bestDist = dist;
+      bestTTI = (tti > 0) ? tti : bestTTI;
       bestIdx = i;
     }
   }
