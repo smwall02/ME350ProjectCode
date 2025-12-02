@@ -235,7 +235,7 @@ const float SHORT_LANE_CRITICAL_DISTANCE = 0.35;  // L2/L3 critical at 35% throu
 const float LONG_LANE_CRITICAL_DISTANCE = 0.60;  // L1/L4 critical at 60% through lane
 const float TARGET_ZONE_MAX = 0.40;  // Desired "comfort" zone: keep zombies under 40%
 const unsigned long MIN_COMMITMENT_TIME = 800;  // Minimum 800ms commitment before allowing overrides
-const unsigned long MAX_LANE_SERVICE_TIME = 2000;  // Never stay on the same lane longer than 2s
+const unsigned long MAX_LANE_SERVICE_TIME = 1500;  // Never stay on the same lane longer than 1.5s
 const unsigned long TARGET_SWITCH_COOLDOWN = 1500;  // 1.5s cooldown after switching targets
 
 const float RETREAT_CONFIRMED_DISTANCE = 0.65;  // Retreat confirmed when drops below 65% through
@@ -2781,6 +2781,28 @@ void logLaneSnapshot(const char* label, int selectedLane) {
 void runStateMachine(unsigned long nowMillis) {
   if (autoMode && isCommitted) {
     unsigned long referenceTime = (arrivalTime > 0) ? arrivalTime : commitStartTime;
+    bool dwellProtected = false;
+
+    // Respect the mandatory dwell window before allowing any preemption
+    if (systemState == ST_FIRE_DWELL && dwellStartMillis > 0) {
+      dwellProtected = (nowMillis - dwellStartMillis) < SENSOR_DWELL_TIME_MS;
+    } else if (arrivalTime > 0) {
+      dwellProtected = (nowMillis - arrivalTime) < SENSOR_DWELL_TIME_MS;
+    }
+
+    // Allow early lane changes if a more urgent forward-moving target appears
+    if (!dwellProtected) {
+      int alternativeLane = pickMostDangerousLane();
+      if (alternativeLane >= 0 && alternativeLane != committedLane) {
+        logLaneSnapshot("preempt", alternativeLane);
+        laserOff();
+        releaseCommitment();
+        state = CHOOSE_TARGET;
+        systemState = ST_SELECT_LANE;
+        return;
+      }
+    }
+
     if (referenceTime > 0) {
       unsigned long serviceDuration = nowMillis - referenceTime;
       if (serviceDuration >= MAX_LANE_SERVICE_TIME) {
