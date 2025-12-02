@@ -216,6 +216,7 @@ int ProxRange[4][2] = {
 
 // Precomputed proximity scaling for faster sensor updates
 float proxRangeInv[4] = {0, 0, 0, 0};
+float proxRangeScaled[4] = {0, 0, 0, 0};
 float laneDistanceScale[4] = {1.0f, 1.12f, 1.12f, 1.0f};
 
 //============================================
@@ -1472,6 +1473,8 @@ void updateProxScaling() {
     }
 
     proxRangeInv[i] = 1.0f / span;
+    // Combine lane scaling to remove an extra multiply per updateSensors() call
+    proxRangeScaled[i] = laneDistanceScale[i] * proxRangeInv[i];
   }
 }
 
@@ -3427,9 +3430,9 @@ void updateSensors() {
     // ProxRange[0] = high reading = target at START (close to sensor)
     // ProxRange[1] = low reading = target at IMPACT (far from sensor)
     // Formula: 0% at start (rawVal=high), 100% at impact (rawVal=low)
-    // normalized = (ProxRange[0] - rawVal) * proxRangeInv
-    float normalized = (float)(ProxRange[i][0] - rawVal) * proxRangeInv[i];
-    currentDistance = constrain(normalized * laneDistanceScale[i], 0.0f, 1.0f);
+    // normalized = (ProxRange[0] - rawVal) * proxRangeScaled (pre-multiplied with lane scaling)
+    float normalized = (float)(ProxRange[i][0] - rawVal) * proxRangeScaled[i];
+    currentDistance = constrain(normalized, 0.0f, 1.0f);
     zombieDistances[i] = currentDistance;
 
     // Derive sensor-specific noise limit rather than sharing across lanes
