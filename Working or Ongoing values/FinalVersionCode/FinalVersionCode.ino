@@ -303,6 +303,10 @@ bool laneAttempted[4] = {false, false, false, false};  // Track which lanes we'v
 unsigned long laneAttemptTime[4] = {0, 0, 0, 0};       // When we attempted each lane
 const unsigned long ATTEMPT_COOLDOWN = 1000;           // Allow faster re-engagement
 
+// Forward declarations for helpers used in forward targeting
+float getEffectiveTTI(int lane);
+float getEarlyEngageThreshold(int lane);
+
 //============================================
 // FORWARD PRIORITY HELPER
 // Ensures we always pick the forward-moving target closest to impact
