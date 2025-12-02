@@ -1000,11 +1000,12 @@ int getBestTarget() {
 
 // Calculate and create a new target sequence
 // RULES:
+// - Always produce batches of 4 targets
+// - At least 3 unique lanes when possible (4 unique if available)
 // - Only FORWARD-moving targets that meet threshold criteria
 // - Sorted by EFFECTIVE TTI (lowest first = closest to impact)
 // - Effective TTI = raw TTI - travel time - lane priority boost
-// - Round start (all 0-5%): 4-lane sequence
-// - Otherwise: 2-lane sequence with repeats allowed
+// - Round start (all 0-5%): include all 4 lanes in order of urgency
 void calculateNewSequence() {
   // Clear existing sequence
   for (int i = 0; i < SEQUENCE_SIZE; i++) {
@@ -1020,9 +1021,6 @@ void calculateNewSequence() {
       break;
     }
   }
-
-  // Determine sequence length: 4 at round start, 2 otherwise
-  int maxSequenceLen = isRoundStart ? 4 : 2;
 
   // Gather lane info - NOW USING TTI FOR PRIORITIZATION
   struct LaneInfo {
@@ -1096,22 +1094,47 @@ void calculateNewSequence() {
   int sequenceCount = 0;
 
   if (isRoundStart) {
-    // ROUND START: Include all 4 lanes, sorted by TTI
-    // Even if not all are forward yet, include them for coverage
-    for (int i = 0; i < 4 && sequenceCount < 4; i++) {
+    // ROUND START: include all four lanes in urgency order to guarantee coverage
+    for (int i = 0; i < 4 && sequenceCount < SEQUENCE_SIZE; i++) {
       targetSequence[sequenceCount++] = lanes[i].lane;
     }
   } else {
-    // NORMAL: Build 2-lane sequence from targetable lanes, sorted by TTI
-    for (int i = 0; i < 4 && sequenceCount < maxSequenceLen; i++) {
-      if (lanes[i].isTargetable) {
-        targetSequence[sequenceCount++] = lanes[i].lane;
+    // NORMAL: build a 4-lane batch with at least 3 unique targetable lanes when possible
+    int uniqueLanes[4] = {-1, -1, -1, -1};
+    int uniqueCount = 0;
+
+    // Collect targetable lanes in priority order (already sorted by effective TTI)
+    for (int i = 0; i < 4; i++) {
+      if (lanes[i].isTargetable && uniqueCount < 4) {
+        uniqueLanes[uniqueCount++] = lanes[i].lane;
       }
     }
 
-    // If we have 1 target but need 2, allow repeat
-    if (sequenceCount == 1 && maxSequenceLen == 2) {
-      targetSequence[sequenceCount++] = targetSequence[0];
+    // If nothing is targetable, bail out
+    if (uniqueCount == 0) {
+      sequenceActive = false;
+      sequenceLocked = false;
+      return;
+    }
+
+    // Add up to four unique lanes
+    for (int i = 0; i < uniqueCount && sequenceCount < SEQUENCE_SIZE; i++) {
+      targetSequence[sequenceCount++] = uniqueLanes[i];
+    }
+
+    // Ensure at least 3 unique lanes when available
+    if (uniqueCount >= 3 && sequenceCount < SEQUENCE_SIZE) {
+      // We already have 3+ unique; fill remaining slots by repeating the most urgent lane(s)
+      int repeatIdx = 0;
+      while (sequenceCount < SEQUENCE_SIZE) {
+        targetSequence[sequenceCount++] = uniqueLanes[repeatIdx % uniqueCount];
+        repeatIdx++;
+      }
+    } else {
+      // Fallback: fewer than 3 unique lanes available, repeat the most urgent to fill the batch
+      while (sequenceCount < SEQUENCE_SIZE) {
+        targetSequence[sequenceCount++] = uniqueLanes[0];
+      }
     }
   }
 
