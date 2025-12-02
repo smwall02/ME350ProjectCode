@@ -214,9 +214,10 @@ const int SHORT_LANE_BOOST = 150;
 // NEW SEMANTICS: 0% = start, 100% = impact
 // EARLY_ENGAGE = minimum % through lane to engage (lower = engage earlier)
 // MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
-const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
-const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
+const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.10, 0.10};   // Engage L1/L4 when > 10% through (increased from 8%)
+const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.08, 0.08};  // Engage L2/L3 when > 8% through (increased from 5%)
 const float MAX_ENGAGE_DISTANCE = 0.95f;  // Allow planning up to 95% through a lane (near impact)
+const float MIN_VALID_DISTANCE = 0.05f;   // Minimum distance to consider a target valid (5% through lane)
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
@@ -361,6 +362,7 @@ float getEarlyEngageThreshold(int lane);
 //============================================
 // FORWARD PRIORITY HELPER
 // Ensures we always pick the forward-moving target closest to impact by TTI
+// FIXED: Properly filters out backward/stopped lanes and prioritizes most advanced targets
 //============================================
 int getMostAdvancedForwardLane(float &bestTTIOut, float &bestDistOut) {
   int bestLane = -1;
@@ -368,51 +370,51 @@ int getMostAdvancedForwardLane(float &bestTTIOut, float &bestDistOut) {
   float bestTTI = 99999.0f;
   long bestTravel = 32767;
 
-  // Two-pass: prefer approaching/serviced lanes, then fall back to any forward lane if none found
-  for (int pass = 0; pass < 2 && bestLane < 0; pass++) {
-    for (int i = 0; i < 4; i++) {
-      // HARD GUARD: never select backward or stopped lanes here
-      if (ProxSensors[i].direction != FORWARD) continue;
+  // CRITICAL: Only consider forward-moving targets
+  for (int i = 0; i < 4; i++) {
+    // HARD GUARD: NEVER select backward or stopped lanes
+    if (ProxSensors[i].direction != FORWARD) continue;
 
-      if (pass == 0) {
-        if (laneTargetState[i] != LANE_APPROACHING && laneTargetState[i] != LANE_BEING_SERVICED) continue;
-      }
+    float dist = zombieDistances[i];
+    
+    // CRITICAL: Only consider targets within valid engagement window
+    // dist must be >= laneThreshold (past minimum engagement point)
+    // dist must be <= MAX_ENGAGE_DISTANCE (not too close to impact)
+    // dist must be >= MIN_VALID_DISTANCE (not too early - likely noise)
+    float laneThreshold = getEarlyEngageThreshold(i);
+    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE || dist < MIN_VALID_DISTANCE) continue;
 
-      float dist = zombieDistances[i];
-      float laneThreshold = getEarlyEngageThreshold(i);
-      if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;  // Ignore out-of-window targets
+    // Respect recent attempt cooldown to avoid thrashing
+    if (laneAttempted[i]) {
+      unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
+      if (timeSinceAttempt < ATTEMPT_COOLDOWN) continue;
+    }
 
-      // Respect recent attempt cooldown to avoid thrashing
-      if (laneAttempted[i]) {
-        unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
-        if (timeSinceAttempt < ATTEMPT_COOLDOWN) continue;
-      }
+    float effectiveTTI = getEffectiveTTI(i);
+    bool hasValidTTI = effectiveTTI < 99999;
+    long travelTicks = labs(cachedEncoderPos - targetPositions[i]);
 
-      float effectiveTTI = getEffectiveTTI(i);
-      bool hasValidTTI = effectiveTTI < 99999;
-      long travelTicks = labs(cachedEncoderPos - targetPositions[i]);
+    bool choose = false;
 
-      bool choose = false;
-
-      // PRIMARY: pick the target furthest forward (highest dist)
-      if (dist > bestDist + 0.001f) {
+    // PRIMARY: pick the target furthest forward (highest dist = closest to impact)
+    // This ensures we prioritize targets that are most advanced through their lane
+    if (dist > bestDist + 0.001f) {
+      choose = true;
+    } else if (fabs(dist - bestDist) <= 0.001f) {
+      // Tie-breaker: prefer lower TTI if both are similarly forward
+      if (hasValidTTI && (effectiveTTI + 0.001f < bestTTI - 0.001f)) {
         choose = true;
-      } else if (abs(dist - bestDist) <= 0.001f) {
-        // Tie-breaker: prefer lower TTI if both are similarly forward
-        if (hasValidTTI && (effectiveTTI + 0.001f < bestTTI - 0.001f)) {
-          choose = true;
-        } else if (hasValidTTI && abs(effectiveTTI - bestTTI) < 0.001f) {
-          // Final tie-breaker: shorter travel for faster slew
-          choose = (travelTicks < bestTravel);
-        }
+      } else if (hasValidTTI && fabs(effectiveTTI - bestTTI) < 0.001f) {
+        // Final tie-breaker: shorter travel for faster slew
+        choose = (travelTicks < bestTravel);
       }
+    }
 
-      if (choose) {
-        bestTTI = hasValidTTI ? effectiveTTI : bestTTI;
-        bestDist = dist;
-        bestLane = i;
-        bestTravel = travelTicks;
-      }
+    if (choose) {
+      bestTTI = hasValidTTI ? effectiveTTI : bestTTI;
+      bestDist = dist;
+      bestLane = i;
+      bestTravel = travelTicks;
     }
   }
 
@@ -821,13 +823,15 @@ int getBestTarget() {
   
   int bestLane = -1;
   float bestScore = 0;
+  float bestDist = -1.0f;  // Track distance to prioritize most advanced targets
   
   // Check ALL lanes for the best forward-moving target
   for (int i = 0; i < 4; i++) {
+    // CRITICAL: Only consider forward-moving targets
     if (ProxSensors[i].direction != FORWARD) continue;
     
     // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
-    if (ProxSensors[i].direction == STOPPED && laneStoppedTime[i] > 0) {
+    if (laneStoppedTime[i] > 0) {
       unsigned long stoppedDuration = millis() - laneStoppedTime[i];
       if (stoppedDuration > STOPPED_TIMEOUT) {
         continue;  // Skip this lane - it's been frozen too long
@@ -837,12 +841,30 @@ int getBestTarget() {
     float dist = zombieDistances[i];
     // Use lane-specific threshold - L2/L3 engage earlier
     // Respect the planned engage ceiling to avoid flirting with impact
+    // Also ensure target is past minimum valid distance (not noise)
     float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
+    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE || dist < MIN_VALID_DISTANCE) continue;
     
+    // FIXED: Prioritize by distance first (most advanced target), then by threat score
+    // This ensures we always pick the target closest to impact when multiple are available
     float score = calculateThreatScore(i);
-    if (score > bestScore) {
+    
+    // Primary: prefer most advanced target (highest dist)
+    // Secondary: if distances are similar, use threat score
+    bool choose = false;
+    if (dist > bestDist + 0.01f) {
+      // Significantly more advanced - always choose
+      choose = true;
+    } else if (fabs(dist - bestDist) <= 0.01f) {
+      // Similar distance - use threat score as tie-breaker
+      if (score > bestScore + 0.1f) {
+        choose = true;
+      }
+    }
+    
+    if (choose) {
       bestScore = score;
+      bestDist = dist;
       bestLane = i;
     }
   }
@@ -2882,8 +2904,27 @@ void handleSelectLaneState() {
   float selTTI = 0.0f;
   float selDist = 0.0f;
   int bestLane = getMostAdvancedForwardLane(selTTI, selDist);
+  
+  // CRITICAL: Validate the selected lane before committing
+  if (bestLane >= 0) {
+    // Double-check that the selected lane is still valid
+    if (ProxSensors[bestLane].direction != FORWARD) {
+      // Lane changed direction - reject it
+      bestLane = -1;
+    } else {
+      float dist = zombieDistances[bestLane];
+      float laneThreshold = getEarlyEngageThreshold(bestLane);
+      // Verify target is still in valid engagement window
+      if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) {
+        bestLane = -1;
+      }
+    }
+  }
+  
   logLaneSnapshot("select", bestLane);
+  
   if (bestLane < 0) {
+    // No valid target found - go to idle
     systemState = ST_IDLE;
     return;
   }
@@ -2999,13 +3040,29 @@ void handleAimState() {
     return;
   }
 
-  if (currentLane >= 0 && ProxSensors[currentLane].direction != FORWARD) {
-    logLaneSnapshot("backward", currentLane);
-    laserOff();
-    releaseCommitment();
-    state = CHOOSE_TARGET;
-    systemState = ST_SELECT_LANE;
-    return;
+  // CRITICAL: Validate current lane is still valid before continuing
+  if (currentLane >= 0) {
+    // Check if lane is no longer forward-moving
+    if (ProxSensors[currentLane].direction != FORWARD) {
+      logLaneSnapshot("backward", currentLane);
+      laserOff();
+      releaseCommitment();
+      state = CHOOSE_TARGET;
+      systemState = ST_SELECT_LANE;
+      return;
+    }
+    
+    // Check if target has moved out of valid engagement window
+    float dist = zombieDistances[currentLane];
+    float laneThreshold = getEarlyEngageThreshold(currentLane);
+    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) {
+      logLaneSnapshot("out-of-window", currentLane);
+      laserOff();
+      releaseCommitment();
+      state = CHOOSE_TARGET;
+      systemState = ST_SELECT_LANE;
+      return;
+    }
   }
 
   if (atTargetAngle()) {
