@@ -308,6 +308,13 @@ int sequenceIndex = 0;                    // Current position in sequence
 bool sequenceActive = false;              // Is a sequence currently active?
 bool sequenceLocked = false;              // Is sequence locked? (stick to sequence)
 int laneChangeCounter = 0;                // Track lane changes to force periodic recalcs
+const unsigned long SEQUENCE_RECALC_MIN_INTERVAL = 10;   // Min time between recalcs
+const unsigned long SEQUENCE_LOG_INTERVAL = 500;         // Time-based log throttle
+unsigned long lastSeqRecalcTime = 0;                      // Last recalc timestamp
+unsigned long lastSeqLogTime = 0;                         // Last sequence log timestamp
+
+enum SequenceState { SEQ_STATE_EMPTY = 0, SEQ_STATE_ACTIVE, SEQ_STATE_LOCKED };
+SequenceState lastSeqState = SEQ_STATE_EMPTY;
 
 // ATTEMPTED LANES TRACKING - Prevent re-engaging lanes already attempted
 bool laneAttempted[4] = {false, false, false, false};  // Track which lanes we've already attempted
@@ -734,8 +741,7 @@ void commitToTarget(int lane) {
   if (previousLane >= 0 && previousLane != lane) {
     laneChangeCounter++;
     if (laneChangeCounter >= 3) {
-      calculateNewSequence();
-      logSequence("recalc/3rd-change");
+      requestSequenceRecalc("recalc/3rd-change");
       laneChangeCounter = 0;
     }
   }
@@ -1166,8 +1172,19 @@ void calculateNewSequence() {
 
   sequenceActive = (sequenceCount > 0);
   sequenceLocked = false;
+}
 
-  logSequence("new batch");
+// Forward declarations
+void logSequence(const char *reason = "");
+
+// Throttled recalculation wrapper to avoid hammering Serial and CPU
+void requestSequenceRecalc(const char *reason = "", bool force = false) {
+  unsigned long now = millis();
+  if (!force && (now - lastSeqRecalcTime) < SEQUENCE_RECALC_MIN_INTERVAL) return;
+
+  lastSeqRecalcTime = now;
+  calculateNewSequence();
+  logSequence(reason);
 }
 
 // Forward declaration
@@ -1177,16 +1194,14 @@ bool shouldRecalculateForLowLane();
 int getNextSequenceTarget() {
   // If sequence is empty or exhausted, calculate new one
   if (!sequenceActive || sequenceIndex >= SEQUENCE_SIZE) {
-    calculateNewSequence();
-    logSequence("recalc/empty");
+    requestSequenceRecalc("recalc/empty", true);
     if (!sequenceActive) return -1;
   }
 
   // Check if any lane has 20% or less remaining that's not our current target
   // If so, recalculate sequence to prioritize critical lanes
   if (shouldRecalculateForLowLane()) {
-    calculateNewSequence();
-    logSequence("recalc/urgent");
+    requestSequenceRecalc("recalc/urgent");
     if (!sequenceActive) return -1;
   }
 
@@ -1237,8 +1252,7 @@ int getNextSequenceTarget() {
   }
   
   // Sequence exhausted, calculate new one
-  calculateNewSequence();
-  logSequence("recalc/exhausted");
+  requestSequenceRecalc("recalc/exhausted", true);
   if (!sequenceActive) return -1;
   
   // Return first target of new sequence
@@ -1262,13 +1276,52 @@ void resetSequence() {
   logSequence("reset");
 }
 
+int getSequenceCountSnapshot() {
+  int count = 0;
+  for (int i = 0; i < SEQUENCE_SIZE; i++) {
+    if (targetSequence[i] >= 0) count++;
+  }
+  return count;
+}
+
+SequenceState getSequenceStateSnapshot() {
+  int count = getSequenceCountSnapshot();
+  if (!sequenceActive || count == 0) return SEQ_STATE_EMPTY;
+  return sequenceLocked ? SEQ_STATE_LOCKED : SEQ_STATE_ACTIVE;
+}
+
+const char *sequenceStateLabel(SequenceState state) {
+  switch (state) {
+    case SEQ_STATE_LOCKED:
+      return "locked";
+    case SEQ_STATE_ACTIVE:
+      return "active";
+    default:
+      return "empty";
+  }
+}
+
 // Debug helper to show the current sequence batch and index
 void logSequence(const char *reason) {
 #ifdef DEBUG_SERIAL
+  unsigned long now = millis();
+  SequenceState state = getSequenceStateSnapshot();
+  bool hasReason = (reason && reason[0] != '\0');
+
+  // Only print on state change or after the log interval to reduce spam
+  bool shouldPrint = (state != lastSeqState) || (now - lastSeqLogTime > SEQUENCE_LOG_INTERVAL);
+  if (!shouldPrint && hasReason && (now - lastSeqLogTime > 100)) {
+    shouldPrint = true;  // Allow occasional reasoned logs without flooding
+  }
+  if (!shouldPrint) return;
+
   Serial.print(F("[SEQ] "));
-  Serial.print(reason);
+  if (hasReason) Serial.print(reason);
+  else Serial.print(sequenceStateLabel(state));
   Serial.print(F(" idx="));
   Serial.print(sequenceIndex);
+  Serial.print(F(" state="));
+  Serial.print(sequenceStateLabel(state));
   Serial.print(F(" lanes:"));
   for (int i = 0; i < SEQUENCE_SIZE; i++) {
     Serial.print(F(" "));
@@ -1276,6 +1329,9 @@ void logSequence(const char *reason) {
     else Serial.print(F("-"));
   }
   Serial.println();
+
+  lastSeqState = state;
+  lastSeqLogTime = now;
 #endif
 }
 
@@ -1331,9 +1387,9 @@ void advanceSequence() {
     sequenceLocked = false;
     sequenceActive = false;
     sequenceIndex = 0;
-    
+
     // Immediately recalculate new sequence
-    calculateNewSequence();
+    requestSequenceRecalc("recalc/advance", true);
   } else {
     // Still targets remaining in current sequence
     sequenceLocked = false;  // Allow recalculation if needed
@@ -2363,7 +2419,7 @@ void chooseAndCommitTargetFromSequence() {
     bool ttiBeatsSequence = (currentSeqTTI >= 99999) || (bestOverrideTTI + SWITCH_TTI_MARGIN < currentSeqTTI);
     if (sequenceIsStale || ttiBeatsSequence) {
       // Recalculate sequence starting with this best target
-      calculateNewSequence();
+      requestSequenceRecalc("recalc/override", true);
       commitToTarget(bestOverrideLane);
       if (isCommitted) {
         state = MOVE_TO_TARGET;
