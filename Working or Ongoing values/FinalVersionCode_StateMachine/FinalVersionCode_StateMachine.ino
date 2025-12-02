@@ -156,7 +156,7 @@ const int SHORT_LANE_BOOST = 150;
 // MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
 const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
 const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
-const float MAX_ENGAGE_DISTANCE = 0.90;  // Do not plan hits past 90% through a lane
+const float MAX_ENGAGE_DISTANCE = 1.00;  // Allow engagement all the way to 100% through a lane
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
