@@ -2119,8 +2119,10 @@ void processSerialCommands() {
 void startAutoMode() {
   autoMode = true;
   systemEnabled = true;
+  gameRunning = true;
   gameOver = false;
   state = CHOOSE_TARGET;
+  systemState = ST_SELECT_LANE;
   activeTargetIndex = -1;
   previousTargetIndex = -1;
   backwardStartTime = 0;
@@ -2129,10 +2131,10 @@ void startAutoMode() {
   lastSelectedLane = -1;
   lastSelectedTTI = 99999;
   lastSelectionTime = 0;
+  desiredPosition = WAIT_POSITION;
   for (int i = 0; i < 4; i++) laneTargetState[i] = LANE_SAFE;
   releaseCommitment();
   pendingQueueSize = 0;
-
 }
 
 //============================================
@@ -2866,35 +2868,32 @@ void readSerialCommands() {
     switch (c) {
       case 'G':
         currentMode = MODE_STABLE;
-        autoMode = true;
-        gameRunning = true;
-        systemState = ST_SELECT_LANE;
+        startAutoMode();
         break;
       case 'T':
         currentMode = MODE_TURBO;
-        autoMode = true;
-        gameRunning = true;
-        systemState = ST_SELECT_LANE;
+        startAutoMode();
         break;
       case 'Y':
         currentMode = MODE_HARDCORE;
-        autoMode = true;
-        gameRunning = true;
-        systemState = ST_SELECT_LANE;
+        startAutoMode();
         break;
       case 'S':
         gameRunning = false;
         autoMode = false;
+        systemEnabled = false;
         systemState = ST_IDLE;
         break;
       case 'H':
         gameRunning = false;
+        systemEnabled = false;
         homingStarted = false;
         systemState = ST_HOME;
         break;
       case 'M':
         gameRunning = false;
         autoMode = false;
+        systemEnabled = true;
         if (currentMode == MODE_STABLE) currentMode = MODE_TURBO;
         else if (currentMode == MODE_TURBO) currentMode = MODE_HARDCORE;
         else currentMode = MODE_STABLE;
