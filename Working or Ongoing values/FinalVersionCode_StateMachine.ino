@@ -235,6 +235,7 @@ const float SHORT_LANE_CRITICAL_DISTANCE = 0.35;  // L2/L3 critical at 35% throu
 const float LONG_LANE_CRITICAL_DISTANCE = 0.60;  // L1/L4 critical at 60% through lane
 const float TARGET_ZONE_MAX = 0.40;  // Desired "comfort" zone: keep zombies under 40%
 const unsigned long MIN_COMMITMENT_TIME = 800;  // Minimum 800ms commitment before allowing overrides
+const unsigned long MAX_LANE_SERVICE_TIME = 2000;  // Never stay on the same lane longer than 2s
 const unsigned long TARGET_SWITCH_COOLDOWN = 1500;  // 1.5s cooldown after switching targets
 
 const float RETREAT_CONFIRMED_DISTANCE = 0.65;  // Retreat confirmed when drops below 65% through
@@ -2743,6 +2744,16 @@ void printStatus() {
 // HIGH-LEVEL STATE MACHINE HELPERS
 //============================================
 void runStateMachine(unsigned long nowMillis) {
+  if (autoMode && isCommitted && commitStartTime > 0) {
+    unsigned long serviceDuration = nowMillis - commitStartTime;
+    if (serviceDuration >= MAX_LANE_SERVICE_TIME) {
+      laserOff();
+      releaseCommitment();
+      state = CHOOSE_TARGET;
+      systemState = ST_SELECT_LANE;
+    }
+  }
+
   switch (systemState) {
     case ST_BOOT:
       handleBootState();
@@ -2915,6 +2926,14 @@ void handleAimState() {
   bool manualActive = (currentMode == MODE_MANUAL);
   if (!gameRunning && !autoMode && !manualActive) {
     systemState = ST_IDLE;
+    return;
+  }
+
+  if (currentLane >= 0 && ProxSensors[currentLane].direction != FORWARD) {
+    laserOff();
+    releaseCommitment();
+    state = CHOOSE_TARGET;
+    systemState = ST_SELECT_LANE;
     return;
   }
 
