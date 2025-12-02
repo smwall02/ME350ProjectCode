@@ -158,10 +158,10 @@ const int TTI_MAX_ENGAGE[4] = {2200, 3000, 3000, 2200};
 const int SHORT_LANE_BOOST = 150;
 // NEW SEMANTICS: 0% = start, 100% = impact
 // EARLY_ENGAGE = minimum % through lane to engage (lower = engage earlier)
-// MIN_ENGAGE = maximum % through lane to engage (don't engage if past this = about to impact)
+// MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
 const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
 const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
-const float MIN_ENGAGE_THRESHOLD = 0.95;  // Don't engage when > 95% through (about to impact)
+const float MIN_ENGAGE_THRESHOLD = 1.01;  // Upper cap intentionally above normalized range (0-1)
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
@@ -572,7 +572,7 @@ void commitToTarget(int lane) {
   bool isEmergency = (dist > ABSOLUTE_OVERRIDE_DISTANCE && ProxSensors[lane].direction == FORWARD);
   if (!isEmergency) {
     float laneThreshold = getEarlyEngageThreshold(lane);
-    // Valid range: dist > laneThreshold (past minimum) AND dist < MIN_ENGAGE (not too close to impact)
+    // Valid range: dist > laneThreshold (upper cap intentionally disabled by MIN_ENGAGE_THRESHOLD > 1)
     if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) return;
     if (ProxSensors[lane].direction != FORWARD) return;
     if (sequenceLocked && sequenceActive && committedLane >= 0) {
@@ -919,7 +919,7 @@ int getBestTarget() {
     
     float dist = zombieDistances[i];
     // Use lane-specific threshold - L2/L3 engage earlier
-    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
+    // Upper cap intentionally disabled (MIN_ENGAGE_THRESHOLD > 1) so we prioritize far-through targets
     float laneThreshold = getEarlyEngageThreshold(i);
     if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;
     
