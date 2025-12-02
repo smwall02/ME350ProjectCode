@@ -10,8 +10,8 @@ SequenceState lastSeqState = SEQ_STATE_EMPTY;
 //============================================
 // DEBUG OPTIMIZATION - Comment out to save flash memory
 //============================================
-// Uncomment the line below to enable debug Serial output
-#define DEBUG_SERIAL  // ENABLED to surface lane tracking and sequence logging
+// Uncomment the line below to enable debug Serial output (disabled by default to save flash)
+// #define DEBUG_SERIAL  // ENABLED to surface lane tracking and sequence logging
 
 #ifdef DEBUG_SERIAL
   #define DBG_PRINT(x) Serial.print(x)
@@ -1291,6 +1291,8 @@ int getSequenceCountSnapshot() {
   return count;
 }
 
+// Debug helpers to show the current sequence batch and index
+#ifdef DEBUG_SERIAL
 SequenceState getSequenceStateSnapshot() {
   int count = getSequenceCountSnapshot();
   if (!sequenceActive || count == 0) return SEQ_STATE_EMPTY;
@@ -1308,9 +1310,7 @@ const char *sequenceStateLabel(SequenceState state) {
   }
 }
 
-// Debug helper to show the current sequence batch and index
 void logSequence(const char *reason) {
-#ifdef DEBUG_SERIAL
   unsigned long now = millis();
   SequenceState state = getSequenceStateSnapshot();
   bool hasReason = (reason && reason[0] != '\0');
@@ -1339,8 +1339,12 @@ void logSequence(const char *reason) {
 
   lastSeqState = state;
   lastSeqLogTime = now;
-#endif
 }
+#else
+SequenceState getSequenceStateSnapshot() { return SEQ_STATE_EMPTY; }
+const char *sequenceStateLabel(SequenceState state) { (void)state; return ""; }
+void logSequence(const char *reason) { (void)reason; }
+#endif
 
 // Check if any lane needs urgent attention based on TTI or distance
 // Returns true if recalculation is needed (a critical lane is not the current sequence target)
