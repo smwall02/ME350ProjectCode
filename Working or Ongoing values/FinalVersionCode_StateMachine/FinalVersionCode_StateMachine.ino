@@ -105,27 +105,6 @@ const long WAIT_POSITION = -629;
 const int TARGET_BAND = 10;
 
 //============================================
-// LANE CHARACTERISTICS
-// Base travel times from WAIT_POSITION (L3) - used as reference
-//============================================
-const int baseTravelTime[4] = {350, 150, 50, 400};
-
-// DYNAMIC TRAVEL TIME MATRIX
-// travelTimeMatrix[from][to] = time in ms to travel from lane 'from' to lane 'to'
-// Based on encoder positions: L1=-109, L2=-376, L3=-629, L4=-1257
-// Travel speed is approximately 3.5 encoder ticks per ms
-const int travelTimeMatrix[4][4] = {
-  // To:    L1    L2    L3    L4      From L1 (pos -109)
-  {          0,   76,  149,  328 },   // L1 to others
-  // To:    L1    L2    L3    L4      From L2 (pos -376)  
-  {         76,    0,   72,  252 },   // L2 to others
-  // To:    L1    L2    L3    L4      From L3 (pos -629)
-  {        149,   72,    0,  179 },   // L3 to others
-  // To:    L1    L2    L3    L4      From L4 (pos -1257)
-  {        328,  252,  179,    0 }    // L4 to others
-};
-
-//============================================
 // CACHED VALUES FOR EFFICIENCY (DECLARED EARLY FOR USE IN FUNCTIONS)
 //============================================
 long cachedEncoderPos = 0;              // Cache encoder position (updated each loop)
@@ -146,38 +125,19 @@ unsigned long lastSelectionTime = 0;
 const float DANGER_ZONE_DISTANCE = 0.82;          // Emergency promotion threshold
 const unsigned long SENSOR_DWELL_TIME_MS = 60;    // Laser on-time for photosensor
 
-// Get dynamic travel time from current position to target lane
+// Simple travel time estimate based on encoder distance
 // OPTIMIZATION: Uses cached encoder position for efficiency
 int getDynamicTravelTime(int targetLane) {
-  // OPTIMIZATION: Use cached encoder position instead of reading again
   long currentPos = cachedEncoderPos;
-  
-  // Find which lane we're closest to (or between)
-  int closestLane = 0;
-  long minDist = abs(currentPos - targetPositions[0]);
-  
-  for (int i = 1; i < 4; i++) {
-    long dist = abs(currentPos - targetPositions[i]);
-    if (dist < minDist) {
-      minDist = dist;
-      closestLane = i;
-    }
-  }
-  
-  // If we're already at or very close to a lane, use matrix
-  if (minDist < 50) {
-    return travelTimeMatrix[closestLane][targetLane];
-  }
-  
-  // Otherwise, calculate based on actual encoder distance
-  // Approximate speed: 3.5 ticks/ms (based on typical motor performance)
   long targetPos = targetPositions[targetLane];
   long distance = abs(currentPos - targetPos);
+
+  // Approximate speed: 3.5 ticks/ms (based on typical motor performance)
   int calculatedTime = distance / 3.5;
-  
+
   // Add settling time (motor needs to stop and settle)
   calculatedTime += 30;
-  
+
   return calculatedTime;
 }
 
@@ -196,7 +156,7 @@ const int SHORT_LANE_BOOST = 150;
 // MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
 const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
 const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
-const float MAX_ENGAGE_DISTANCE = 0.65;  // Do not plan hits past 65% through a lane
+const float MAX_ENGAGE_DISTANCE = 0.90;  // Do not plan hits past 90% through a lane
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
