@@ -62,10 +62,21 @@ enum State {
 
 State state = IDLE;
 
-// Secondary state machine with explicit AIM/FIRE dwell handling
+// Game modes
+enum GameMode {
+  MODE_STABLE,
+  MODE_TURBO,
+  MODE_HARDCORE,
+  MODE_MANUAL
+};
+
+GameMode currentMode = MODE_STABLE;
+
+// Secondary system state machine with explicit AIM/FIRE dwell handling
 enum SystemState {
-  ST_IDLE = 0,
+  ST_BOOT = 0,
   ST_HOME,
+  ST_IDLE,
   ST_SELECT_LANE,
   ST_AIM,
   ST_FIRE_DWELL,
@@ -73,16 +84,26 @@ enum SystemState {
   ST_ERROR
 };
 
-SystemState systemState = ST_IDLE;
+SystemState systemState = ST_BOOT;
+
+// Core globals for stateful control
+volatile long motorPositionCounts = 0;
+float motorVelocityCPS = 0.0f;
+float laneAnglesDeg[4] = {0, 0, 0, 0};
+int currentLane = -1;
+float targetAngleDeg = 0.0f;
+float laneTTI[4] = {9999, 9999, 9999, 9999};
+unsigned long lastVelUpdateMicros = 0;
+unsigned long dwellStartMillis = 0;
+const unsigned long SENSOR_DWELL_TIME_MS = 350;  // Ensure 350ms on-target dwell
 
 // Hardware helpers
 const int LASER_PIN = 4;
 const float COUNTS_PER_DEGREE = 11.4f;  // Approximate conversion for motor linkage
-float targetAngleDeg = 0.0f;
-unsigned long dwellStartMillis = 0;
 bool pauseClearedByCommand = false;
 bool gameRunning = false;
 int requestedManualLane = -1;
+bool homingStarted = false;
 
 const int FORWARD = 1;
 const int BACKWARD = -1;
@@ -144,7 +165,6 @@ int lastSelectedLane = -1;                        // Track last chosen lane for 
 float lastSelectedTTI = 99999;                    // Track last chosen lane's effective TTI
 unsigned long lastSelectionTime = 0;
 const float DANGER_ZONE_DISTANCE = 0.82;          // Emergency promotion threshold
-const unsigned long SENSOR_DWELL_TIME_MS = 60;    // Laser on-time for photosensor
 
 // Get dynamic travel time from current position to target lane
 // OPTIMIZATION: Uses cached encoder position for efficiency
@@ -413,8 +433,8 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 0.0;
 float arrivalZombieDistance = 0.0;
 
-const unsigned long MIN_DWELL_TIME = 450;  // Increased to 450ms - no early exits
-const unsigned long NORMAL_DWELL_TIME = 450;
+const unsigned long MIN_DWELL_TIME = 350;  // Ensure at least 350ms on target
+const unsigned long NORMAL_DWELL_TIME = 350;
 const unsigned long MAX_DWELL_TIME = 850;
 const unsigned long L4_DWELL_TIME = 1050;
 
@@ -496,10 +516,16 @@ void updateThreatModel(unsigned long nowMillis);
 int pickMostDangerousLane();
 void readSerialCommands();
 bool atTargetAngle();
+void runStateMachine(unsigned long nowMillis);
+void handleBootState();
+void handleHomeState();
+void handleIdleState();
+void handleSelectLaneState();
 void handleAimState();
 void handleFireDwellState(unsigned long nowMillis);
 void handlePauseState();
 void handleErrorState();
+void updateMotorControl(unsigned long nowMicros);
 
 //============================================
 // SETUP
@@ -1160,20 +1186,21 @@ void startCalibration() {
 // MAIN LOOP
 //============================================
 void loop() {
-  executionDuration = micros() - lastExecutionTime;
-  lastExecutionTime = micros();
+  unsigned long nowMicros = micros();
+  unsigned long now = millis();
+  executionDuration = nowMicros - lastExecutionTime;
+  lastExecutionTime = nowMicros;
 
   processSerialCommands();
   readSerialCommands();
   
   // OPTIMIZATION: Cache encoder position to avoid multiple reads
-  unsigned long now = millis();
   if (now - lastEncoderRead >= ENCODER_CACHE_INTERVAL) {
     cachedEncoderPos = encoder.read();
     lastEncoderRead = now;
   }
-  
-  computeVelocity();
+
+  updateMotorVelocity(nowMicros);
   updateSensors();
   
   // OPTIMIZATION: Update cached critical status efficiently
@@ -1210,343 +1237,19 @@ void loop() {
     releaseCommitment();
     state = CHOOSE_TARGET;
   }
+
+  updateThreatModel(now);
   
   //============================================
-  // STATE MACHINE - BATCH-BASED TARGETING
+  // HIGH-LEVEL STATE MACHINE
   //============================================
-  static unsigned long lastOverrideCommit = 0;  // Track when we last committed via override
-  static int lastOverrideLane = -1;             // Track which lane we overrode to
-  static unsigned long overrideCheckTime = 0;   // Rate limit override checks
-  
-  // CRITICAL: Skip state machine during calibration - mechanism must stay at position 0
-  if (calibrationActive) {
-    // State machine disabled during calibration - PID controller will maintain position 0
-  } else if (autoMode && systemEnabled && !gameOver) {
+  runStateMachine(now);
 
     //============================================
-    // ABSOLUTE EMERGENCY OVERRIDE - BYPASSES ALL COOLDOWNS
-    // If ANY lane is at 85%+ FORWARD, IMMEDIATELY target it
-    // This prevents lanes from reaching 100% (game over)
-    // BUT: Do NOT interrupt dwell time - let the hit register first
-    //============================================
-    const float ABSOLUTE_EMERGENCY_THRESHOLD = 0.85;  // 85% = 15% remaining
-    int absoluteEmergencyLane = -1;
-    float highestEmergencyDist = 0;
-
-    // Check if we're currently dwelling - don't interrupt dwell!
-    bool isDwelling = (state == DWELL_AT_TARGET);
-    bool canEmergencyOverride = !isDwelling;  // Only override if NOT dwelling
-
-    // If dwelling, only allow emergency override if current target moved BACKWARD
-    if (isDwelling && committedLane >= 0) {
-      if (ProxSensors[committedLane].direction == BACKWARD) {
-        canEmergencyOverride = true;  // Target retreated - OK to override
-      }
-    }
-
-    if (canEmergencyOverride) {
-      for (int i = 0; i < 4; i++) {
-        // Skip current target - we're already on it
-        if (i == committedLane) continue;
-
-        // Only check FORWARD-moving targets
-        if (ProxSensors[i].direction != FORWARD) continue;
-
-        float dist = zombieDistances[i];
-
-        // Check if this lane is in absolute emergency (85%+ and higher than any we've seen)
-        if (dist >= ABSOLUTE_EMERGENCY_THRESHOLD && dist < 0.99 && dist > highestEmergencyDist) {
-          absoluteEmergencyLane = i;
-          highestEmergencyDist = dist;
-        }
-      }
-
-      // If we found an absolute emergency lane, IMMEDIATELY commit to it
-      if (absoluteEmergencyLane >= 0) {
-        // Only switch if emergency lane is more critical than current target
-        float currentDist = (committedLane >= 0) ? zombieDistances[committedLane] : 0;
-        bool currentIsForward = (committedLane >= 0) ? (ProxSensors[committedLane].direction == FORWARD) : false;
-
-        // Switch if: no current target, current is backward, or emergency is further along
-        if (committedLane < 0 || !currentIsForward || highestEmergencyDist > currentDist + 0.05) {
-          Serial.print(F("!!!EMERGENCY L"));
-          Serial.print(absoluteEmergencyLane + 1);
-          Serial.print(F(" @"));
-          Serial.print((int)(highestEmergencyDist * 100));
-          Serial.println(F("%"));
-
-          // Force immediate commit - bypass all normal checks
-          releaseCommitment();
-          commitToTarget(absoluteEmergencyLane);
-          desiredPosition = targetPositions[absoluteEmergencyLane];
-          state = MOVE_TO_TARGET;
-          lastOverrideCommit = millis();
-          lastOverrideLane = absoluteEmergencyLane;
-        }
-      }
-    }
-
-    //============================================
-    // EMERGENCY OVERRIDE CHECK
-    // Interrupts normal execution for critical threats
-    //============================================
-    int overrideLane = -1;
-    float bestOverrideScore = 0;
-
-    unsigned long timeSinceOverride = millis() - lastOverrideCommit;
-    // CRITICAL FIX: Add cooldown after overrides to prevent rapid switching
-    // After an override, wait at least 2 seconds before allowing another override
-    const unsigned long OVERRIDE_COOLDOWN = 2000;  // 2 second cooldown after override (increased to prevent loops)
-    
-    // CRITICAL FIX: Allow override checks while dwelling - but still respect cooldown
-    // While dwelling, we need to continuously check for critical threats (especially short lanes)
-    // Note: isDwelling already declared above in emergency override section
-    bool canCheckOverride = false;
-    
-    // Always respect cooldown period after override
-    if (timeSinceOverride < OVERRIDE_COOLDOWN) {
-      canCheckOverride = false;  // Still in cooldown - don't check overrides
-    } else if (isDwelling) {
-      // While dwelling: Check overrides every 200ms (slower to prevent rapid switching)
-      canCheckOverride = (millis() - overrideCheckTime >= 200);
-    } else {
-      // While moving: Use cooldown to prevent excessive switching
-      canCheckOverride = (timeSinceOverride >= 1000) && (millis() - overrideCheckTime >= 150);
-      
-      // Don't check overrides while actively moving unless we've been moving for a while
-      // OPTIMIZATION: Use cached encoder position
-      long currentPos = cachedEncoderPos;
-      int distToTarget = abs(currentPos - targetPositions[committedLane]);
-      bool activelyMoving = (distToTarget > 100 && state == MOVE_TO_TARGET);
-      // FIXED: Allow overrides while moving if short lane is getting critical (reduced from 3s to 1.5s)
-      if (activelyMoving && timeSinceOverride < 1500) {
-        canCheckOverride = false;  // Don't override while actively moving unless 1.5s has passed
-      }
-    }
-    
-    if (canCheckOverride) {
-      overrideCheckTime = millis();
-
-      for (int lane = 0; lane < 4; lane++) {
-        if (lane == committedLane) continue;
-        if (ProxSensors[lane].direction == BACKWARD) continue;  // Only forward targets
-
-        float dist = zombieDistances[lane];
-        bool isAboutToImpact = (dist > 0.95 && dist < 0.99);  // 95%+ through lane
-        if (ProxSensors[lane].direction != FORWARD && !(ProxSensors[lane].direction == STOPPED && isAboutToImpact)) {
-          continue;  // Skip non-forward lanes unless they're stopped and about to impact
-        }
-
-        // TIGHTER: Longer anti-return period - prevent overriding back to same lane
-        if (lane == lastOverrideLane && timeSinceOverride < 5000) continue;
-
-        // CRITICAL: Skip STOPPED lanes that have been stopped for > 2 seconds (freeze protection)
-        dist = zombieDistances[lane];
-        isAboutToImpact = (dist > 0.95 && dist < 0.99);
-        if (ProxSensors[lane].direction == STOPPED && laneStoppedTime[lane] > 0 && !isAboutToImpact) {
-          unsigned long stoppedDuration = millis() - laneStoppedTime[lane];
-          if (stoppedDuration > STOPPED_TIMEOUT) {
-            continue;  // Skip this lane - it's been frozen too long (unless about to impact)
-          }
-        }
-
-        // IMPROVED: Don't override to lanes that have already been attempted recently
-        if (laneAttempted[lane]) {
-          unsigned long timeSinceAttempt = millis() - laneAttemptTime[lane];
-          if (timeSinceAttempt < ATTEMPT_COOLDOWN) {
-            continue;  // Skip lanes attempted within cooldown period
-          }
-        }
-
-        // OPTIMIZATION: Use cached critical status instead of recalculating
-        dist = zombieDistances[lane];
-        bool isCritical = laneIsCritical[lane];
-
-        // CRITICAL: NEVER allow L1/L4 to override L2/L3 when L1/L4 are not critical
-        bool newIsLongLane = laneIsLong[lane];
-        bool committedIsShortLane = (committedLane >= 0) ? laneIsShort[committedLane] : false;
-        if (newIsLongLane && committedIsShortLane && !isCritical) {
-          continue;  // Skip - don't allow long lane to override short lane when not critical
-        }
-
-        bool committedIsCritical = (committedLane >= 0) ? laneIsCritical[committedLane] : false;
-        bool isShortLane = laneIsShort[lane];
-        bool committedIsLongLane = (committedLane >= 0) ? laneIsLong[committedLane] : false;
-
-        bool shouldOverride = false;
-
-        float committedDist = zombieDistances[committedLane];
-        float distanceGap = abs(dist - committedDist);
-
-        float minGapRequired;
-        if (committedDist > 0.95 && dist > 0.95) {
-          minGapRequired = 0.30;  // Prevent bouncing when both are at the end
-        } else if (isShortLane && committedIsLongLane) {
-          minGapRequired = 0.10;  // Short lanes can override long lanes with smaller gap
-        } else {
-          minGapRequired = (committedDist > 0.80 && dist > 0.80) ? 0.20 : 0.15;
-        }
-
-        if (distanceGap < minGapRequired) {
-          continue;  // Targets too similar in distance
-        }
-
-        bool isLongLane = laneIsLong[lane];
-        if (isLongLane && committedIsShortLane && !isCritical) {
-          if (dist <= committedDist + 0.50) {
-            continue;  // Protect short lanes unless long lane is much further along
-          }
-        }
-
-        bool l4AlsoClose = (zombieDistances[3] > 0.90 &&
-                            ProxSensors[3].direction == FORWARD &&
-                            zombieDistances[3] < 0.98);
-
-        if (dist > 0.95 && ProxSensors[lane].direction == FORWARD && dist < 0.99) {
-          shouldOverride = true;
-        } else if (lane == 3 && dist > 0.90 && ProxSensors[lane].direction == FORWARD && dist < 0.98) {
-          shouldOverride = true;
-        } else if (isShortLane && committedIsLongLane && dist > 0.50) {
-          if (l4AlsoClose && dist < 0.60) {
-            shouldOverride = false;
-          } else {
-            shouldOverride = true;
-          }
-        } else if (isShortLane && !committedIsLongLane && dist > 0.30) {
-          shouldOverride = true;
-        } else if (isCritical && !committedIsCritical) {
-          shouldOverride = true;
-        } else if (isCritical && committedIsCritical && dist > committedDist + 0.30) {
-          shouldOverride = true;
-        } else if (isShortLane && dist > 0.40 && committedIsLongLane && committedDist < 0.70) {
-          shouldOverride = true;
-        } else if (dist > OVERRIDE_THRESHOLD[lane] && !committedIsCritical) {
-          shouldOverride = true;
-        }
-
-        if (shouldOverride) {
-          float effectiveTTI = getEffectiveTTI(lane);
-          if (effectiveTTI >= 99999) {
-            effectiveTTI = 999999;  // Very low priority for invalid TTI
-          }
-
-          bool shouldSelect = false;
-          if (overrideLane < 0) {
-            shouldSelect = true;
-          } else {
-            float currentTTI = getEffectiveTTI(overrideLane);
-            if (currentTTI >= 99999) currentTTI = 999999;
-
-            if (effectiveTTI < currentTTI) {
-              shouldSelect = true;
-            } else if (effectiveTTI == currentTTI) {
-              float thisScore = calculateThreatScore(lane);
-              float currentScore = calculateThreatScore(overrideLane);
-              if (thisScore > currentScore) {
-                shouldSelect = true;
-              }
-            }
-          }
-
-          if (shouldSelect) {
-            overrideLane = lane;
-            bestOverrideScore = effectiveTTI;  // Store TTI for comparison
-          }
-        }
-      }
-    }
-    // EMERGENCY OVERRIDE - handle immediately
-    // CRITICAL FIX: Only allow override if we haven't just overridden to this lane
-    // Prevent override loops by checking if we're already committed to the override lane
-    if (overrideLane >= 0 && shouldOverride(overrideLane) && overrideLane != committedLane) {
-      int previousLane = committedLane;
-      
-      // CRITICAL: Prevent override loops - don't override if we just overrode to this lane recently
-      if (overrideLane == lastOverrideLane && timeSinceOverride < 5000) {
-        // Just overrode to this lane within 5 seconds - skip to prevent loop (increased from 3s)
-        overrideLane = -1;
-      } else {
-        // CRITICAL: Only print and commit ONCE - prevent spam
-        // Check if we're already moving to this target
-        if (isCommitted && committedLane == overrideLane) {
-          // Already committed to this lane - don't override again
-          overrideLane = -1;
-        } else {
-          DBG_PRINT(F("!!! OVERRIDE L"));
-          DBG_PRINT(overrideLane + 1);
-          DBG_PRINT(F(" @"));
-          DBG_PRINT((int)(zombieDistances[overrideLane] * 100));
-          DBG_PRINTLN(F("% !!!"));
-
-          releaseCommitment();
-          commitToTarget(overrideLane);
-          
-          if (isCommitted) {
-            lastOverrideCommit = millis();
-            lastOverrideLane = overrideLane;  // Track which lane we overrode TO, not FROM
-            state = MOVE_TO_TARGET;
-            // CRITICAL: Exit early to prevent checking overrides again this loop
-            overrideLane = -1;  // Clear to prevent re-checking
-            return;  // Exit immediately to prevent re-checking in same loop
-          } else {
-            // Commit failed - clear override to prevent spam
-            overrideLane = -1;
-          }
-        }
-      }
-    }
-    //============================================
-    // NORMAL EXECUTION
-    //============================================
-    else if (isCommitted && committedLane >= 0) {
-      // Ensure we're targeting the committed lane
-      // CRITICAL: Don't change desiredPosition during calibration
-      if (activeTargetIndex != committedLane && !calibrationActive) {
-        activeTargetIndex = committedLane;
-        desiredPosition = targetPositions[committedLane];
-      }
-      
-      switch (state) {
-        case MOVE_TO_TARGET:
-          moveToTarget();
-          break;
-        case DWELL_AT_TARGET:
-          dwellAtTarget();
-          break;
-        default:
-          state = MOVE_TO_TARGET;
-          break;
-      }
-    }
-    //============================================
-    // NO COMMITMENT - PICK NEXT TARGET
-    //============================================
-    else {
-        switch (state) {
-          case IDLE:
-            state = CHOOSE_TARGET;
-            break;
-
-        case CHOOSE_TARGET:
-          chooseAndCommitTarget();
-          break;
-        
-        case MOVE_TO_TARGET:
-          moveToTarget();
-          break;
-        
-          case DWELL_AT_TARGET:
-            dwellAtTarget();
-            break;
-        }
-      }
-    }
-
-  //============================================
   // MOTOR CONTROL
   //============================================
   if (systemEnabled && digitalRead(ON_OFF_SWITCH_PIN) == HIGH) {
-    runPIDController();
+    updateMotorControl(nowMicros);
   } else {
     stopMotor();
     errorIntegral = 0;
@@ -1559,21 +1262,6 @@ void loop() {
   //============================================
   // STATUS OUTPUT
   //============================================
-  switch (state) {
-    case CHOOSE_TARGET: systemState = ST_SELECT_LANE; break;
-    case MOVE_TO_TARGET: systemState = ST_AIM; break;
-    case DWELL_AT_TARGET: systemState = ST_FIRE_DWELL; break;
-    default: systemState = ST_IDLE; break;
-  }
-
-  updateThreatModel(now);
-
-  if (systemState == ST_AIM) {
-    handleAimState();
-  } else if (systemState == ST_FIRE_DWELL) {
-    handleFireDwellState(now);
-  }
-
   if (autoMode && (millis() - lastPrintTime >= 350)) {  // Reduced from 200ms to 350ms for faster processing
     lastPrintTime = millis();
     printStatus();
@@ -2913,14 +2601,21 @@ void updateMotorVelocity(unsigned long nowMicros) {
   if (nowMicros - lastTime < MIN_VEL_COMP_TIME) return;
 
   long pos = encoder.read();
+  motorPositionCounts = pos;
   long deltaCounts = pos - lastPos;
   unsigned long deltaMicros = nowMicros - lastTime;
 
   if (abs(deltaCounts) >= MIN_VEL_COMP_COUNT && deltaMicros > 0) {
     motorVelocity = (float)deltaCounts * 1e6 / (float)deltaMicros;
+    motorVelocityCPS = motorVelocity;
     lastPos = pos;
     lastTime = nowMicros;
   }
+}
+
+void updateMotorControl(unsigned long nowMicros) {
+  (void)nowMicros;
+  runPIDController();
 }
 
 //============================================
@@ -3045,6 +2740,87 @@ void printStatus() {
 }
 
 //============================================
+// HIGH-LEVEL STATE MACHINE HELPERS
+//============================================
+void runStateMachine(unsigned long nowMillis) {
+  switch (systemState) {
+    case ST_BOOT:
+      handleBootState();
+      break;
+    case ST_HOME:
+      handleHomeState();
+      break;
+    case ST_IDLE:
+      handleIdleState();
+      break;
+    case ST_SELECT_LANE:
+      handleSelectLaneState();
+      break;
+    case ST_AIM:
+      handleAimState();
+      break;
+    case ST_FIRE_DWELL:
+      handleFireDwellState(nowMillis);
+      break;
+    case ST_PAUSE:
+      handlePauseState();
+      break;
+    case ST_ERROR:
+      handleErrorState();
+      break;
+  }
+}
+
+void handleBootState() {
+  initHardware();
+  homingStarted = false;
+  systemState = ST_HOME;
+}
+
+void handleHomeState() {
+  if (!homingStarted) {
+    homingStarted = true;
+    homeToLeftLimit();
+    motorPositionCounts = encoder.read();
+    systemState = ST_IDLE;
+  }
+}
+
+void handleIdleState() {
+  if (gameRunning && currentMode != MODE_MANUAL) {
+    systemState = ST_SELECT_LANE;
+    return;
+  }
+
+  if (currentMode == MODE_MANUAL && requestedManualLane >= 0) {
+    currentLane = requestedManualLane;
+    desiredPosition = targetPositions[currentLane];
+    targetAngleDeg = motorCountsToDegrees(desiredPosition);
+    systemState = ST_AIM;
+    requestedManualLane = -1;
+  }
+}
+
+void handleSelectLaneState() {
+  if (!gameRunning) {
+    systemState = ST_IDLE;
+    return;
+  }
+
+  int bestLane = pickMostDangerousLane();
+  if (bestLane < 0) {
+    systemState = ST_IDLE;
+    return;
+  }
+
+  currentLane = bestLane;
+  targetAngleDeg = motorCountsToDegrees(targetPositions[bestLane]);
+  commitToTarget(bestLane);
+  state = MOVE_TO_TARGET;
+  systemState = ST_AIM;
+}
+
+//============================================
 // Threat model helpers for per-rail TTI selection
 //============================================
 void updateThreatModel(unsigned long nowMillis) {
@@ -3079,6 +2855,19 @@ void readSerialCommands() {
     char c = Serial.read();
     switch (c) {
       case 'G':
+        currentMode = MODE_STABLE;
+        autoMode = true;
+        gameRunning = true;
+        systemState = ST_SELECT_LANE;
+        break;
+      case 'T':
+        currentMode = MODE_TURBO;
+        autoMode = true;
+        gameRunning = true;
+        systemState = ST_SELECT_LANE;
+        break;
+      case 'Y':
+        currentMode = MODE_HARDCORE;
         autoMode = true;
         gameRunning = true;
         systemState = ST_SELECT_LANE;
@@ -3090,17 +2879,21 @@ void readSerialCommands() {
         break;
       case 'H':
         gameRunning = false;
+        homingStarted = false;
         systemState = ST_HOME;
         break;
       case 'M':
         gameRunning = false;
         autoMode = false;
-        requestedManualLane = (requestedManualLane + 1) % 4;
+        if (currentMode == MODE_STABLE) currentMode = MODE_TURBO;
+        else if (currentMode == MODE_TURBO) currentMode = MODE_HARDCORE;
+        else currentMode = MODE_STABLE;
         systemState = ST_IDLE;
         break;
       case '1': case '2': case '3': case '4':
         gameRunning = false;
         autoMode = false;
+        currentMode = MODE_MANUAL;
         requestedManualLane = (int)(c - '1');
         systemState = ST_IDLE;
         break;
@@ -3119,7 +2912,8 @@ bool atTargetAngle() {
 }
 
 void handleAimState() {
-  if (!gameRunning && !autoMode) {
+  bool manualActive = (currentMode == MODE_MANUAL);
+  if (!gameRunning && !autoMode && !manualActive) {
     systemState = ST_IDLE;
     return;
   }
@@ -3136,8 +2930,10 @@ void handleFireDwellState(unsigned long nowMillis) {
   if (elapsed >= SENSOR_DWELL_TIME_MS) {
     laserOff();
     if (!gameRunning) {
+      releaseCommitment();
       systemState = ST_IDLE;
     } else {
+      releaseCommitment();
       systemState = ST_SELECT_LANE;
     }
   }
