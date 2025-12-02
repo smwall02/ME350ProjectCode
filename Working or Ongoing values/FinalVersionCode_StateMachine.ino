@@ -216,7 +216,7 @@ const int SHORT_LANE_BOOST = 150;
 // MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
 const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
 const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
-const float MAX_ENGAGE_DISTANCE = 0.65;  // Do not plan hits past 65% through a lane
+const float MAX_ENGAGE_DISTANCE = 0.98;  // Allow targeting up to 98% through a lane (near impact)
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
@@ -2482,9 +2482,9 @@ void updateSensors() {
       }
     }
     
-    // NOISE FILTER: Ignore targets below 15% that aren't clearly forward
-    // This prevents false locks on sensor noise
-    if (currentDistance > 0.85f && ProxSensors[i].direction == FORWARD) {
+    // NOISE FILTER: Ignore targets below 15% that aren't clearly forward (0 = start, 1 = impact)
+    // This prevents false locks on sensor noise near the lane start
+    if (currentDistance < 0.15f && ProxSensors[i].direction == FORWARD) {
       // Very low signal - require stronger evidence
       if (ProxSensors[i].forwardCount < 3) {
         ProxSensors[i].direction = STOPPED;
@@ -2879,7 +2879,9 @@ void handleSelectLaneState() {
     return;
   }
 
-  int bestLane = pickMostDangerousLane();
+  float selTTI = 0.0f;
+  float selDist = 0.0f;
+  int bestLane = getMostAdvancedForwardLane(selTTI, selDist);
   logLaneSnapshot("select", bestLane);
   if (bestLane < 0) {
     systemState = ST_IDLE;
@@ -2914,7 +2916,7 @@ int pickMostDangerousLane() {
     if (ProxSensors[i].direction != FORWARD) continue;
     float dist = zombieDistances[i];
     float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
+    if (dist < laneThreshold) continue;
 
     float tti = laneTTI[i];
     bool betterDistance = dist > bestDist;
