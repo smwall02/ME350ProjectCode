@@ -105,27 +105,6 @@ const long WAIT_POSITION = -629;
 const int TARGET_BAND = 10;
 
 //============================================
-// LANE CHARACTERISTICS
-// Base travel times from WAIT_POSITION (L3) - used as reference
-//============================================
-const int baseTravelTime[4] = {350, 150, 50, 400};
-
-// DYNAMIC TRAVEL TIME MATRIX
-// travelTimeMatrix[from][to] = time in ms to travel from lane 'from' to lane 'to'
-// Based on encoder positions: L1=-109, L2=-376, L3=-629, L4=-1257
-// Travel speed is approximately 3.5 encoder ticks per ms
-const int travelTimeMatrix[4][4] = {
-  // To:    L1    L2    L3    L4      From L1 (pos -109)
-  {          0,   76,  149,  328 },   // L1 to others
-  // To:    L1    L2    L3    L4      From L2 (pos -376)  
-  {         76,    0,   72,  252 },   // L2 to others
-  // To:    L1    L2    L3    L4      From L3 (pos -629)
-  {        149,   72,    0,  179 },   // L3 to others
-  // To:    L1    L2    L3    L4      From L4 (pos -1257)
-  {        328,  252,  179,    0 }    // L4 to others
-};
-
-//============================================
 // CACHED VALUES FOR EFFICIENCY (DECLARED EARLY FOR USE IN FUNCTIONS)
 //============================================
 long cachedEncoderPos = 0;              // Cache encoder position (updated each loop)
@@ -137,47 +116,28 @@ bool laneIsLong[4] = {true, false, false, true};        // Cache lane type (L1/L
 unsigned long lastCriticalUpdate = 0;   // Track when critical status was last updated
 const unsigned long CRITICAL_UPDATE_INTERVAL = 10;  // Update critical status every 10ms
 
-// HYSTERESIS for target selection to avoid rail thrash
-const float SWITCH_TTI_MARGIN = 200.0f;           // Require 200 ms improvement to switch
-const unsigned long MIN_SERVICE_TIME = 350;       // Stay on a lane briefly before switching
-int lastSelectedLane = -1;                        // Track last chosen lane for hysteresis
-float lastSelectedTTI = 99999;                    // Track last chosen lane's effective TTI
+// SIMPLE, STICKY LANE SELECTION
+const float MIN_LOCK_PCT = 0.20f;    // Minimum progress (0.0-1.0) required to lock a lane
+const float HOLD_PCT = 0.10f;        // Keep current lane if it's still above this progress
+const float PREEMPT_MARGIN = 0.15f;  // Only switch if a new lane is ahead by this margin
+int lastSelectedLane = -1;           // Track last chosen lane for visibility/debugging
 unsigned long lastSelectionTime = 0;
 const float DANGER_ZONE_DISTANCE = 0.82;          // Emergency promotion threshold
 const unsigned long SENSOR_DWELL_TIME_MS = 60;    // Laser on-time for photosensor
 
-// Get dynamic travel time from current position to target lane
+// Simple travel time estimate based on encoder distance
 // OPTIMIZATION: Uses cached encoder position for efficiency
 int getDynamicTravelTime(int targetLane) {
-  // OPTIMIZATION: Use cached encoder position instead of reading again
   long currentPos = cachedEncoderPos;
-  
-  // Find which lane we're closest to (or between)
-  int closestLane = 0;
-  long minDist = abs(currentPos - targetPositions[0]);
-  
-  for (int i = 1; i < 4; i++) {
-    long dist = abs(currentPos - targetPositions[i]);
-    if (dist < minDist) {
-      minDist = dist;
-      closestLane = i;
-    }
-  }
-  
-  // If we're already at or very close to a lane, use matrix
-  if (minDist < 50) {
-    return travelTimeMatrix[closestLane][targetLane];
-  }
-  
-  // Otherwise, calculate based on actual encoder distance
-  // Approximate speed: 3.5 ticks/ms (based on typical motor performance)
   long targetPos = targetPositions[targetLane];
   long distance = abs(currentPos - targetPos);
+
+  // Approximate speed: 3.5 ticks/ms (based on typical motor performance)
   int calculatedTime = distance / 3.5;
-  
+
   // Add settling time (motor needs to stop and settle)
   calculatedTime += 30;
-  
+
   return calculatedTime;
 }
 
@@ -196,7 +156,7 @@ const int SHORT_LANE_BOOST = 150;
 // MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
 const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
 const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
-const float MAX_ENGAGE_DISTANCE = 0.65;  // Do not plan hits past 65% through a lane
+const float MAX_ENGAGE_DISTANCE = 1.00;  // Allow engagement all the way to 100% through a lane
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
@@ -217,10 +177,14 @@ const float TARGET_ZONE_MAX = 0.40;  // Desired "comfort" zone: keep zombies und
 const unsigned long MIN_COMMITMENT_TIME = 800;  // Minimum 800ms commitment before allowing overrides
 const unsigned long TARGET_SWITCH_COOLDOWN = 1500;  // 1.5s cooldown after switching targets
 
+// Override logic is disabled by default to reduce CPU work and complexity; set to 1 to re-enable
+#define ENABLE_OVERRIDES 0
+
 const float RETREAT_CONFIRMED_DISTANCE = 0.65;  // Retreat confirmed when drops below 65% through
-const float ZOMBIE_GONE_DISTANCE = 0.08;  // Zombie gone when < 8% through (near start)
-const float L2_L3_GONE_DISTANCE = 0.05;  // L2/L3 gone when < 5% through
-const float L4_GONE_DISTANCE = 0.10;  // L4 gone when < 10% through
+// GONE = zombie has already passed the impact point / truly unreachable
+const float ZOMBIE_GONE_DISTANCE = 0.90;   // Zombie gone when > 90% through (past safe hit window)
+const float L2_L3_GONE_DISTANCE = 0.92;    // L2/L3 gone when > 92% through
+const float L4_GONE_DISTANCE = 0.88;       // L4 gone when > 88% through
 
 //============================================
 // DYNAMIC CALIBRATION
@@ -738,7 +702,6 @@ void commitToTarget(int lane) {
   commitStartDistance = zombieDistances[lane];
   lastCommitTime = millis();
   lastSelectedLane = lane;
-  lastSelectedTTI = getEffectiveTTI(lane);
   lastSelectionTime = millis();
   
   previousTargetIndex = activeTargetIndex;
@@ -1286,6 +1249,7 @@ void loop() {
       }
     }
 
+#if ENABLE_OVERRIDES
     //============================================
     // EMERGENCY OVERRIDE CHECK
     // Interrupts normal execution for critical threats
@@ -1297,12 +1261,12 @@ void loop() {
     // CRITICAL FIX: Add cooldown after overrides to prevent rapid switching
     // After an override, wait at least 2 seconds before allowing another override
     const unsigned long OVERRIDE_COOLDOWN = 2000;  // 2 second cooldown after override (increased to prevent loops)
-    
+
     // CRITICAL FIX: Allow override checks while dwelling - but still respect cooldown
     // While dwelling, we need to continuously check for critical threats (especially short lanes)
     // Note: isDwelling already declared above in emergency override section
     bool canCheckOverride = false;
-    
+
     // Always respect cooldown period after override
     if (timeSinceOverride < OVERRIDE_COOLDOWN) {
       canCheckOverride = false;  // Still in cooldown - don't check overrides
@@ -1312,7 +1276,7 @@ void loop() {
     } else {
       // While moving: Use cooldown to prevent excessive switching
       canCheckOverride = (timeSinceOverride >= 1000) && (millis() - overrideCheckTime >= 150);
-      
+
       // Don't check overrides while actively moving unless we've been moving for a while
       // OPTIMIZATION: Use cached encoder position
       long currentPos = cachedEncoderPos;
@@ -1323,7 +1287,7 @@ void loop() {
         canCheckOverride = false;  // Don't override while actively moving unless 1.5s has passed
       }
     }
-    
+
     if (canCheckOverride) {
       overrideCheckTime = millis();
 
@@ -1460,7 +1424,7 @@ void loop() {
     // Prevent override loops by checking if we're already committed to the override lane
     if (overrideLane >= 0 && shouldOverride(overrideLane) && overrideLane != committedLane) {
       int previousLane = committedLane;
-      
+
       // CRITICAL: Prevent override loops - don't override if we just overrode to this lane recently
       if (overrideLane == lastOverrideLane && timeSinceOverride < 5000) {
         // Just overrode to this lane within 5 seconds - skip to prevent loop (increased from 3s)
@@ -1480,7 +1444,7 @@ void loop() {
 
           releaseCommitment();
           commitToTarget(overrideLane);
-          
+
           if (isCommitted) {
             lastOverrideCommit = millis();
             lastOverrideLane = overrideLane;  // Track which lane we overrode TO, not FROM
@@ -1495,10 +1459,11 @@ void loop() {
         }
       }
     }
+#endif
     //============================================
     // NORMAL EXECUTION
     //============================================
-    else if (isCommitted && committedLane >= 0) {
+    if (isCommitted && committedLane >= 0) {
       // Ensure we're targeting the committed lane
       // CRITICAL: Don't change desiredPosition during calibration
       if (activeTargetIndex != committedLane && !calibrationActive) {
@@ -1587,66 +1552,59 @@ void loop() {
 // CHOOSE AND COMMIT TO TARGET
 //============================================
 void chooseAndCommitTarget() {
-  // Always prioritize smallest positive TTI, with emergency danger handling and hysteresis
-  int bestLane = -1;
-  float bestTTI = 99999.0f;
-  float bestDist = 0.0f;
-  int dangerLane = -1;
-  float dangerDist = 0.0f;
+  // Do not select or lock lanes during calibration
+  if (calibrationActive) {
+    desiredPosition = WAIT_POSITION;
+    WAIT_POS = true;
+    activeTargetIndex = -1;
+    releaseCommitment();
+    systemState = ST_IDLE;
+    return;
+  }
+
+  int furthestLane = -1;
+  float furthestPct = -1.0f;
 
   updatePendingQueue();  // Clean stale queue entries
 
   for (int i = 0; i < 4; i++) {
     if (ProxSensors[i].direction != FORWARD) continue;
 
-    float dist = zombieDistances[i];
-    float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
+    float pct = zombieDistances[i];
+    if (pct < MIN_LOCK_PCT || pct > MAX_ENGAGE_DISTANCE) continue;
 
-    float effectiveTTI = getEffectiveTTI(i);
-    laneTTI[i] = effectiveTTI;
+    bool choose = false;
+    if (pct > furthestPct + 0.0001f) {
+      choose = true;
+    } else if (abs(pct - furthestPct) <= 0.0001f && i > furthestLane) {
+      // Tie-breaker: prefer higher-numbered lane when progress is equal
+      choose = true;
+    }
 
-    if (dist >= DANGER_ZONE_DISTANCE && effectiveTTI < 99999) {
-      if (dist > dangerDist) {
-        dangerLane = i;
-        dangerDist = dist;
+    if (choose) {
+      furthestLane = i;
+      furthestPct = pct;
+    }
+  }
+
+  int selectedLane = furthestLane;
+
+  // Stickiness: stay on the current committed lane unless another is clearly ahead
+  if (committedLane >= 0 && ProxSensors[committedLane].direction == FORWARD) {
+    float committedPct = zombieDistances[committedLane];
+    if (committedPct >= HOLD_PCT) {
+      bool otherAhead = (furthestLane >= 0 && furthestLane != committedLane &&
+                         (furthestPct - committedPct) >= PREEMPT_MARGIN);
+      if (!otherAhead) {
+        selectedLane = committedLane;
       }
     }
-
-    if (effectiveTTI > 0 && effectiveTTI < bestTTI) {
-      bestTTI = effectiveTTI;
-      bestLane = i;
-      bestDist = dist;
-    } else if (effectiveTTI >= 0 && abs(effectiveTTI - bestTTI) < 1.0f && dist > bestDist) {
-      // Tie-breaker: furthest forward
-      bestLane = i;
-      bestDist = dist;
-    }
   }
 
-  // Promote imminent danger regardless of minor TTI differences
-  if (dangerLane >= 0) {
-    bestLane = dangerLane;
-    bestTTI = getEffectiveTTI(dangerLane);
-  }
-
-  if (bestLane >= 0 && lastSelectedLane >= 0 && lastSelectedLane != bestLane) {
-    float lastTTI = getEffectiveTTI(lastSelectedLane);
-    bool lastValid = ProxSensors[lastSelectedLane].direction == FORWARD &&
-                     zombieDistances[lastSelectedLane] > getEarlyEngageThreshold(lastSelectedLane) &&
-                     zombieDistances[lastSelectedLane] < MAX_ENGAGE_DISTANCE;
-    bool servedRecently = (millis() - lastSelectionTime) < MIN_SERVICE_TIME;
-    bool meaningfullyBetter = (lastTTI - bestTTI) > SWITCH_TTI_MARGIN;
-    if (lastValid && (!meaningfullyBetter || servedRecently)) {
-      bestLane = lastSelectedLane;
-      bestTTI = lastTTI;
-    }
-  }
-
-  if (bestLane >= 0) {
+  if (selectedLane >= 0) {
     // Remove from queue if it was queued
     for (int i = 0; i < pendingQueueSize; i++) {
-      if (pendingQueue[i] == bestLane) {
+      if (pendingQueue[i] == selectedLane) {
         for (int j = i; j < pendingQueueSize - 1; j++) {
           pendingQueue[j] = pendingQueue[j + 1];
         }
@@ -1655,14 +1613,13 @@ void chooseAndCommitTarget() {
       }
     }
 
-    commitToTarget(bestLane);
+    commitToTarget(selectedLane);
     if (isCommitted) {
       state = MOVE_TO_TARGET;
       systemState = ST_AIM;
-      lastSelectedLane = bestLane;
-      lastSelectedTTI = bestTTI;
+      lastSelectedLane = selectedLane;
       lastSelectionTime = millis();
-      targetAngleDeg = motorCountsToDegrees(targetPositions[bestLane]);
+      targetAngleDeg = motorCountsToDegrees(targetPositions[selectedLane]);
     }
   } else {
     // No targets - go to wait position
@@ -1721,6 +1678,7 @@ void dwellAtTarget() {
     return;
   }
   
+#if ENABLE_OVERRIDES
   // CRITICAL FIX: Check for emergency overrides while dwelling
   // This prevents missing short lane targets (L2/L3) that are getting close while dwelling at long lanes
   // ANTI-OSCILLATION: Check minimum commitment time and cooldown before allowing overrides
@@ -1901,7 +1859,8 @@ void dwellAtTarget() {
       return;  // Exit dwell immediately to handle override
     }
   }
-  
+#endif
+
   // CRITICAL: Safety check - ensure arrivalTime is valid (avoid overflow)
   unsigned long dwellTime = (arrivalTime > 0) ? (millis() - arrivalTime) : 0;
   
@@ -2138,7 +2097,7 @@ void dwellAtTarget() {
   //--------------------------------------------
   // EXIT CONDITION 3: ZOMBIE COMPLETELY GONE
   // CRITICAL FIX: Much more conservative - only mark as GONE if:
-  // 1. Target is beyond lane-specific threshold (85-90% of lane)
+  // 1. Target is beyond lane-specific threshold (~88-92% of lane)
   // 2. Target has been consistently far for extended time
   // 3. Target is moving backward (retreating past the threshold)
   // For short lanes (L2/L3), use even higher threshold (90%+)
@@ -2157,7 +2116,7 @@ void dwellAtTarget() {
   }
   
   // CRITICAL FIX: Much stricter validation - only mark as GONE if zombie is TRULY unreachable
-  // 1. Target must be beyond very conservative threshold (85-90% of lane)
+  // 1. Target must be beyond very conservative threshold (88-92% of lane)
   // 2. Target must be moving backward (retreating past threshold) OR consistently far for extended time
   // 3. Must have dwelt long enough to confirm (prevents false GONE on arrival)
   // 4. For short lanes (L2/L3), require even higher threshold (90%+) since they're critical
@@ -2439,7 +2398,6 @@ void startAutoMode() {
   zombiesKilled = 0;
   zombiesMissed = 0;
   lastSelectedLane = -1;
-  lastSelectedTTI = 99999;
   lastSelectionTime = 0;
   for (int i = 0; i < 4; i++) laneTargetState[i] = LANE_SAFE;
   releaseCommitment();
@@ -2482,7 +2440,7 @@ void updateLaneStates() {
       nextState = LANE_RECOVERING;
     } else if (dir == FORWARD) {
       nextState = LANE_APPROACHING;
-    } else if (dist <= safeThreshold) {
+    } else if (dist >= safeThreshold) {
       nextState = LANE_SAFE;
     }
 
@@ -2793,8 +2751,8 @@ void updateSensors() {
     }
     
     // NOISE FILTER: Ignore targets below 15% that aren't clearly forward
-    // This prevents false locks on sensor noise
-    if (currentDistance > 0.85f && ProxSensors[i].direction == FORWARD) {
+    // This prevents false locks on sensor noise near the start of the lane
+    if (currentDistance < 0.15f && ProxSensors[i].direction == FORWARD) {
       // Very low signal - require stronger evidence
       if (ProxSensors[i].forwardCount < 3) {
         ProxSensors[i].direction = STOPPED;
