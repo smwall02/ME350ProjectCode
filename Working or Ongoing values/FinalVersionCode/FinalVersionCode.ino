@@ -111,6 +111,13 @@ bool laneIsLong[4] = {true, false, false, true};        // Cache lane type (L1/L
 unsigned long lastCriticalUpdate = 0;   // Track when critical status was last updated
 const unsigned long CRITICAL_UPDATE_INTERVAL = 10;  // Update critical status every 10ms
 
+// HYSTERESIS for target selection to avoid rail thrash
+const float SWITCH_TTI_MARGIN = 200.0f;           // Require 200 ms improvement to switch
+const unsigned long MIN_SERVICE_TIME = 350;       // Stay on a lane briefly before switching
+int lastSelectedLane = -1;                        // Track last chosen lane for hysteresis
+float lastSelectedTTI = 99999;                    // Track last chosen lane's effective TTI
+unsigned long lastSelectionTime = 0;
+
 // Get dynamic travel time from current position to target lane
 // OPTIMIZATION: Uses cached encoder position for efficiency
 int getDynamicTravelTime(int targetLane) {
@@ -253,6 +260,9 @@ float timeToImpact[4] = {99999, 99999, 99999, 99999};
 unsigned long lastTTIUpdate = 0;
 const unsigned long TTI_UPDATE_INTERVAL = 25;  // Lowered from 40ms for faster updates
 float prevZombieDistances[4] = {1.0, 1.0, 1.0, 1.0};
+float proxSpeeds[4] = {0, 0, 0, 0};            // Raw proximity delta per ms
+int lastRawReading[4] = {0, 0, 0, 0};          // Previous raw reading for speed
+unsigned long lastRawUpdate[4] = {0, 0, 0, 0}; // Timestamp of last raw update
 
 const int VEL_HISTORY_SIZE = 4;  // Lowered from 5 for faster response
 float velocityHistory[4][VEL_HISTORY_SIZE];
@@ -310,11 +320,12 @@ float getEarlyEngageThreshold(int lane);
 
 //============================================
 // FORWARD PRIORITY HELPER
-// Ensures we always pick the forward-moving target closest to impact
+// Ensures we always pick the forward-moving target closest to impact by TTI
 //============================================
-int getMostAdvancedForwardLane(float &bestDistOut) {
+int getMostAdvancedForwardLane(float &bestTTIOut, float &bestDistOut) {
   int bestLane = -1;
   float bestDist = -1.0f;
+  float bestTTI = 99999.0f;
 
   for (int i = 0; i < 4; i++) {
     if (ProxSensors[i].direction != FORWARD) continue;  // Only forward targets
@@ -329,20 +340,27 @@ int getMostAdvancedForwardLane(float &bestDistOut) {
       if (timeSinceAttempt < ATTEMPT_COOLDOWN) continue;
     }
 
-    // Pick the highest distance (closest to impact); tie-breaker = lower effective TTI
-    if (dist > bestDist) {
+    float effectiveTTI = getEffectiveTTI(i);
+    bool hasValidTTI = effectiveTTI < 99999;
+
+    // Primary: smallest positive TTI
+    if (hasValidTTI && (effectiveTTI + 0.001f < bestTTI - 0.001f)) {
+      bestTTI = effectiveTTI;
       bestDist = dist;
       bestLane = i;
-    } else if (dist == bestDist) {
-      float currentTTI = getEffectiveTTI(i);
-      float bestTTI = (bestLane >= 0) ? getEffectiveTTI(bestLane) : 99999;
-      if (currentTTI < bestTTI) {
-        bestLane = i;
-        bestDist = dist;
-      }
+    } else if (hasValidTTI && abs(effectiveTTI - bestTTI) < 0.001f && dist > bestDist) {
+      // Tie-breaker: farther through the lane wins
+      bestTTI = effectiveTTI;
+      bestDist = dist;
+      bestLane = i;
+    } else if (!hasValidTTI && bestLane < 0 && dist > bestDist) {
+      // Fallback: distance only when no valid TTI
+      bestDist = dist;
+      bestLane = i;
     }
   }
 
+  bestTTIOut = bestTTI;
   bestDistOut = bestDist;
   return bestLane;
 }
@@ -463,7 +481,9 @@ void setup() {
     ProxSensors[i].direction = STOPPED;
     ProxSensors[i].forwardCount = 0;
     ProxSensors[i].backwardCount = 0;
-    
+    lastRawReading[i] = ProxSensors[i].currVal;
+    lastRawUpdate[i] = millis();
+
     for (int j = 0; j < VEL_HISTORY_SIZE; j++) {
       velocityHistory[i][j] = 0;
     }
@@ -704,6 +724,9 @@ void commitToTarget(int lane) {
   commitStartTime = millis();
   commitStartDistance = zombieDistances[lane];
   lastCommitTime = millis();
+  lastSelectedLane = lane;
+  lastSelectedTTI = getEffectiveTTI(lane);
+  lastSelectionTime = millis();
   
   previousTargetIndex = activeTargetIndex;
   activeTargetIndex = lane;
@@ -2280,11 +2303,34 @@ void chooseAndCommitTarget() {
   }
   
   if (bestLane >= 0) {
-    // Final safety: ensure this is the most advanced forward target available
+    // Final safety: ensure this is the earliest forward target by TTI
     float topDist = -1.0f;
-    int topLane = getMostAdvancedForwardLane(topDist);
-    if (topLane >= 0 && topLane != bestLane && topDist > zombieDistances[bestLane]) {
-      bestLane = topLane;  // Promote the lane closest to impact
+    float topTTI = 99999.0f;
+    int topLane = getMostAdvancedForwardLane(topTTI, topDist);
+    float candidateTTI = getEffectiveTTI(bestLane);
+
+    if (topLane >= 0 && topLane != bestLane) {
+      // Promote if TTI is meaningfully sooner or distance gap is large
+      bool promoteByTTI = (candidateTTI >= 99999) || (topTTI + SWITCH_TTI_MARGIN < candidateTTI);
+      bool promoteByDistance = (topDist > zombieDistances[bestLane] + 0.05f);
+      if (promoteByTTI || promoteByDistance) {
+        bestLane = topLane;  // Promote the lane that will hit first
+        candidateTTI = topTTI;
+      }
+    }
+
+    // Hysteresis: avoid thrashing if previously selected lane is still nearly as urgent
+    if (lastSelectedLane >= 0 && lastSelectedLane != bestLane) {
+      float lastTTI = getEffectiveTTI(lastSelectedLane);
+      bool lastValid = ProxSensors[lastSelectedLane].direction == FORWARD &&
+                       zombieDistances[lastSelectedLane] > getEarlyEngageThreshold(lastSelectedLane) &&
+                       zombieDistances[lastSelectedLane] < MIN_ENGAGE_THRESHOLD;
+      bool withinMargin = (candidateTTI + SWITCH_TTI_MARGIN >= lastTTI);
+      bool servedRecently = (millis() - lastSelectionTime) < MIN_SERVICE_TIME;
+      if (lastValid && withinMargin && servedRecently) {
+        bestLane = lastSelectedLane;
+        candidateTTI = lastTTI;
+      }
     }
 
     // Remove from queue if it was queued
@@ -2317,20 +2363,29 @@ void chooseAndCommitTarget() {
 // BREAKS SEQUENCE if a better FORWARD target is farther along
 //============================================
 void chooseAndCommitTargetFromSequence() {
-  // FIRST: Check if any FORWARD lane is farther along than our sequence target
-  // If so, override the sequence and target that lane instead
+  // FIRST: Check if any FORWARD lane will hit sooner than our sequence target
   float bestOverrideDist = -1.0f;
-  int bestOverrideLane = getMostAdvancedForwardLane(bestOverrideDist);
+  float bestOverrideTTI = 99999.0f;
+  int bestOverrideLane = getMostAdvancedForwardLane(bestOverrideTTI, bestOverrideDist);
 
-  // If we found a valid FORWARD target, use it (overrides sequence)
+  // Evaluate sequence head for hysteresis comparison
+  float currentSeqTTI = 99999.0f;
+  int currentSeqLane = (sequenceActive && sequenceIndex < SEQUENCE_SIZE) ? targetSequence[sequenceIndex] : -1;
+  if (currentSeqLane >= 0) currentSeqTTI = getEffectiveTTI(currentSeqLane);
+
+  // If we found a valid FORWARD target that is meaningfully sooner, use it (overrides sequence)
   if (bestOverrideLane >= 0) {
-    // Recalculate sequence starting with this best target
-    calculateNewSequence();
-    commitToTarget(bestOverrideLane);
-    if (isCommitted) {
-      state = MOVE_TO_TARGET;
+    bool sequenceIsStale = (currentSeqLane < 0);
+    bool ttiBeatsSequence = (currentSeqTTI >= 99999) || (bestOverrideTTI + SWITCH_TTI_MARGIN < currentSeqTTI);
+    if (sequenceIsStale || ttiBeatsSequence) {
+      // Recalculate sequence starting with this best target
+      calculateNewSequence();
+      commitToTarget(bestOverrideLane);
+      if (isCommitted) {
+        state = MOVE_TO_TARGET;
+      }
+      return;
     }
-    return;
   }
 
   // If sequence is locked, ONLY get targets from the sequence
@@ -3344,6 +3399,9 @@ void startAutoMode() {
   backwardStartTime = 0;
   zombiesKilled = 0;
   zombiesMissed = 0;
+  lastSelectedLane = -1;
+  lastSelectedTTI = 99999;
+  lastSelectionTime = 0;
   releaseCommitment();
   pendingQueueSize = 0;
   
@@ -3361,6 +3419,7 @@ void resetTTITracking() {
     for (int j = 0; j < VEL_HISTORY_SIZE; j++) {
       velocityHistory[i][j] = 0;
     }
+    proxSpeeds[i] = 0;
   }
   lastTTIUpdate = millis();
 }
@@ -3389,6 +3448,10 @@ void updateTTI() {
     float distChange = zombieDistances[i] - prevZombieDistances[i];  // Positive when approaching impact
     float instantVel = distChange / (float)TTI_UPDATE_INTERVAL;  // velocity in dist%/ms
 
+    // Derive velocity directly from raw sensor delta to improve TTI accuracy
+    float spanCounts = max(1.0f, (float)(ProxRange[i][0] - ProxRange[i][1]));
+    float railVel = -(proxSpeeds[i]) / spanCounts;  // Normalize and flip sign so forward = +
+
     // Store in history for median filtering
     velocityHistory[i][velocityHistoryIndex[i]] = instantVel;
     velocityHistoryIndex[i] = (velocityHistoryIndex[i] + 1) % VEL_HISTORY_SIZE;
@@ -3405,8 +3468,11 @@ void updateTTI() {
     }
     float medianVel = sortedVels[VEL_HISTORY_SIZE / 2];
 
+    // Fuse distance-derived median velocity with raw sensor velocity for robustness
+    float fusedVel = 0.6f * railVel + 0.4f * medianVel;
+
     // Smooth the velocity (EMA filter)
-    zombieVelocities[i] = velocityAlpha * zombieVelocities[i] + (1 - velocityAlpha) * medianVel;
+    zombieVelocities[i] = velocityAlpha * zombieVelocities[i] + (1 - velocityAlpha) * fusedVel;
 
     // Calculate TTI: REMAINING DISTANCE / VELOCITY
     // Remaining distance = 1.0 - zombieDistances[i] (how far until impact)
@@ -3574,6 +3640,13 @@ void updateSensors() {
 
   for (int i = 0; i < 4; i++) {
     int rawVal = analogRead(ProxSensors[i].pin);
+    unsigned long rawNow = now;
+    unsigned long rawDeltaT = rawNow - lastRawUpdate[i];
+    if (rawDeltaT == 0) rawDeltaT = 1;  // Prevent division by zero
+    proxSpeeds[i] = (float)(rawVal - lastRawReading[i]) / (float)rawDeltaT;  // counts per ms
+    lastRawReading[i] = rawVal;
+    lastRawUpdate[i] = rawNow;
+
     ProxSensors[i].currVal = alpha * ProxSensors[i].currVal + (1.0 - alpha) * rawVal;
     ProxSensors[i].smoothVal = velocityAlpha * ProxSensors[i].smoothVal + (1.0 - velocityAlpha) * rawVal;
 
