@@ -462,8 +462,6 @@ void setup() {
   
   Serial.begin(115200);
   Serial.println(F("ME350 Zombie Defense v9"));
-  Serial.println(F("======================="));
-  Serial.println(F("EARLY ENGAGE + AUTO-CAL"));
   
   loadFromEEPROM();
   updateProxScaling();
@@ -570,15 +568,7 @@ void saveToEEPROM() {
 // PRINT HELP
 //============================================
 void printHelp() {
-  Serial.println(F("\n--- COMMANDS ---"));
-  Serial.println(F("T/Y - Start"));
-  Serial.println(F("S - Stop, H - Home"));
-  Serial.println(F("M - Mode info"));
-  Serial.println(F("1-4 - Manual lane"));
-  Serial.println(F("C1-C4 - Capture pos"));
-  Serial.println(F("X - Show calibration"));
-  Serial.println(F("P/W/R/D/?"));
-  Serial.println();
+  Serial.println(F("Cmds: T/Y start, S stop, H home, M mode, 1-4 lane, C1-4 cap, X calib, P/W/R/D/?"));
 }
 
 //============================================
@@ -1439,21 +1429,17 @@ void updateCalibration() {
     // Calibration period over - apply results
     applyCalibration();
     calibrationActive = false;
-    Serial.println(F("=== CALIBRATION COMPLETE ==="));
-    
-    // CRITICAL: Verify ranges are actually updated and will be used
-    Serial.println(F("=== VERIFICATION: Ranges now in use ==="));
+    Serial.print(F("CAL DONE Ranges:"));
     for (int i = 0; i < 4; i++) {
-      Serial.print(F("L"));
+      Serial.print(F(" L"));
       Serial.print(i + 1);
-      Serial.print(F(": ProxRange["));
+      Serial.print(F("=["));
       Serial.print(ProxRange[i][0]);
       Serial.print(F(","));
       Serial.print(ProxRange[i][1]);
-      Serial.print(F("] - Distance calculations will use these values"));
-      Serial.println();
+      Serial.print(F("]"));
     }
-    Serial.println(F("All distance calculations now use calibrated ranges."));
+    Serial.println();
     return;
   }
   
@@ -1624,19 +1610,17 @@ void applyCalibration() {
   // No additional normalization needed - we used calibrationStart (captured at begin) as 0%
   // This ensures targets at their initial position = exactly 0%
 
-  // Force a print of current ranges to verify they were updated
-  Serial.println(F("--- Final Prox Ranges (NOW IN USE) ---"));
+  Serial.println(F("Ranges in use (far,close):"));
   for (int i = 0; i < 4; i++) {
-    Serial.print(F("  L"));
+    Serial.print(F(" L"));
     Serial.print(i + 1);
-    Serial.print(F(": ["));
+    Serial.print(F("=["));
     Serial.print(ProxRange[i][0]);
     Serial.print(F(","));
     Serial.print(ProxRange[i][1]);
-    Serial.print(F("] -> Distance calculation will use these values"));
-    Serial.println();
+    Serial.print(F("]"));
   }
-  Serial.println(F("Calibration ranges are now active and will be used for all distance calculations."));
+  Serial.println();
 }
 
 //============================================
