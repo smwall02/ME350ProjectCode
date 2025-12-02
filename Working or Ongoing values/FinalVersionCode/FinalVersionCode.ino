@@ -1475,10 +1475,10 @@ void loop() {
     // NO COMMITMENT - PICK NEXT TARGET
     //============================================
     else {
-      switch (state) {
-        case IDLE:
-          state = CHOOSE_TARGET;
-          break;
+        switch (state) {
+          case IDLE:
+            state = CHOOSE_TARGET;
+            break;
 
         case CHOOSE_TARGET:
           chooseAndCommitTarget();
@@ -1488,15 +1488,17 @@ void loop() {
           moveToTarget();
           break;
         
-        case DWELL_AT_TARGET:
-          dwellAtTarget();
-          break;
+          case DWELL_AT_TARGET:
+            dwellAtTarget();
+            break;
+        }
       }
     }
-    //============================================
-    // MOTOR CONTROL
-    //============================================
-    if (systemEnabled && digitalRead(ON_OFF_SWITCH_PIN) == HIGH) {
+
+  //============================================
+  // MOTOR CONTROL
+  //============================================
+  if (systemEnabled && digitalRead(ON_OFF_SWITCH_PIN) == HIGH) {
     runPIDController();
   } else {
     stopMotor();
@@ -1506,7 +1508,7 @@ void loop() {
       DBG_PRINTLN(F("Switch OFF"));
     }
   }
-  
+
   //============================================
   // STATUS OUTPUT
   //============================================
@@ -1517,7 +1519,6 @@ void loop() {
 }
 
 // End of main loop
-}
 
 
 //============================================
