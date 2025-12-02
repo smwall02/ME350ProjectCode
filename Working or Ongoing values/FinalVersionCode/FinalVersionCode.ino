@@ -7,6 +7,10 @@
 enum SequenceState { SEQ_STATE_EMPTY = 0, SEQ_STATE_ACTIVE, SEQ_STATE_LOCKED };
 SequenceState lastSeqState = SEQ_STATE_EMPTY;
 
+// Per-lane state machine to reduce thrash and favor forward threats
+enum LaneTargetState { LANE_SAFE = 0, LANE_APPROACHING, LANE_BEING_SERVICED, LANE_RECOVERING };
+LaneTargetState laneTargetState[4] = {LANE_SAFE, LANE_SAFE, LANE_SAFE, LANE_SAFE};
+
 //============================================
 // DEBUG OPTIMIZATION - Comment out to save flash memory
 //============================================
@@ -340,37 +344,57 @@ int getMostAdvancedForwardLane(float &bestTTIOut, float &bestDistOut) {
   int bestLane = -1;
   float bestDist = -1.0f;
   float bestTTI = 99999.0f;
+  bool bestEmergency = false;
+  long bestTravel = 32767;
 
-  for (int i = 0; i < 4; i++) {
-    if (ProxSensors[i].direction != FORWARD) continue;  // Only forward targets
+  // Two-pass: prefer approaching/serviced lanes, then fall back to any forward lane if none found
+  for (int pass = 0; pass < 2 && bestLane < 0; pass++) {
+    for (int i = 0; i < 4; i++) {
+      if (ProxSensors[i].direction != FORWARD) continue;  // Only forward targets
 
-    float dist = zombieDistances[i];
-    float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;  // Ignore out-of-window targets
+      if (pass == 0) {
+        if (laneTargetState[i] != LANE_APPROACHING && laneTargetState[i] != LANE_BEING_SERVICED) continue;
+      }
 
-    // Respect recent attempt cooldown to avoid thrashing
-    if (laneAttempted[i]) {
-      unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
-      if (timeSinceAttempt < ATTEMPT_COOLDOWN) continue;
-    }
+      float dist = zombieDistances[i];
+      float laneThreshold = getEarlyEngageThreshold(i);
+      if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;  // Ignore out-of-window targets
 
-    float effectiveTTI = getEffectiveTTI(i);
-    bool hasValidTTI = effectiveTTI < 99999;
+      // Respect recent attempt cooldown to avoid thrashing
+      if (laneAttempted[i]) {
+        unsigned long timeSinceAttempt = millis() - laneAttemptTime[i];
+        if (timeSinceAttempt < ATTEMPT_COOLDOWN) continue;
+      }
 
-    // Primary: smallest positive TTI
-    if (hasValidTTI && (effectiveTTI + 0.001f < bestTTI - 0.001f)) {
-      bestTTI = effectiveTTI;
-      bestDist = dist;
-      bestLane = i;
-    } else if (hasValidTTI && abs(effectiveTTI - bestTTI) < 0.001f && dist > bestDist) {
-      // Tie-breaker: farther through the lane wins
-      bestTTI = effectiveTTI;
-      bestDist = dist;
-      bestLane = i;
-    } else if (!hasValidTTI && bestLane < 0 && dist > bestDist) {
-      // Fallback: distance only when no valid TTI
-      bestDist = dist;
-      bestLane = i;
+      float effectiveTTI = getEffectiveTTI(i);
+      bool hasValidTTI = effectiveTTI < 99999;
+      bool emergencyBand = dist > ABSOLUTE_OVERRIDE_DISTANCE;
+      long travelTicks = labs(cachedEncoderPos - targetPositions[i]);
+
+      bool choose = false;
+
+      // Primary: smallest positive TTI
+      if (hasValidTTI && (effectiveTTI + 0.001f < bestTTI - 0.001f)) {
+        choose = true;
+      } else if (hasValidTTI && abs(effectiveTTI - bestTTI) < 0.001f) {
+        // Tie-breaker: emergency band prefers closest motor slew, otherwise farther through lane wins
+        if (emergencyBand && bestEmergency) {
+          choose = (travelTicks < bestTravel);
+        } else if (dist > bestDist) {
+          choose = true;
+        }
+      } else if (!hasValidTTI && bestLane < 0 && dist > bestDist) {
+        // Fallback: distance only when no valid TTI
+        choose = true;
+      }
+
+      if (choose) {
+        bestTTI = hasValidTTI ? effectiveTTI : bestTTI;
+        bestDist = dist;
+        bestLane = i;
+        bestEmergency = emergencyBand;
+        bestTravel = travelTicks;
+      }
     }
   }
 
@@ -1781,6 +1805,8 @@ void loop() {
     updateTTI();
     lastTTIUpdate = millis();
   }
+
+  updateLaneStates();
   
   // Update calibration if active (runs alongside normal operation)
   if (calibrationActive) {
@@ -3453,9 +3479,10 @@ void startAutoMode() {
   lastSelectedLane = -1;
   lastSelectedTTI = 99999;
   lastSelectionTime = 0;
+  for (int i = 0; i < 4; i++) laneTargetState[i] = LANE_SAFE;
   releaseCommitment();
   pendingQueueSize = 0;
-  
+
 }
 
 //============================================
@@ -3473,6 +3500,32 @@ void resetTTITracking() {
     proxSpeeds[i] = 0;
   }
   lastTTIUpdate = millis();
+}
+
+//============================================
+// PER-LANE STATE TRACKING
+// Keeps lightweight intent per rail to cut thrash
+//============================================
+void updateLaneStates() {
+  for (int i = 0; i < 4; i++) {
+    float dist = zombieDistances[i];
+    int dir = ProxSensors[i].direction;
+    float safeThreshold = (i == 3) ? L4_GONE_DISTANCE : ((i == 1 || i == 2) ? L2_L3_GONE_DISTANCE : ZOMBIE_GONE_DISTANCE);
+
+    LaneTargetState nextState = laneTargetState[i];
+
+    if (isCommitted && committedLane == i) {
+      nextState = LANE_BEING_SERVICED;
+    } else if (dir == BACKWARD) {
+      nextState = LANE_RECOVERING;
+    } else if (dir == FORWARD) {
+      nextState = LANE_APPROACHING;
+    } else if (dist <= safeThreshold) {
+      nextState = LANE_SAFE;
+    }
+
+    laneTargetState[i] = nextState;
+  }
 }
 
 void recordHit(int lane) {
