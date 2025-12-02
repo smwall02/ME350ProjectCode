@@ -1363,7 +1363,11 @@ void applyCalibration() {
   for (int i = 0; i < 4; i++) {
     // Use calibrationStart (captured at begin) as 0% baseline
     // Use calibrationMin (tracked during cal) as 100% impact point
-    int startVal = calibrationStart[i];  // Initial reading = 0%
+    // Use the highest observed value as the "start" reference. If the user moved a target
+    // closer to the sensor after calibration began, calibrationMax will capture it. This
+    // avoids compressing the usable range around a stale initial reading.
+    int startVal = max(calibrationStart[i], calibrationMax[i]);  // Initial/maximum = 0%
+    // Impact is always the lowest value we observed (target far from sensor)
     int impactVal = calibrationMin[i];   // Minimum reading = 100%
     int range = startVal - impactVal;
 
@@ -1379,8 +1383,16 @@ void applyCalibration() {
     Serial.print(F(", range="));
     Serial.println(range);
 
-    // Check if we have valid calibration data (range > 100 for good resolution)
-    if (range > 100 && impactVal < startVal) {
+    // Treat untouched sensors as invalid; they will keep defaults
+    if (!calibrationUpdated[i]) {
+      Serial.print(F("  L"));
+      Serial.print(i + 1);
+      Serial.println(F(": no movement captured, keeping existing range"));
+      continue;
+    }
+
+    // Check if we have valid calibration data (range > 150 for good resolution)
+    if (range > 150 && impactVal < startVal) {
       // Use the INITIAL reading (calibrationStart) as 0%
       // Use the MINIMUM seen (calibrationMin) as 100%
       int newFar = startVal;    // Start/0% = initial reading
@@ -1390,8 +1402,9 @@ void applyCalibration() {
       newFar = min(newFar + 2, 1023);
       newClose = max(newClose - 2, 0);
       
-      // Final sanity check - ensure reasonable range remains (very permissive: 50)
-      if (newFar > newClose && (newFar - newClose) > 50) {
+      // Final sanity check - ensure reasonable range remains (tightened to 120 counts)
+      int finalRange = newFar - newClose;
+      if (newFar > newClose && finalRange > 120) {
         // Save OLD values before updating for comparison
         int oldFar = ProxRange[i][0];
         int oldClose = ProxRange[i][1];
@@ -1417,13 +1430,13 @@ void applyCalibration() {
         Serial.print(F(","));
         Serial.print(newClose);
         Serial.print(F("] range="));
-        Serial.print(newFar - newClose);
+        Serial.print(finalRange);
         Serial.println(F(" [APPLIED & SAVED]"));
       } else {
         Serial.print(F("  L"));
         Serial.print(i + 1);
         Serial.print(F(": range too small after margins ("));
-        Serial.print(newFar - newClose);
+        Serial.print(finalRange);
         Serial.println(F("), keeping default"));
       }
     } else {
