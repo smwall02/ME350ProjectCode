@@ -95,7 +95,7 @@ float targetAngleDeg = 0.0f;
 float laneTTI[4] = {9999, 9999, 9999, 9999};
 unsigned long lastVelUpdateMicros = 0;
 unsigned long dwellStartMillis = 0;
-const unsigned long SENSOR_DWELL_TIME_MS = 350;  // Ensure 350ms on-target dwell
+const unsigned long SENSOR_DWELL_TIME_MS = 400;  // Ensure 400ms on-target dwell
 
 // Hardware helpers
 const int LASER_PIN = 4;
@@ -433,8 +433,8 @@ unsigned long arrivalTime = 0;
 float peakZombieDistance = 0.0;
 float arrivalZombieDistance = 0.0;
 
-const unsigned long MIN_DWELL_TIME = 350;  // Ensure at least 350ms on target
-const unsigned long NORMAL_DWELL_TIME = 350;
+const unsigned long MIN_DWELL_TIME = 400;  // Ensure at least 400ms on target
+const unsigned long NORMAL_DWELL_TIME = 400;
 const unsigned long MAX_DWELL_TIME = 850;
 const unsigned long L4_DWELL_TIME = 1050;
 
