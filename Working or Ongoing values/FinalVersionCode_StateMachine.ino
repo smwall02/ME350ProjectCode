@@ -9,7 +9,7 @@ LaneTargetState laneTargetState[4] = {LANE_SAFE, LANE_SAFE, LANE_SAFE, LANE_SAFE
 // DEBUG OPTIMIZATION - Comment out to save flash memory
 //============================================
 // Uncomment the line below to enable debug Serial output (disabled by default to save flash)
-// #define DEBUG_SERIAL  // ENABLED to surface lane tracking logs
+#define DEBUG_SERIAL  // ENABLED to surface lane tracking logs
 
 #ifdef DEBUG_SERIAL
   #define DBG_PRINT(x) Serial.print(x)
@@ -2742,6 +2742,40 @@ void printStatus() {
 }
 
 //============================================
+// Lane decision logging helpers
+//============================================
+void logLaneSnapshot(const char* label, int selectedLane) {
+  #ifdef DEBUG_SERIAL
+  Serial.print(F("[LANES] "));
+  Serial.print(label);
+  Serial.print(F(" sel="));
+  if (selectedLane >= 0) Serial.print(selectedLane + 1); else Serial.print(F("-"));
+  Serial.print(F(" commit="));
+  if (committedLane >= 0) Serial.print(committedLane + 1); else Serial.print(F("-"));
+  Serial.print(F(" enc="));
+  Serial.print(cachedEncoderPos);
+  Serial.print(F(" tgtAng="));
+  Serial.print(targetAngleDeg, 1);
+
+  for (int i = 0; i < 4; i++) {
+    Serial.print(F(" |L"));
+    Serial.print(i + 1);
+    Serial.print(F(" pos="));
+    Serial.print(targetPositions[i]);
+    Serial.print(F(" dist="));
+    Serial.print(zombieDistances[i], 2);
+    Serial.print(F(" dir="));
+    if (ProxSensors[i].direction == FORWARD) Serial.print(F("F"));
+    else if (ProxSensors[i].direction == BACKWARD) Serial.print(F("B"));
+    else Serial.print(F("-"));
+    Serial.print(F(" tti="));
+    if (laneTTI[i] < 99999) Serial.print(laneTTI[i], 0); else Serial.print(F("-"));
+  }
+  Serial.println();
+  #endif
+}
+
+//============================================
 // HIGH-LEVEL STATE MACHINE HELPERS
 //============================================
 void runStateMachine(unsigned long nowMillis) {
@@ -2818,11 +2852,13 @@ void handleIdleState() {
 
 void handleSelectLaneState() {
   if (!gameRunning) {
+    logLaneSnapshot("idle", -1);
     systemState = ST_IDLE;
     return;
   }
 
   int bestLane = pickMostDangerousLane();
+  logLaneSnapshot("select", bestLane);
   if (bestLane < 0) {
     systemState = ST_IDLE;
     return;
@@ -2940,6 +2976,7 @@ void handleAimState() {
   }
 
   if (currentLane >= 0 && ProxSensors[currentLane].direction != FORWARD) {
+    logLaneSnapshot("backward", currentLane);
     laserOff();
     releaseCommitment();
     state = CHOOSE_TARGET;
@@ -2948,6 +2985,7 @@ void handleAimState() {
   }
 
   if (atTargetAngle()) {
+    logLaneSnapshot("aim-ok", currentLane);
     laserOn();
     dwellStartMillis = millis();
     systemState = ST_FIRE_DWELL;
@@ -2957,6 +2995,7 @@ void handleAimState() {
 void handleFireDwellState(unsigned long nowMillis) {
   unsigned long elapsed = nowMillis - dwellStartMillis;
   if (elapsed >= SENSOR_DWELL_TIME_MS) {
+    logLaneSnapshot("dwell-done", currentLane);
     laserOff();
     if (!gameRunning) {
       releaseCommitment();
