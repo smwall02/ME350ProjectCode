@@ -5,7 +5,7 @@
 // DEBUG OPTIMIZATION - Comment out to save flash memory
 //============================================
 // Uncomment the line below to enable debug Serial output
-// #define DEBUG_SERIAL  // DISABLED for faster processing
+#define DEBUG_SERIAL  // ENABLED to surface lane tracking and sequence logging
 
 #ifdef DEBUG_SERIAL
   #define DBG_PRINT(x) Serial.print(x)
@@ -420,6 +420,7 @@ void addToPendingQueue(int lane);
 int getBestTarget();
 int getNextFromQueue();
 void updatePendingQueue();
+void logSequence(const char *reason);
 void updateCalibration();
 void applyCalibration();
 void stopMotor();
@@ -1140,6 +1141,8 @@ void calculateNewSequence() {
 
   sequenceActive = (sequenceCount > 0);
   sequenceLocked = false;
+
+  logSequence("new batch");
 }
 
 // Forward declaration
@@ -1150,6 +1153,7 @@ int getNextSequenceTarget() {
   // If sequence is empty or exhausted, calculate new one
   if (!sequenceActive || sequenceIndex >= SEQUENCE_SIZE) {
     calculateNewSequence();
+    logSequence("recalc/empty");
     if (!sequenceActive) return -1;
   }
 
@@ -1157,6 +1161,7 @@ int getNextSequenceTarget() {
   // If so, recalculate sequence to prioritize critical lanes
   if (shouldRecalculateForLowLane()) {
     calculateNewSequence();
+    logSequence("recalc/urgent");
     if (!sequenceActive) return -1;
   }
 
@@ -1208,6 +1213,7 @@ int getNextSequenceTarget() {
   
   // Sequence exhausted, calculate new one
   calculateNewSequence();
+  logSequence("recalc/exhausted");
   if (!sequenceActive) return -1;
   
   // Return first target of new sequence
@@ -1227,6 +1233,25 @@ void resetSequence() {
   for (int i = 0; i < SEQUENCE_SIZE; i++) {
     targetSequence[i] = -1;
   }
+
+  logSequence("reset");
+}
+
+// Debug helper to show the current sequence batch and index
+void logSequence(const char *reason) {
+#ifdef DEBUG_SERIAL
+  Serial.print(F("[SEQ] "));
+  Serial.print(reason);
+  Serial.print(F(" idx="));
+  Serial.print(sequenceIndex);
+  Serial.print(F(" lanes:"));
+  for (int i = 0; i < SEQUENCE_SIZE; i++) {
+    Serial.print(F(" "));
+    if (targetSequence[i] >= 0) Serial.print(targetSequence[i] + 1);
+    else Serial.print(F("-"));
+  }
+  Serial.println();
+#endif
 }
 
 // Check if any lane needs urgent attention based on TTI or distance
