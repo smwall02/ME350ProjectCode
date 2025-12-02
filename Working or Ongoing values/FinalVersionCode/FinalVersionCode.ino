@@ -178,7 +178,7 @@ const int SHORT_LANE_BOOST = 150;
 // MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
 const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
 const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
-const float MIN_ENGAGE_THRESHOLD = 1.01;  // Upper cap intentionally above normalized range (0-1)
+const float MAX_ENGAGE_DISTANCE = 0.65;  // Do not plan hits past 65% through a lane
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
@@ -191,10 +191,11 @@ float getEarlyEngageThreshold(int lane) {
 
 // NEW SEMANTICS: 0% = at start, 100% = at impact (traveled through lane)
 // Higher values = more urgent (closer to impact)
-const float OVERRIDE_THRESHOLD[4] = {0.90, 0.50, 0.50, 0.90};  // Override when > this % through lane
-const float ABSOLUTE_OVERRIDE_DISTANCE = 0.92;  // Critical when > 92% through lane
-const float SHORT_LANE_CRITICAL_DISTANCE = 0.50;  // L2/L3 critical at 50% through lane
-const float LONG_LANE_CRITICAL_DISTANCE = 0.85;  // L1/L4 critical at 85% through lane
+const float OVERRIDE_THRESHOLD[4] = {0.70, 0.45, 0.45, 0.70};  // Override when > this % through lane
+const float ABSOLUTE_OVERRIDE_DISTANCE = 0.75;  // Critical when > 75% through lane
+const float SHORT_LANE_CRITICAL_DISTANCE = 0.35;  // L2/L3 critical at 35% through lane
+const float LONG_LANE_CRITICAL_DISTANCE = 0.60;  // L1/L4 critical at 60% through lane
+const float TARGET_ZONE_MAX = 0.40;  // Desired "comfort" zone: keep zombies under 40%
 const unsigned long MIN_COMMITMENT_TIME = 800;  // Minimum 800ms commitment before allowing overrides
 const unsigned long TARGET_SWITCH_COOLDOWN = 1500;  // 1.5s cooldown after switching targets
 
@@ -358,7 +359,7 @@ int getMostAdvancedForwardLane(float &bestTTIOut, float &bestDistOut) {
 
       float dist = zombieDistances[i];
       float laneThreshold = getEarlyEngageThreshold(i);
-      if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;  // Ignore out-of-window targets
+      if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;  // Ignore out-of-window targets
 
       // Respect recent attempt cooldown to avoid thrashing
       if (laneAttempted[i]) {
@@ -668,8 +669,8 @@ void commitToTarget(int lane) {
   bool isEmergency = (dist > ABSOLUTE_OVERRIDE_DISTANCE && ProxSensors[lane].direction == FORWARD);
   if (!isEmergency) {
     float laneThreshold = getEarlyEngageThreshold(lane);
-    // Valid range: dist > laneThreshold (upper cap intentionally disabled by MIN_ENGAGE_THRESHOLD > 1)
-    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) return;
+    // Valid range: dist > laneThreshold and below planned engage ceiling
+    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) return;
     if (ProxSensors[lane].direction != FORWARD) return;
     if (sequenceLocked && sequenceActive && committedLane >= 0) {
       bool isInSequence = false;
@@ -707,7 +708,7 @@ void commitToTarget(int lane) {
         if (i != lane &&
             ProxSensors[i].direction == FORWARD &&
             zombieDistances[i] > getEarlyEngageThreshold(i) &&
-            zombieDistances[i] < MIN_ENGAGE_THRESHOLD) {
+            zombieDistances[i] < MAX_ENGAGE_DISTANCE) {
           if (zombieDistances[i] > closestDist) {  // Higher = closer to impact
             closestDist = zombieDistances[i];
             closestLane = i;
@@ -1027,9 +1028,9 @@ int getBestTarget() {
     
     float dist = zombieDistances[i];
     // Use lane-specific threshold - L2/L3 engage earlier
-    // Upper cap intentionally disabled (MIN_ENGAGE_THRESHOLD > 1) so we prioritize far-through targets
+    // Respect the planned engage ceiling to avoid flirting with impact
     float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;
+    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
     
     float score = calculateThreatScore(i);
     if (score > bestScore) {
@@ -1253,7 +1254,7 @@ int getNextSequenceTarget() {
     // Lanes 1 and 4 (indices 0 and 3): require >= 30%
     float minThreshold = (lane == 1 || lane == 2) ? 0.0 : 0.30;
     bool isInRange = (zombieDistances[lane] >= minThreshold &&
-                      zombieDistances[lane] < MIN_ENGAGE_THRESHOLD);
+                      zombieDistances[lane] < MAX_ENGAGE_DISTANCE);
     
     // If target is backward-moving, skip it
     if (isBackward) {
@@ -1404,7 +1405,7 @@ bool shouldRecalculateForLowLane() {
     }
 
     // Also trigger on distance threshold as backup
-    if (dist >= LOW_LANE_THRESHOLD && dist < MIN_ENGAGE_THRESHOLD) {
+    if (dist >= LOW_LANE_THRESHOLD && dist < MAX_ENGAGE_DISTANCE) {
       return true;
     }
   }
@@ -2346,9 +2347,9 @@ void chooseAndCommitTarget() {
     
     float dist = zombieDistances[lane];
     // Use lane-specific threshold - L2/L3 engage earlier
-    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
+    // Valid range is dist > laneThreshold AND dist < MAX_ENGAGE_DISTANCE
     float laneThreshold = getEarlyEngageThreshold(lane);
-    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;
+    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
 
     float score = calculateThreatScore(lane);
     if (score > bestScore) {
@@ -2367,9 +2368,9 @@ void chooseAndCommitTarget() {
     float dist = zombieDistances[i];
 
     // Skip if zombie is outside valid engagement range - use lane-specific threshold
-    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
+    // Valid range is dist > laneThreshold AND dist < MAX_ENGAGE_DISTANCE
     float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;
+    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
     
     float score = calculateThreatScore(i);
     
@@ -2401,7 +2402,7 @@ void chooseAndCommitTarget() {
       float lastTTI = getEffectiveTTI(lastSelectedLane);
       bool lastValid = ProxSensors[lastSelectedLane].direction == FORWARD &&
                        zombieDistances[lastSelectedLane] > getEarlyEngageThreshold(lastSelectedLane) &&
-                       zombieDistances[lastSelectedLane] < MIN_ENGAGE_THRESHOLD;
+                       zombieDistances[lastSelectedLane] < MAX_ENGAGE_DISTANCE;
       bool withinMargin = (candidateTTI + SWITCH_TTI_MARGIN >= lastTTI);
       bool servedRecently = (millis() - lastSelectionTime) < MIN_SERVICE_TIME;
       if (lastValid && withinMargin && servedRecently) {
@@ -2505,7 +2506,7 @@ void chooseAndCommitTargetFromSequence() {
         float minThreshold = (nextLane == 1 || nextLane == 2) ? 0.0 : 0.30;
         bool isValidStandard = (ProxSensors[nextLane].direction == FORWARD &&
                                 zombieDistances[nextLane] >= minThreshold &&
-                                zombieDistances[nextLane] < MIN_ENGAGE_THRESHOLD &&
+                                zombieDistances[nextLane] < MAX_ENGAGE_DISTANCE &&
                                 !recentlyAttempted);
 
         if (isValidStandard) {
@@ -3647,6 +3648,9 @@ float calculateThreatScore(int lane) {
     return dist * 50 * LANE_PRIORITY[lane];
   }
   if (ProxSensors[lane].direction != FORWARD) return 0;
+  float zoneError = max(0.0f, dist - TARGET_ZONE_MAX);  // Pressure once past the comfort zone
+  float zoneWeight = (lane == 1 || lane == 2) ? 1600.0f : 1200.0f;
+  score += zoneError * zoneWeight;
   float effectiveTTI = getEffectiveTTI(lane);
   float rawTTI = timeToImpact[lane];
   if (rawTTI < 99999 && effectiveTTI < 5000) {
