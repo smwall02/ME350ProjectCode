@@ -3703,6 +3703,16 @@ void printStatus() {
   Serial.print(desiredPosition);
   Serial.print(F(" T:"));
   Serial.print(activeTargetIndex + 1);
+
+  // Show configured lane target positions on every auto-mode status log
+  Serial.print(F(" |Lanes:"));
+  for (int i = 0; i < 4; i++) {
+    Serial.print(F(" L"));
+    Serial.print(i + 1);
+    Serial.print(F("="));
+    Serial.print(targetPositions[i]);
+    Serial.print(F(" "));
+  }
   
   if (isCommitted) {
     Serial.print(F(" [L"));
