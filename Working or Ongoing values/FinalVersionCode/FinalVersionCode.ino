@@ -318,13 +318,13 @@ int getMostAdvancedForwardLane(float &bestTTIOut, float &bestDistOut) {
   int bestLane = -1;
   float bestDist = -1.0f;
   float bestTTI = 99999.0f;
-  bool bestEmergency = false;
   long bestTravel = 32767;
 
   // Two-pass: prefer approaching/serviced lanes, then fall back to any forward lane if none found
   for (int pass = 0; pass < 2 && bestLane < 0; pass++) {
     for (int i = 0; i < 4; i++) {
-      if (ProxSensors[i].direction != FORWARD) continue;  // Only forward targets
+      // HARD GUARD: never select backward or stopped lanes here
+      if (ProxSensors[i].direction != FORWARD) continue;
 
       if (pass == 0) {
         if (laneTargetState[i] != LANE_APPROACHING && laneTargetState[i] != LANE_BEING_SERVICED) continue;
@@ -342,31 +342,27 @@ int getMostAdvancedForwardLane(float &bestTTIOut, float &bestDistOut) {
 
       float effectiveTTI = getEffectiveTTI(i);
       bool hasValidTTI = effectiveTTI < 99999;
-      bool emergencyBand = dist > ABSOLUTE_OVERRIDE_DISTANCE;
       long travelTicks = labs(cachedEncoderPos - targetPositions[i]);
 
       bool choose = false;
 
-      // Primary: smallest positive TTI
-      if (hasValidTTI && (effectiveTTI + 0.001f < bestTTI - 0.001f)) {
+      // PRIMARY: pick the target furthest forward (highest dist)
+      if (dist > bestDist + 0.001f) {
         choose = true;
-      } else if (hasValidTTI && abs(effectiveTTI - bestTTI) < 0.001f) {
-        // Tie-breaker: emergency band prefers closest motor slew, otherwise farther through lane wins
-        if (emergencyBand && bestEmergency) {
-          choose = (travelTicks < bestTravel);
-        } else if (dist > bestDist) {
+      } else if (abs(dist - bestDist) <= 0.001f) {
+        // Tie-breaker: prefer lower TTI if both are similarly forward
+        if (hasValidTTI && (effectiveTTI + 0.001f < bestTTI - 0.001f)) {
           choose = true;
+        } else if (hasValidTTI && abs(effectiveTTI - bestTTI) < 0.001f) {
+          // Final tie-breaker: shorter travel for faster slew
+          choose = (travelTicks < bestTravel);
         }
-      } else if (!hasValidTTI && bestLane < 0 && dist > bestDist) {
-        // Fallback: distance only when no valid TTI
-        choose = true;
       }
 
       if (choose) {
         bestTTI = hasValidTTI ? effectiveTTI : bestTTI;
         bestDist = dist;
         bestLane = i;
-        bestEmergency = emergencyBand;
         bestTravel = travelTicks;
       }
     }
@@ -2522,6 +2518,9 @@ void updateTTI() {
 // L2/L3 get BOOST (lower effective TTI = more urgent)
 //============================================
 float getEffectiveTTI(int lane) {
+  // Immediately de-prioritize backward or stopped movement
+  if (ProxSensors[lane].direction != FORWARD) return 99999;
+
   if (timeToImpact[lane] >= 99999) return 99999;
   int dynamicTravel = getDynamicTravelTime(lane);
   float effectiveTTI = timeToImpact[lane] - dynamicTravel;
