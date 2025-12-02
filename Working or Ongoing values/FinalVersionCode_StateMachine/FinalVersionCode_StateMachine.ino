@@ -137,11 +137,11 @@ bool laneIsLong[4] = {true, false, false, true};        // Cache lane type (L1/L
 unsigned long lastCriticalUpdate = 0;   // Track when critical status was last updated
 const unsigned long CRITICAL_UPDATE_INTERVAL = 10;  // Update critical status every 10ms
 
-// HYSTERESIS for target selection to avoid rail thrash
-const float SWITCH_TTI_MARGIN = 200.0f;           // Require 200 ms improvement to switch
-const unsigned long MIN_SERVICE_TIME = 350;       // Stay on a lane briefly before switching
-int lastSelectedLane = -1;                        // Track last chosen lane for hysteresis
-float lastSelectedTTI = 99999;                    // Track last chosen lane's effective TTI
+// SIMPLE, STICKY LANE SELECTION
+const float MIN_LOCK_PCT = 0.20f;    // Minimum progress (0.0-1.0) required to lock a lane
+const float HOLD_PCT = 0.10f;        // Keep current lane if it's still above this progress
+const float PREEMPT_MARGIN = 0.15f;  // Only switch if a new lane is ahead by this margin
+int lastSelectedLane = -1;           // Track last chosen lane for visibility/debugging
 unsigned long lastSelectionTime = 0;
 const float DANGER_ZONE_DISTANCE = 0.82;          // Emergency promotion threshold
 const unsigned long SENSOR_DWELL_TIME_MS = 60;    // Laser on-time for photosensor
@@ -738,7 +738,6 @@ void commitToTarget(int lane) {
   commitStartDistance = zombieDistances[lane];
   lastCommitTime = millis();
   lastSelectedLane = lane;
-  lastSelectedTTI = getEffectiveTTI(lane);
   lastSelectionTime = millis();
   
   previousTargetIndex = activeTargetIndex;
@@ -1587,66 +1586,59 @@ void loop() {
 // CHOOSE AND COMMIT TO TARGET
 //============================================
 void chooseAndCommitTarget() {
-  // Always prioritize smallest positive TTI, with emergency danger handling and hysteresis
-  int bestLane = -1;
-  float bestTTI = 99999.0f;
-  float bestDist = 0.0f;
-  int dangerLane = -1;
-  float dangerDist = 0.0f;
+  // Do not select or lock lanes during calibration
+  if (calibrationActive) {
+    desiredPosition = WAIT_POSITION;
+    WAIT_POS = true;
+    activeTargetIndex = -1;
+    releaseCommitment();
+    systemState = ST_IDLE;
+    return;
+  }
+
+  int furthestLane = -1;
+  float furthestPct = -1.0f;
 
   updatePendingQueue();  // Clean stale queue entries
 
   for (int i = 0; i < 4; i++) {
     if (ProxSensors[i].direction != FORWARD) continue;
 
-    float dist = zombieDistances[i];
-    float laneThreshold = getEarlyEngageThreshold(i);
-    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
+    float pct = zombieDistances[i];
+    if (pct < MIN_LOCK_PCT || pct > MAX_ENGAGE_DISTANCE) continue;
 
-    float effectiveTTI = getEffectiveTTI(i);
-    laneTTI[i] = effectiveTTI;
+    bool choose = false;
+    if (pct > furthestPct + 0.0001f) {
+      choose = true;
+    } else if (abs(pct - furthestPct) <= 0.0001f && i > furthestLane) {
+      // Tie-breaker: prefer higher-numbered lane when progress is equal
+      choose = true;
+    }
 
-    if (dist >= DANGER_ZONE_DISTANCE && effectiveTTI < 99999) {
-      if (dist > dangerDist) {
-        dangerLane = i;
-        dangerDist = dist;
+    if (choose) {
+      furthestLane = i;
+      furthestPct = pct;
+    }
+  }
+
+  int selectedLane = furthestLane;
+
+  // Stickiness: stay on the current committed lane unless another is clearly ahead
+  if (committedLane >= 0 && ProxSensors[committedLane].direction == FORWARD) {
+    float committedPct = zombieDistances[committedLane];
+    if (committedPct >= HOLD_PCT) {
+      bool otherAhead = (furthestLane >= 0 && furthestLane != committedLane &&
+                         (furthestPct - committedPct) >= PREEMPT_MARGIN);
+      if (!otherAhead) {
+        selectedLane = committedLane;
       }
     }
-
-    if (effectiveTTI > 0 && effectiveTTI < bestTTI) {
-      bestTTI = effectiveTTI;
-      bestLane = i;
-      bestDist = dist;
-    } else if (effectiveTTI >= 0 && abs(effectiveTTI - bestTTI) < 1.0f && dist > bestDist) {
-      // Tie-breaker: furthest forward
-      bestLane = i;
-      bestDist = dist;
-    }
   }
 
-  // Promote imminent danger regardless of minor TTI differences
-  if (dangerLane >= 0) {
-    bestLane = dangerLane;
-    bestTTI = getEffectiveTTI(dangerLane);
-  }
-
-  if (bestLane >= 0 && lastSelectedLane >= 0 && lastSelectedLane != bestLane) {
-    float lastTTI = getEffectiveTTI(lastSelectedLane);
-    bool lastValid = ProxSensors[lastSelectedLane].direction == FORWARD &&
-                     zombieDistances[lastSelectedLane] > getEarlyEngageThreshold(lastSelectedLane) &&
-                     zombieDistances[lastSelectedLane] < MAX_ENGAGE_DISTANCE;
-    bool servedRecently = (millis() - lastSelectionTime) < MIN_SERVICE_TIME;
-    bool meaningfullyBetter = (lastTTI - bestTTI) > SWITCH_TTI_MARGIN;
-    if (lastValid && (!meaningfullyBetter || servedRecently)) {
-      bestLane = lastSelectedLane;
-      bestTTI = lastTTI;
-    }
-  }
-
-  if (bestLane >= 0) {
+  if (selectedLane >= 0) {
     // Remove from queue if it was queued
     for (int i = 0; i < pendingQueueSize; i++) {
-      if (pendingQueue[i] == bestLane) {
+      if (pendingQueue[i] == selectedLane) {
         for (int j = i; j < pendingQueueSize - 1; j++) {
           pendingQueue[j] = pendingQueue[j + 1];
         }
@@ -1655,14 +1647,13 @@ void chooseAndCommitTarget() {
       }
     }
 
-    commitToTarget(bestLane);
+    commitToTarget(selectedLane);
     if (isCommitted) {
       state = MOVE_TO_TARGET;
       systemState = ST_AIM;
-      lastSelectedLane = bestLane;
-      lastSelectedTTI = bestTTI;
+      lastSelectedLane = selectedLane;
       lastSelectionTime = millis();
-      targetAngleDeg = motorCountsToDegrees(targetPositions[bestLane]);
+      targetAngleDeg = motorCountsToDegrees(targetPositions[selectedLane]);
     }
   } else {
     // No targets - go to wait position
@@ -2439,7 +2430,6 @@ void startAutoMode() {
   zombiesKilled = 0;
   zombiesMissed = 0;
   lastSelectedLane = -1;
-  lastSelectedTTI = 99999;
   lastSelectionTime = 0;
   for (int i = 0; i < 4; i++) laneTargetState[i] = LANE_SAFE;
   releaseCommitment();
