@@ -62,6 +62,28 @@ enum State {
 
 State state = IDLE;
 
+// Secondary state machine with explicit AIM/FIRE dwell handling
+enum SystemState {
+  ST_IDLE = 0,
+  ST_HOME,
+  ST_SELECT_LANE,
+  ST_AIM,
+  ST_FIRE_DWELL,
+  ST_PAUSE,
+  ST_ERROR
+};
+
+SystemState systemState = ST_IDLE;
+
+// Hardware helpers
+const int LASER_PIN = 4;
+const float COUNTS_PER_DEGREE = 11.4f;  // Approximate conversion for motor linkage
+float targetAngleDeg = 0.0f;
+unsigned long dwellStartMillis = 0;
+bool pauseClearedByCommand = false;
+bool gameRunning = false;
+int requestedManualLane = -1;
+
 const int FORWARD = 1;
 const int BACKWARD = -1;
 const int STOPPED = 0;
@@ -121,6 +143,8 @@ const unsigned long MIN_SERVICE_TIME = 350;       // Stay on a lane briefly befo
 int lastSelectedLane = -1;                        // Track last chosen lane for hysteresis
 float lastSelectedTTI = 99999;                    // Track last chosen lane's effective TTI
 unsigned long lastSelectionTime = 0;
+const float DANGER_ZONE_DISTANCE = 0.82;          // Emergency promotion threshold
+const unsigned long SENSOR_DWELL_TIME_MS = 60;    // Laser on-time for photosensor
 
 // Get dynamic travel time from current position to target lane
 // OPTIMIZATION: Uses cached encoder position for efficiency
@@ -250,12 +274,14 @@ struct ProxSensor {
 ProxSensor ProxSensors[4];
 
 const float alpha = 0.75;           // Lowered from 0.85 - much faster response (25% new data)
-const float velocityAlpha = 0.70;   // Lowered from 0.80 - faster velocity tracking  
+const float velocityAlpha = 0.70;   // Lowered from 0.80 - faster velocity tracking
 const int stopTimeout = 80;         // Lowered from 100 - faster STOPPED detection
 // Noise thresholds are derived per-sensor during updates to avoid cross-lane coupling.
 const int lowerNoiseLimit = 5;      // Lowered from 6
 const int upperNoiseLimit = 8;      // Lowered from 10
 const int noiseThreshold = 225;
+const unsigned long MIN_VEL_COMP_TIME = 5000;  // micros between velocity updates
+const int MIN_VEL_COMP_COUNT = 2;              // encoder counts needed for update
 
 //============================================
 // TTI TRACKING
@@ -266,6 +292,8 @@ unsigned long lastTTIUpdate = 0;
 const unsigned long TTI_UPDATE_INTERVAL = 25;  // Lowered from 40ms for faster updates
 float prevZombieDistances[4] = {1.0, 1.0, 1.0, 1.0};
 float proxSpeeds[4] = {0, 0, 0, 0};            // Raw proximity delta per ms
+float laneTTI[4] = {99999, 99999, 99999, 99999};
+float prevSmoothProx[4] = {0, 0, 0, 0};
 int lastRawReading[4] = {0, 0, 0, 0};          // Previous raw reading for speed
 unsigned long lastRawUpdate[4] = {0, 0, 0, 0}; // Timestamp of last raw update
 
@@ -454,6 +482,24 @@ void stopMotor();
 void setMotorVoltage(float voltage);
 void recordHit(int lane);
 void updateProxScaling();
+void initHardware();
+void encoderISR();
+void setMotorPWM(int pwm);
+void setMotorDirection(int dir);
+bool isHomeSwitchActive();
+void laserOn();
+void laserOff();
+float motorCountsToDegrees(long counts);
+long motorDegreesToCounts(float deg);
+void updateMotorVelocity(unsigned long nowMicros);
+void updateThreatModel(unsigned long nowMillis);
+int pickMostDangerousLane();
+void readSerialCommands();
+bool atTargetAngle();
+void handleAimState();
+void handleFireDwellState(unsigned long nowMillis);
+void handlePauseState();
+void handleErrorState();
 
 //============================================
 // SETUP
@@ -467,7 +513,9 @@ void setup() {
   pinMode(MOTOR_ENA, OUTPUT);
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_IN3, OUTPUT);
-  
+  pinMode(LASER_PIN, OUTPUT);
+  initHardware();
+
   Serial.begin(115200);
   Serial.println(F("ME350 Zombie Defense v9"));
   
@@ -489,6 +537,8 @@ void setup() {
     ProxSensors[i].backwardCount = 0;
     lastRawReading[i] = ProxSensors[i].currVal;
     lastRawUpdate[i] = millis();
+    prevSmoothProx[i] = ProxSensors[i].smoothVal;
+    laneTTI[i] = 99999;
 
     for (int j = 0; j < VEL_HISTORY_SIZE; j++) {
       velocityHistory[i][j] = 0;
@@ -1112,8 +1162,9 @@ void startCalibration() {
 void loop() {
   executionDuration = micros() - lastExecutionTime;
   lastExecutionTime = micros();
-  
+
   processSerialCommands();
+  readSerialCommands();
   
   // OPTIMIZATION: Cache encoder position to avoid multiple reads
   unsigned long now = millis();
@@ -1508,6 +1559,21 @@ void loop() {
   //============================================
   // STATUS OUTPUT
   //============================================
+  switch (state) {
+    case CHOOSE_TARGET: systemState = ST_SELECT_LANE; break;
+    case MOVE_TO_TARGET: systemState = ST_AIM; break;
+    case DWELL_AT_TARGET: systemState = ST_FIRE_DWELL; break;
+    default: systemState = ST_IDLE; break;
+  }
+
+  updateThreatModel(now);
+
+  if (systemState == ST_AIM) {
+    handleAimState();
+  } else if (systemState == ST_FIRE_DWELL) {
+    handleFireDwellState(now);
+  }
+
   if (autoMode && (millis() - lastPrintTime >= 350)) {  // Reduced from 200ms to 350ms for faster processing
     lastPrintTime = millis();
     printStatus();
@@ -1521,85 +1587,63 @@ void loop() {
 // CHOOSE AND COMMIT TO TARGET
 //============================================
 void chooseAndCommitTarget() {
-  // Find the best target from ALL sources - queue AND new detections
+  // Always prioritize smallest positive TTI, with emergency danger handling and hysteresis
   int bestLane = -1;
-  float bestScore = 0;
-  
-  // Check pending queue first
-  updatePendingQueue();  // Clean up stale entries
-  for (int i = 0; i < pendingQueueSize; i++) {
-    int lane = pendingQueue[i];
-    if (lane < 0 || lane > 3) continue;
-    // CRITICAL: NEVER target backward-moving zombies - they're retreating!
-    if (ProxSensors[lane].direction == BACKWARD) continue;
-    if (ProxSensors[lane].direction != FORWARD) continue;
-    
-    float dist = zombieDistances[lane];
-    // Use lane-specific threshold - L2/L3 engage earlier
-    // Valid range is dist > laneThreshold AND dist < MAX_ENGAGE_DISTANCE
-    float laneThreshold = getEarlyEngageThreshold(lane);
-    if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
+  float bestTTI = 99999.0f;
+  float bestDist = 0.0f;
+  int dangerLane = -1;
+  float dangerDist = 0.0f;
 
-    float score = calculateThreatScore(lane);
-    if (score > bestScore) {
-      bestScore = score;
-      bestLane = lane;
-    }
-  }
+  updatePendingQueue();  // Clean stale queue entries
 
-  // Now check all lanes for new targets - might be better than queued
   for (int i = 0; i < 4; i++) {
-    // CRITICAL: NEVER target backward-moving zombies - they're retreating!
-    if (ProxSensors[i].direction == BACKWARD) continue;
-    // Skip non-forward targets
     if (ProxSensors[i].direction != FORWARD) continue;
 
     float dist = zombieDistances[i];
-
-    // Skip if zombie is outside valid engagement range - use lane-specific threshold
-    // Valid range is dist > laneThreshold AND dist < MAX_ENGAGE_DISTANCE
     float laneThreshold = getEarlyEngageThreshold(i);
     if (dist < laneThreshold || dist > MAX_ENGAGE_DISTANCE) continue;
-    
-    float score = calculateThreatScore(i);
-    
-    if (score > bestScore) {
-      bestScore = score;
+
+    float effectiveTTI = getEffectiveTTI(i);
+    laneTTI[i] = effectiveTTI;
+
+    if (dist >= DANGER_ZONE_DISTANCE && effectiveTTI < 99999) {
+      if (dist > dangerDist) {
+        dangerLane = i;
+        dangerDist = dist;
+      }
+    }
+
+    if (effectiveTTI > 0 && effectiveTTI < bestTTI) {
+      bestTTI = effectiveTTI;
       bestLane = i;
+      bestDist = dist;
+    } else if (effectiveTTI >= 0 && abs(effectiveTTI - bestTTI) < 1.0f && dist > bestDist) {
+      // Tie-breaker: furthest forward
+      bestLane = i;
+      bestDist = dist;
     }
   }
-  
+
+  // Promote imminent danger regardless of minor TTI differences
+  if (dangerLane >= 0) {
+    bestLane = dangerLane;
+    bestTTI = getEffectiveTTI(dangerLane);
+  }
+
+  if (bestLane >= 0 && lastSelectedLane >= 0 && lastSelectedLane != bestLane) {
+    float lastTTI = getEffectiveTTI(lastSelectedLane);
+    bool lastValid = ProxSensors[lastSelectedLane].direction == FORWARD &&
+                     zombieDistances[lastSelectedLane] > getEarlyEngageThreshold(lastSelectedLane) &&
+                     zombieDistances[lastSelectedLane] < MAX_ENGAGE_DISTANCE;
+    bool servedRecently = (millis() - lastSelectionTime) < MIN_SERVICE_TIME;
+    bool meaningfullyBetter = (lastTTI - bestTTI) > SWITCH_TTI_MARGIN;
+    if (lastValid && (!meaningfullyBetter || servedRecently)) {
+      bestLane = lastSelectedLane;
+      bestTTI = lastTTI;
+    }
+  }
+
   if (bestLane >= 0) {
-    // Final safety: ensure this is the earliest forward target by TTI
-    float topDist = -1.0f;
-    float topTTI = 99999.0f;
-    int topLane = getMostAdvancedForwardLane(topTTI, topDist);
-    float candidateTTI = getEffectiveTTI(bestLane);
-
-    if (topLane >= 0 && topLane != bestLane) {
-      // Promote if TTI is meaningfully sooner or distance gap is large
-      bool promoteByTTI = (candidateTTI >= 99999) || (topTTI + SWITCH_TTI_MARGIN < candidateTTI);
-      bool promoteByDistance = (topDist > zombieDistances[bestLane] + 0.05f);
-      if (promoteByTTI || promoteByDistance) {
-        bestLane = topLane;  // Promote the lane that will hit first
-        candidateTTI = topTTI;
-      }
-    }
-
-    // Hysteresis: avoid thrashing if previously selected lane is still nearly as urgent
-    if (lastSelectedLane >= 0 && lastSelectedLane != bestLane) {
-      float lastTTI = getEffectiveTTI(lastSelectedLane);
-      bool lastValid = ProxSensors[lastSelectedLane].direction == FORWARD &&
-                       zombieDistances[lastSelectedLane] > getEarlyEngageThreshold(lastSelectedLane) &&
-                       zombieDistances[lastSelectedLane] < MAX_ENGAGE_DISTANCE;
-      bool withinMargin = (candidateTTI + SWITCH_TTI_MARGIN >= lastTTI);
-      bool servedRecently = (millis() - lastSelectionTime) < MIN_SERVICE_TIME;
-      if (lastValid && withinMargin && servedRecently) {
-        bestLane = lastSelectedLane;
-        candidateTTI = lastTTI;
-      }
-    }
-
     // Remove from queue if it was queued
     for (int i = 0; i < pendingQueueSize; i++) {
       if (pendingQueue[i] == bestLane) {
@@ -1610,10 +1654,15 @@ void chooseAndCommitTarget() {
         break;
       }
     }
-    
+
     commitToTarget(bestLane);
     if (isCommitted) {
       state = MOVE_TO_TARGET;
+      systemState = ST_AIM;
+      lastSelectedLane = bestLane;
+      lastSelectedTTI = bestTTI;
+      lastSelectionTime = millis();
+      targetAngleDeg = motorCountsToDegrees(targetPositions[bestLane]);
     }
   } else {
     // No targets - go to wait position
@@ -1621,6 +1670,7 @@ void chooseAndCommitTarget() {
     WAIT_POS = true;
     activeTargetIndex = -1;
     releaseCommitment();
+    systemState = ST_IDLE;
   }
 }
 
@@ -1647,6 +1697,10 @@ void moveToTarget() {
     if (WAIT_POS) {
       state = CHOOSE_TARGET;
     } else {
+      laserOn();
+      dwellStartMillis = millis();
+      systemState = ST_FIRE_DWELL;
+      targetAngleDeg = motorCountsToDegrees(desiredPosition);
       state = DWELL_AT_TARGET;
       if (verboseMode) {
         DBG_PRINT(F("~ARRIVE L"));
@@ -2458,11 +2512,16 @@ void updateTTI() {
     // Calculate velocity: positive = moving TOWARD impact (distance increasing)
     // zombieDistances: 0% = start, 100% = impact
     float distChange = zombieDistances[i] - prevZombieDistances[i];  // Positive when approaching impact
-    float instantVel = distChange / (float)TTI_UPDATE_INTERVAL;  // velocity in dist%/ms
+    float instantVel = distChange / (float)TTI_UPDATE_INTERVAL;      // velocity in dist%/ms
 
     // Derive velocity directly from raw sensor delta to improve TTI accuracy
     float spanCounts = max(1.0f, (float)(ProxRange[i][0] - ProxRange[i][1]));
     float railVel = -(proxSpeeds[i]) / spanCounts;  // Normalize and flip sign so forward = +
+
+    // Use filtered proximity deltas per rail to stabilize speed estimation
+    float filteredCountsDelta = prevSmoothProx[i] - ProxSensors[i].smoothVal;  // forward => positive
+    float filteredRailVel = (filteredCountsDelta * proxRangeScaled[i]) / (float)TTI_UPDATE_INTERVAL;
+    prevSmoothProx[i] = ProxSensors[i].smoothVal;
 
     // Store in history for median filtering
     velocityHistory[i][velocityHistoryIndex[i]] = instantVel;
@@ -2480,8 +2539,8 @@ void updateTTI() {
     }
     float medianVel = sortedVels[VEL_HISTORY_SIZE / 2];
 
-    // Fuse distance-derived median velocity with raw sensor velocity for robustness
-    float fusedVel = 0.6f * railVel + 0.4f * medianVel;
+    // Fuse distance-derived median velocity with filtered sensor velocity for robustness
+    float fusedVel = 0.5f * filteredRailVel + 0.3f * railVel + 0.2f * medianVel;
 
     // Smooth the velocity (EMA filter)
     zombieVelocities[i] = velocityAlpha * zombieVelocities[i] + (1 - velocityAlpha) * fusedVel;
@@ -2508,6 +2567,7 @@ void updateTTI() {
     }
 
     timeToImpact[i] = constrain(timeToImpact[i], 0, 99999);
+    laneTTI[i] = timeToImpact[i];
     prevZombieDistances[i] = zombieDistances[i];
   }
 }
@@ -2521,9 +2581,10 @@ float getEffectiveTTI(int lane) {
   // Immediately de-prioritize backward or stopped movement
   if (ProxSensors[lane].direction != FORWARD) return 99999;
 
-  if (timeToImpact[lane] >= 99999) return 99999;
+  float baseTTI = (laneTTI[lane] < 99999) ? laneTTI[lane] : timeToImpact[lane];
+  if (baseTTI >= 99999) return 99999;
   int dynamicTravel = getDynamicTravelTime(lane);
-  float effectiveTTI = timeToImpact[lane] - dynamicTravel;
+  float effectiveTTI = baseTTI - dynamicTravel;
   // SHORT LANE BOOST for L2/L3 - they need earlier action!
   // By subtracting boost, their effective TTI becomes LOWER = MORE URGENT
   if (lane == 1 || lane == 2) effectiveTTI -= SHORT_LANE_BOOST;
@@ -2809,6 +2870,59 @@ void runPIDController() {
   setMotorVoltage(voltage);
 }
 
+// Helper wrappers for state-machine driven control
+void initHardware() {
+  laserOff();
+}
+
+void encoderISR() {
+  // Encoder library handles updates; placeholder provided for completeness
+}
+
+void setMotorPWM(int pwm) {
+  analogWrite(MOTOR_ENA, constrain(pwm, 0, 255));
+}
+
+void setMotorDirection(int dir) {
+  if (dir > 0) {
+    digitalWrite(MOTOR_IN2, HIGH);
+    digitalWrite(MOTOR_IN3, LOW);
+  } else if (dir < 0) {
+    digitalWrite(MOTOR_IN2, LOW);
+    digitalWrite(MOTOR_IN3, HIGH);
+  } else {
+    digitalWrite(MOTOR_IN2, LOW);
+    digitalWrite(MOTOR_IN3, LOW);
+  }
+}
+
+bool isHomeSwitchActive() {
+  return digitalRead(LIMIT_LEFT) == HIGH;
+}
+
+void laserOn() { digitalWrite(LASER_PIN, HIGH); }
+void laserOff() { digitalWrite(LASER_PIN, LOW); }
+
+float motorCountsToDegrees(long counts) { return (float)counts / COUNTS_PER_DEGREE; }
+long motorDegreesToCounts(float deg) { return (long)(deg * COUNTS_PER_DEGREE); }
+
+void updateMotorVelocity(unsigned long nowMicros) {
+  static long lastPos = 0;
+  static unsigned long lastTime = 0;
+
+  if (nowMicros - lastTime < MIN_VEL_COMP_TIME) return;
+
+  long pos = encoder.read();
+  long deltaCounts = pos - lastPos;
+  unsigned long deltaMicros = nowMicros - lastTime;
+
+  if (abs(deltaCounts) >= MIN_VEL_COMP_COUNT && deltaMicros > 0) {
+    motorVelocity = (float)deltaCounts * 1e6 / (float)deltaMicros;
+    lastPos = pos;
+    lastTime = nowMicros;
+  }
+}
+
 //============================================
 // MOTOR CONTROL
 //============================================
@@ -2928,4 +3042,117 @@ void printStatus() {
   Serial.print(F(" M:"));
   Serial.println(zombiesMissed);
   #endif
+}
+
+//============================================
+// Threat model helpers for per-rail TTI selection
+//============================================
+void updateThreatModel(unsigned long nowMillis) {
+  if (nowMillis - lastTTIUpdate >= TTI_UPDATE_INTERVAL) {
+    updateTTI();
+    lastTTIUpdate = nowMillis;
+  }
+  for (int i = 0; i < 4; i++) {
+    laneTTI[i] = getEffectiveTTI(i);
+  }
+}
+
+int pickMostDangerousLane() {
+  int bestIdx = -1;
+  float bestTTI = 999999.0f;
+  for (int i = 0; i < 4; i++) {
+    if (ProxSensors[i].direction != FORWARD) continue;
+    float tti = laneTTI[i];
+    if (tti > 0 && tti < bestTTI) {
+      bestTTI = tti;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+//============================================
+// Command handling
+//============================================
+void readSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    switch (c) {
+      case 'G':
+        autoMode = true;
+        gameRunning = true;
+        systemState = ST_SELECT_LANE;
+        break;
+      case 'S':
+        gameRunning = false;
+        autoMode = false;
+        systemState = ST_IDLE;
+        break;
+      case 'H':
+        gameRunning = false;
+        systemState = ST_HOME;
+        break;
+      case 'M':
+        gameRunning = false;
+        autoMode = false;
+        requestedManualLane = (requestedManualLane + 1) % 4;
+        systemState = ST_IDLE;
+        break;
+      case '1': case '2': case '3': case '4':
+        gameRunning = false;
+        autoMode = false;
+        requestedManualLane = (int)(c - '1');
+        systemState = ST_IDLE;
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+//============================================
+// AIM and FIRE dwell helpers
+//============================================
+bool atTargetAngle() {
+  float currentDeg = motorCountsToDegrees(encoder.read());
+  return fabs(currentDeg - targetAngleDeg) <= 1.0f;
+}
+
+void handleAimState() {
+  if (!gameRunning && !autoMode) {
+    systemState = ST_IDLE;
+    return;
+  }
+
+  if (atTargetAngle()) {
+    laserOn();
+    dwellStartMillis = millis();
+    systemState = ST_FIRE_DWELL;
+  }
+}
+
+void handleFireDwellState(unsigned long nowMillis) {
+  unsigned long elapsed = nowMillis - dwellStartMillis;
+  if (elapsed >= SENSOR_DWELL_TIME_MS) {
+    laserOff();
+    if (!gameRunning) {
+      systemState = ST_IDLE;
+    } else {
+      systemState = ST_SELECT_LANE;
+    }
+  }
+}
+
+void handlePauseState() {
+  stopMotor();
+  laserOff();
+  if (pauseClearedByCommand) {
+    systemState = ST_IDLE;
+    pauseClearedByCommand = false;
+  }
+}
+
+void handleErrorState() {
+  stopMotor();
+  laserOff();
 }
