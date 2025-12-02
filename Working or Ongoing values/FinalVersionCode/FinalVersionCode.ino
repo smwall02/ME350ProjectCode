@@ -192,11 +192,13 @@ const float L4_GONE_DISTANCE = 0.10;  // L4 gone when < 10% through
 bool calibrationActive = false;
 unsigned long calibrationStartTime = 0;
 const unsigned long CALIBRATION_DURATION = 10000;  // 10 seconds of calibration
+unsigned long lastCalibrationLogTime = 0;
 
 // Track min/max readings per lane during calibration
 int calibrationMin[4] = {1023, 1023, 1023, 1023};  // Impact (low reading)
 int calibrationMax[4] = {0, 0, 0, 0};              // Start (high reading)
 int calibrationStart[4] = {0, 0, 0, 0};            // Initial reading at calibration start (= 0%)
+int calibrationRaw[4] = {0, 0, 0, 0};              // Latest raw readings during calibration
 bool calibrationUpdated[4] = {false, false, false, false};
 
 //============================================
@@ -1331,13 +1333,14 @@ void updateCalibration() {
   
   // Update min/max for each lane based on RAW analog readings (not smoothed!)
   // CRITICAL: Must use raw analogRead() to capture true min/max values
-  // Calibration mapping:
-  // - Start (0%): HIGH sensor reading (target far from sensor) = calibrationMax
-  // - Impact (100%): LOW sensor reading (target close to sensor) = calibrationMin
+  // Calibration mapping (sensor is mounted near lane start):
+  // - Start (0%): HIGH sensor reading (target close to sensor) = calibrationMax
+  // - Impact (100%): LOW sensor reading (target far from sensor) = calibrationMin
   for (int i = 0; i < 4; i++) {
     // Use raw analog reading directly - smoothed values won't capture true extremes
     int rawVal = analogRead(ProxSensors[i].pin);
-    
+    calibrationRaw[i] = rawVal;  // Capture latest raw value for logging
+
     // Track minimum (impact/100% = lowest sensor reading when target is closest)
     // Track maximum (start/0% = highest sensor reading when target is at beginning)
     // Sensor behavior: LOW value = target close (at impact/100%), HIGH value = target far (at start/0%)
@@ -1350,6 +1353,27 @@ void updateCalibration() {
       calibrationMax[i] = rawVal;  // Maximum = target at start/0% (highest reading, may be slightly +/-)
       calibrationUpdated[i] = true;
     }
+  }
+
+  // Periodically log raw readings to verify orientation and movement during calibration
+  const unsigned long CALIBRATION_LOG_INTERVAL = 1000;  // ms
+  if (elapsed - lastCalibrationLogTime >= CALIBRATION_LOG_INTERVAL) {
+    Serial.print(F("[CAL] t="));
+    Serial.print(elapsed / 1000);
+    Serial.print(F("s raw/min/max -> "));
+    for (int i = 0; i < 4; i++) {
+      Serial.print(F("L"));
+      Serial.print(i + 1);
+      Serial.print(F("("));
+      Serial.print(calibrationRaw[i]);
+      Serial.print(F("/"));
+      Serial.print(calibrationMin[i]);
+      Serial.print(F("/"));
+      Serial.print(calibrationMax[i]);
+      Serial.print(F(") "));
+    }
+    Serial.println();
+    lastCalibrationLogTime = elapsed;
   }
 }
 
@@ -1448,7 +1472,11 @@ void applyCalibration() {
       Serial.print(calibrationMin[i]);
       Serial.print(F(", max="));
       Serial.print(calibrationMax[i]);
-      Serial.println(F("), keeping default"));
+      Serial.print(F(")"));
+      if (impactVal >= startVal) {
+        Serial.print(F(" [expected IMPACT < START; verify sensor orientation]"));
+      }
+      Serial.println(F(", keeping default"));
     }
   }
 
@@ -1497,7 +1525,8 @@ void updateProxScaling() {
 void startCalibration() {
   calibrationActive = true;
   calibrationStartTime = millis();
-  
+  lastCalibrationLogTime = 0;
+
   // CRITICAL: Move mechanism to encoder home (position 0) and keep it there during calibration
   desiredPosition = 0;
   systemEnabled = true;  // Ensure PID controller is active to maintain position
