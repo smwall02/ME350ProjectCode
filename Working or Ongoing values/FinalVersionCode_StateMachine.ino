@@ -216,7 +216,7 @@ const int SHORT_LANE_BOOST = 150;
 // MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
 const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
 const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
-const float MAX_ENGAGE_DISTANCE = 0.98;  // Allow targeting up to 98% through a lane (near impact)
+const float MAX_ENGAGE_DISTANCE = 0.95f;  // Allow planning up to 95% through a lane (near impact)
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
@@ -3018,6 +3018,43 @@ void handleAimState() {
 
 void handleFireDwellState(unsigned long nowMillis) {
   unsigned long elapsed = nowMillis - dwellStartMillis;
+  // After half the dwell window, allow an emergency bail-out if another lane is about to impact
+  if (elapsed >= (SENSOR_DWELL_TIME_MS / 2) && gameRunning) {
+    int emergencyLane = -1;
+    float bestDist = 0.0f;
+    float currentDist = (currentLane >= 0) ? zombieDistances[currentLane] : 0.0f;
+
+    for (int i = 0; i < 4; i++) {
+      if (i == currentLane) continue;                     // ignore current lane
+      if (ProxSensors[i].direction != FORWARD) continue;  // only forward-moving threats
+
+      float dist = zombieDistances[i];  // 0 = start, 1 = impact
+      // Only bail if the alternate lane is much further along and near impact
+      if (dist >= 0.90f && dist > currentDist + 0.15f && dist > bestDist) {
+        emergencyLane = i;
+        bestDist = dist;
+      }
+    }
+
+    if (emergencyLane >= 0) {
+      logLaneSnapshot("override-dwell", emergencyLane);
+      laserOff();
+      releaseCommitment();
+      arrivalTime = 0;  // Reset dwell timers for the new lane
+      currentLane = emergencyLane;
+      targetAngleDeg = motorCountsToDegrees(targetPositions[emergencyLane]);
+      commitToTarget(emergencyLane);
+      if (isCommitted) {
+        state = MOVE_TO_TARGET;
+        dwellStartMillis = nowMillis;  // reset dwell timing for new lane
+        systemState = ST_AIM;
+      } else {
+        systemState = ST_SELECT_LANE;
+      }
+      return;
+    }
+  }
+
   if (elapsed >= SENSOR_DWELL_TIME_MS) {
     logLaneSnapshot("dwell-done", currentLane);
     laserOff();
