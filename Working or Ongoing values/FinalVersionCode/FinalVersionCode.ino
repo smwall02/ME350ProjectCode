@@ -158,10 +158,10 @@ const int TTI_MAX_ENGAGE[4] = {2200, 3000, 3000, 2200};
 const int SHORT_LANE_BOOST = 150;
 // NEW SEMANTICS: 0% = start, 100% = impact
 // EARLY_ENGAGE = minimum % through lane to engage (lower = engage earlier)
-// MIN_ENGAGE = maximum % through lane to engage (don't engage if past this = about to impact)
+// MIN_ENGAGE = maximum % through lane to engage (set above 1 to allow engaging near impact)
 const float EARLY_ENGAGE_THRESHOLD_LONG[2] = {0.08, 0.08};   // Engage L1/L4 when > 8% through
 const float EARLY_ENGAGE_THRESHOLD_SHORT[2] = {0.05, 0.05};  // Engage L2/L3 when > 5% through
-const float MIN_ENGAGE_THRESHOLD = 0.95;  // Don't engage when > 95% through (about to impact)
+const float MIN_ENGAGE_THRESHOLD = 1.01;  // Upper cap intentionally above normalized range (0-1)
 
 // Get lane-specific engagement threshold
 float getEarlyEngageThreshold(int lane) {
@@ -192,11 +192,13 @@ const float L4_GONE_DISTANCE = 0.10;  // L4 gone when < 10% through
 bool calibrationActive = false;
 unsigned long calibrationStartTime = 0;
 const unsigned long CALIBRATION_DURATION = 10000;  // 10 seconds of calibration
+unsigned long lastCalibrationLogTime = 0;
 
 // Track min/max readings per lane during calibration
 int calibrationMin[4] = {1023, 1023, 1023, 1023};  // Impact (low reading)
 int calibrationMax[4] = {0, 0, 0, 0};              // Start (high reading)
 int calibrationStart[4] = {0, 0, 0, 0};            // Initial reading at calibration start (= 0%)
+int calibrationRaw[4] = {0, 0, 0, 0};              // Latest raw readings during calibration
 bool calibrationUpdated[4] = {false, false, false, false};
 
 //============================================
@@ -213,6 +215,11 @@ int ProxRange[4][2] = {
   {620, 90},   // Lane 3: [start/0%, impact/100%] - ~530 range
   {650, 135}   // Lane 4: [start/0%, impact/100%] - ~515 range
 };
+
+// Precomputed proximity scaling for faster sensor updates
+float proxRangeInv[4] = {0, 0, 0, 0};
+float proxRangeScaled[4] = {0, 0, 0, 0};
+float laneDistanceScale[4] = {1.0f, 1.12f, 1.12f, 1.0f};
 
 //============================================
 // PROXIMITY SENSORS
@@ -375,6 +382,7 @@ void applyCalibration();
 void stopMotor();
 void setMotorVoltage(float voltage);
 void recordHit(int lane);
+void updateProxScaling();
 
 //============================================
 // SETUP
@@ -395,6 +403,7 @@ void setup() {
   Serial.println(F("EARLY ENGAGE + AUTO-CAL"));
   
   loadFromEEPROM();
+  updateProxScaling();
   
   ProxSensors[0].pin = PROX_SENSOR_1;
   ProxSensors[1].pin = PROX_SENSOR_2;
@@ -466,6 +475,8 @@ void loadFromEEPROM() {
       Serial.println(F("), using default"));
     }
   }
+
+  updateProxScaling();
 }
 
 //============================================
@@ -563,7 +574,7 @@ void commitToTarget(int lane) {
   bool isEmergency = (dist > ABSOLUTE_OVERRIDE_DISTANCE && ProxSensors[lane].direction == FORWARD);
   if (!isEmergency) {
     float laneThreshold = getEarlyEngageThreshold(lane);
-    // Valid range: dist > laneThreshold (past minimum) AND dist < MIN_ENGAGE (not too close to impact)
+    // Valid range: dist > laneThreshold (upper cap intentionally disabled by MIN_ENGAGE_THRESHOLD > 1)
     if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) return;
     if (ProxSensors[lane].direction != FORWARD) return;
     if (sequenceLocked && sequenceActive && committedLane >= 0) {
@@ -910,7 +921,7 @@ int getBestTarget() {
     
     float dist = zombieDistances[i];
     // Use lane-specific threshold - L2/L3 engage earlier
-    // NEW SEMANTICS: Valid range is dist > laneThreshold AND dist < MIN_ENGAGE_THRESHOLD
+    // Upper cap intentionally disabled (MIN_ENGAGE_THRESHOLD > 1) so we prioritize far-through targets
     float laneThreshold = getEarlyEngageThreshold(i);
     if (dist < laneThreshold || dist > MIN_ENGAGE_THRESHOLD) continue;
     
@@ -1322,13 +1333,14 @@ void updateCalibration() {
   
   // Update min/max for each lane based on RAW analog readings (not smoothed!)
   // CRITICAL: Must use raw analogRead() to capture true min/max values
-  // Calibration mapping:
-  // - Start (0%): HIGH sensor reading (target far from sensor) = calibrationMax
-  // - Impact (100%): LOW sensor reading (target close to sensor) = calibrationMin
+  // Calibration mapping (sensor is mounted near lane start):
+  // - Start (0%): HIGH sensor reading (target close to sensor) = calibrationMax
+  // - Impact (100%): LOW sensor reading (target far from sensor) = calibrationMin
   for (int i = 0; i < 4; i++) {
     // Use raw analog reading directly - smoothed values won't capture true extremes
     int rawVal = analogRead(ProxSensors[i].pin);
-    
+    calibrationRaw[i] = rawVal;  // Capture latest raw value for logging
+
     // Track minimum (impact/100% = lowest sensor reading when target is closest)
     // Track maximum (start/0% = highest sensor reading when target is at beginning)
     // Sensor behavior: LOW value = target close (at impact/100%), HIGH value = target far (at start/0%)
@@ -1342,6 +1354,27 @@ void updateCalibration() {
       calibrationUpdated[i] = true;
     }
   }
+
+  // Periodically log raw readings to verify orientation and movement during calibration
+  const unsigned long CALIBRATION_LOG_INTERVAL = 1000;  // ms
+  if (elapsed - lastCalibrationLogTime >= CALIBRATION_LOG_INTERVAL) {
+    Serial.print(F("[CAL] t="));
+    Serial.print(elapsed / 1000);
+    Serial.print(F("s raw/min/max -> "));
+    for (int i = 0; i < 4; i++) {
+      Serial.print(F("L"));
+      Serial.print(i + 1);
+      Serial.print(F("("));
+      Serial.print(calibrationRaw[i]);
+      Serial.print(F("/"));
+      Serial.print(calibrationMin[i]);
+      Serial.print(F("/"));
+      Serial.print(calibrationMax[i]);
+      Serial.print(F(") "));
+    }
+    Serial.println();
+    lastCalibrationLogTime = elapsed;
+  }
 }
 
 //============================================
@@ -1354,7 +1387,11 @@ void applyCalibration() {
   for (int i = 0; i < 4; i++) {
     // Use calibrationStart (captured at begin) as 0% baseline
     // Use calibrationMin (tracked during cal) as 100% impact point
-    int startVal = calibrationStart[i];  // Initial reading = 0%
+    // Use the highest observed value as the "start" reference. If the user moved a target
+    // closer to the sensor after calibration began, calibrationMax will capture it. This
+    // avoids compressing the usable range around a stale initial reading.
+    int startVal = max(calibrationStart[i], calibrationMax[i]);  // Initial/maximum = 0%
+    // Impact is always the lowest value we observed (target far from sensor)
     int impactVal = calibrationMin[i];   // Minimum reading = 100%
     int range = startVal - impactVal;
 
@@ -1370,8 +1407,16 @@ void applyCalibration() {
     Serial.print(F(", range="));
     Serial.println(range);
 
-    // Check if we have valid calibration data (range > 100 for good resolution)
-    if (range > 100 && impactVal < startVal) {
+    // Treat untouched sensors as invalid; they will keep defaults
+    if (!calibrationUpdated[i]) {
+      Serial.print(F("  L"));
+      Serial.print(i + 1);
+      Serial.println(F(": no movement captured, keeping existing range"));
+      continue;
+    }
+
+    // Check if we have valid calibration data (range > 150 for good resolution)
+    if (range > 150 && impactVal < startVal) {
       // Use the INITIAL reading (calibrationStart) as 0%
       // Use the MINIMUM seen (calibrationMin) as 100%
       int newFar = startVal;    // Start/0% = initial reading
@@ -1381,8 +1426,9 @@ void applyCalibration() {
       newFar = min(newFar + 2, 1023);
       newClose = max(newClose - 2, 0);
       
-      // Final sanity check - ensure reasonable range remains (very permissive: 50)
-      if (newFar > newClose && (newFar - newClose) > 50) {
+      // Final sanity check - ensure reasonable range remains (tightened to 120 counts)
+      int finalRange = newFar - newClose;
+      if (newFar > newClose && finalRange > 120) {
         // Save OLD values before updating for comparison
         int oldFar = ProxRange[i][0];
         int oldClose = ProxRange[i][1];
@@ -1408,13 +1454,13 @@ void applyCalibration() {
         Serial.print(F(","));
         Serial.print(newClose);
         Serial.print(F("] range="));
-        Serial.print(newFar - newClose);
+        Serial.print(finalRange);
         Serial.println(F(" [APPLIED & SAVED]"));
       } else {
         Serial.print(F("  L"));
         Serial.print(i + 1);
         Serial.print(F(": range too small after margins ("));
-        Serial.print(newFar - newClose);
+        Serial.print(finalRange);
         Serial.println(F("), keeping default"));
       }
     } else {
@@ -1426,10 +1472,16 @@ void applyCalibration() {
       Serial.print(calibrationMin[i]);
       Serial.print(F(", max="));
       Serial.print(calibrationMax[i]);
-      Serial.println(F("), keeping default"));
+      Serial.print(F(")"));
+      if (impactVal >= startVal) {
+        Serial.print(F(" [expected IMPACT < START; verify sensor orientation]"));
+      }
+      Serial.println(F(", keeping default"));
     }
   }
-  
+
+  updateProxScaling();
+
   // No additional normalization needed - we used calibrationStart (captured at begin) as 0%
   // This ensures targets at their initial position = exactly 0%
 
@@ -1449,12 +1501,32 @@ void applyCalibration() {
 }
 
 //============================================
+// PRECOMPUTE PROXIMITY SCALING
+// Calculates spans and inverses to avoid repeated division in updateSensors()
+//============================================
+void updateProxScaling() {
+  for (int i = 0; i < 4; i++) {
+    float span = (float)(ProxRange[i][0] - ProxRange[i][1]);
+
+    // Prevent divide-by-zero and ensure reasonable defaults
+    if (span < 1.0f) {
+      span = 1.0f;
+    }
+
+    proxRangeInv[i] = 1.0f / span;
+    // Combine lane scaling to remove an extra multiply per updateSensors() call
+    proxRangeScaled[i] = laneDistanceScale[i] * proxRangeInv[i];
+  }
+}
+
+//============================================
 // START CALIBRATION
 //============================================
 void startCalibration() {
   calibrationActive = true;
   calibrationStartTime = millis();
-  
+  lastCalibrationLogTime = 0;
+
   // CRITICAL: Move mechanism to encoder home (position 0) and keep it there during calibration
   desiredPosition = 0;
   systemEnabled = true;  // Ensure PID controller is active to maintain position
@@ -1522,6 +1594,16 @@ void loop() {
   // Update calibration if active (runs alongside normal operation)
   if (calibrationActive) {
     updateCalibration();
+  }
+
+  // If our committed target starts retreating, abandon it and pick a new threat
+  if (autoMode && systemEnabled && isCommitted && committedLane >= 0 &&
+      ProxSensors[committedLane].direction == BACKWARD) {
+    laneAttempted[committedLane] = true;
+    laneAttemptTime[committedLane] = millis();
+    activeTargetIndex = -1;
+    releaseCommitment();
+    state = CHOOSE_TARGET;
   }
   
   //============================================
@@ -3395,24 +3477,14 @@ void updateSensors() {
     ProxSensors[i].currVal = alpha * ProxSensors[i].currVal + (1.0 - alpha) * rawVal;
     ProxSensors[i].smoothVal = velocityAlpha * ProxSensors[i].smoothVal + (1.0 - velocityAlpha) * rawVal;
 
-    const float range = (float)(ProxRange[i][0] - ProxRange[i][1]);
     float currentDistance = 0.0f;
-    if (range != 0.0f) {
-      // Distance calculation: Uses RAW sensor value for accurate calibration
-      // ProxRange[0] = high reading = target at START (close to sensor)
-      // ProxRange[1] = low reading = target at IMPACT (far from sensor)
-      // Formula: 0% at start (rawVal=high), 100% at impact (rawVal=low)
-      // normalized = (ProxRange[0] - rawVal) / range
-      float normalized = (float)(ProxRange[i][0] - rawVal) / range;
-      currentDistance = constrain(normalized, 0.0f, 1.0f);
-
-      // CRITICAL: Make L2/L3 appear 12% further through lane to prioritize them earlier
-      // This makes them appear closer to impact than they really are
-      if (i == 1 || i == 2) {  // L2 or L3 (short lanes)
-        currentDistance = currentDistance * 1.12f;  // Make appear 12% further through lane
-        currentDistance = constrain(currentDistance, 0.0f, 1.0f);
-      }
-    }
+    // Distance calculation: Uses RAW sensor value for accurate calibration
+    // ProxRange[0] = high reading = target at START (close to sensor)
+    // ProxRange[1] = low reading = target at IMPACT (far from sensor)
+    // Formula: 0% at start (rawVal=high), 100% at impact (rawVal=low)
+    // normalized = (ProxRange[0] - rawVal) * proxRangeScaled (pre-multiplied with lane scaling)
+    float normalized = (float)(ProxRange[i][0] - rawVal) * proxRangeScaled[i];
+    currentDistance = constrain(normalized, 0.0f, 1.0f);
     zombieDistances[i] = currentDistance;
 
     // Derive sensor-specific noise limit rather than sharing across lanes
