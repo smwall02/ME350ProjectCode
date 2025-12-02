@@ -313,7 +313,6 @@ unsigned long lastTTIUpdate = 0;
 const unsigned long TTI_UPDATE_INTERVAL = 25;  // Lowered from 40ms for faster updates
 float prevZombieDistances[4] = {1.0, 1.0, 1.0, 1.0};
 float proxSpeeds[4] = {0, 0, 0, 0};            // Raw proximity delta per ms
-float laneTTI[4] = {99999, 99999, 99999, 99999};
 float prevSmoothProx[4] = {0, 0, 0, 0};
 int lastRawReading[4] = {0, 0, 0, 0};          // Previous raw reading for speed
 unsigned long lastRawUpdate[4] = {0, 0, 0, 0}; // Timestamp of last raw update
