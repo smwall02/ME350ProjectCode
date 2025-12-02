@@ -164,7 +164,7 @@ void loop() {
   }
 
   // Limit switch check to refresh zero
-  if (state != CALIBRATE && digitalRead(LIMIT_LEFT) == HIGH) {
+  if (state != CALIBRATE && digitalRead(LIMIT_LEFT) == LOW) {
     encoder.write(0);
     errorIntegral = 0;
   }
@@ -217,8 +217,8 @@ void handleCalibrate() {
     return;
   }
 
-  // Drive toward the left limit switch using a constant voltage
-  if (digitalRead(LIMIT_LEFT) == LOW) {
+  // Drive toward the left limit switch using a constant voltage until the switch is hit
+  if (digitalRead(LIMIT_LEFT) == HIGH) {
     setMotorVoltage(CALIBRATE_VOLTAGE);
   } else {
     stopMotor();
