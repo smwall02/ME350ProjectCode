@@ -2,6 +2,12 @@
 #include <EEPROM.h>
 
 //============================================
+// SEQUENCE STATE TYPE (must be above any auto-generated prototypes)
+//============================================
+enum SequenceState { SEQ_STATE_EMPTY = 0, SEQ_STATE_ACTIVE, SEQ_STATE_LOCKED };
+SequenceState lastSeqState = SEQ_STATE_EMPTY;
+
+//============================================
 // DEBUG OPTIMIZATION - Comment out to save flash memory
 //============================================
 // Uncomment the line below to enable debug Serial output
@@ -313,8 +319,9 @@ const unsigned long SEQUENCE_LOG_INTERVAL = 500;         // Time-based log throt
 unsigned long lastSeqRecalcTime = 0;                      // Last recalc timestamp
 unsigned long lastSeqLogTime = 0;                         // Last sequence log timestamp
 
-enum SequenceState { SEQ_STATE_EMPTY = 0, SEQ_STATE_ACTIVE, SEQ_STATE_LOCKED };
-SequenceState lastSeqState = SEQ_STATE_EMPTY;
+// Forward declarations for sequence helpers used before their definitions
+void requestSequenceRecalc(const char *reason = "", bool force = false);
+const char *sequenceStateLabel(SequenceState state);
 
 // ATTEMPTED LANES TRACKING - Prevent re-engaging lanes already attempted
 bool laneAttempted[4] = {false, false, false, false};  // Track which lanes we've already attempted
