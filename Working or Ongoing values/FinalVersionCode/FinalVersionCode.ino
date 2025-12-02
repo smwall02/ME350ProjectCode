@@ -1553,6 +1553,16 @@ void loop() {
   if (calibrationActive) {
     updateCalibration();
   }
+
+  // If our committed target starts retreating, abandon it and pick a new threat
+  if (autoMode && systemEnabled && isCommitted && committedLane >= 0 &&
+      ProxSensors[committedLane].direction == BACKWARD) {
+    laneAttempted[committedLane] = true;
+    laneAttemptTime[committedLane] = millis();
+    activeTargetIndex = -1;
+    releaseCommitment();
+    state = CHOOSE_TARGET;
+  }
   
   //============================================
   // STATE MACHINE - BATCH-BASED TARGETING
