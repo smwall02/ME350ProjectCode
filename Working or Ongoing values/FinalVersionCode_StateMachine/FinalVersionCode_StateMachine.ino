@@ -217,10 +217,14 @@ const float TARGET_ZONE_MAX = 0.40;  // Desired "comfort" zone: keep zombies und
 const unsigned long MIN_COMMITMENT_TIME = 800;  // Minimum 800ms commitment before allowing overrides
 const unsigned long TARGET_SWITCH_COOLDOWN = 1500;  // 1.5s cooldown after switching targets
 
+// Override logic is disabled by default to reduce CPU work and complexity; set to 1 to re-enable
+#define ENABLE_OVERRIDES 0
+
 const float RETREAT_CONFIRMED_DISTANCE = 0.65;  // Retreat confirmed when drops below 65% through
-const float ZOMBIE_GONE_DISTANCE = 0.08;  // Zombie gone when < 8% through (near start)
-const float L2_L3_GONE_DISTANCE = 0.05;  // L2/L3 gone when < 5% through
-const float L4_GONE_DISTANCE = 0.10;  // L4 gone when < 10% through
+// GONE = zombie has already passed the impact point / truly unreachable
+const float ZOMBIE_GONE_DISTANCE = 0.90;   // Zombie gone when > 90% through (past safe hit window)
+const float L2_L3_GONE_DISTANCE = 0.92;    // L2/L3 gone when > 92% through
+const float L4_GONE_DISTANCE = 0.88;       // L4 gone when > 88% through
 
 //============================================
 // DYNAMIC CALIBRATION
@@ -1285,6 +1289,7 @@ void loop() {
       }
     }
 
+#if ENABLE_OVERRIDES
     //============================================
     // EMERGENCY OVERRIDE CHECK
     // Interrupts normal execution for critical threats
@@ -1296,12 +1301,12 @@ void loop() {
     // CRITICAL FIX: Add cooldown after overrides to prevent rapid switching
     // After an override, wait at least 2 seconds before allowing another override
     const unsigned long OVERRIDE_COOLDOWN = 2000;  // 2 second cooldown after override (increased to prevent loops)
-    
+
     // CRITICAL FIX: Allow override checks while dwelling - but still respect cooldown
     // While dwelling, we need to continuously check for critical threats (especially short lanes)
     // Note: isDwelling already declared above in emergency override section
     bool canCheckOverride = false;
-    
+
     // Always respect cooldown period after override
     if (timeSinceOverride < OVERRIDE_COOLDOWN) {
       canCheckOverride = false;  // Still in cooldown - don't check overrides
@@ -1311,7 +1316,7 @@ void loop() {
     } else {
       // While moving: Use cooldown to prevent excessive switching
       canCheckOverride = (timeSinceOverride >= 1000) && (millis() - overrideCheckTime >= 150);
-      
+
       // Don't check overrides while actively moving unless we've been moving for a while
       // OPTIMIZATION: Use cached encoder position
       long currentPos = cachedEncoderPos;
@@ -1322,7 +1327,7 @@ void loop() {
         canCheckOverride = false;  // Don't override while actively moving unless 1.5s has passed
       }
     }
-    
+
     if (canCheckOverride) {
       overrideCheckTime = millis();
 
@@ -1459,7 +1464,7 @@ void loop() {
     // Prevent override loops by checking if we're already committed to the override lane
     if (overrideLane >= 0 && shouldOverride(overrideLane) && overrideLane != committedLane) {
       int previousLane = committedLane;
-      
+
       // CRITICAL: Prevent override loops - don't override if we just overrode to this lane recently
       if (overrideLane == lastOverrideLane && timeSinceOverride < 5000) {
         // Just overrode to this lane within 5 seconds - skip to prevent loop (increased from 3s)
@@ -1479,7 +1484,7 @@ void loop() {
 
           releaseCommitment();
           commitToTarget(overrideLane);
-          
+
           if (isCommitted) {
             lastOverrideCommit = millis();
             lastOverrideLane = overrideLane;  // Track which lane we overrode TO, not FROM
@@ -1494,10 +1499,11 @@ void loop() {
         }
       }
     }
+#endif
     //============================================
     // NORMAL EXECUTION
     //============================================
-    else if (isCommitted && committedLane >= 0) {
+    if (isCommitted && committedLane >= 0) {
       // Ensure we're targeting the committed lane
       // CRITICAL: Don't change desiredPosition during calibration
       if (activeTargetIndex != committedLane && !calibrationActive) {
@@ -1712,6 +1718,7 @@ void dwellAtTarget() {
     return;
   }
   
+#if ENABLE_OVERRIDES
   // CRITICAL FIX: Check for emergency overrides while dwelling
   // This prevents missing short lane targets (L2/L3) that are getting close while dwelling at long lanes
   // ANTI-OSCILLATION: Check minimum commitment time and cooldown before allowing overrides
@@ -1892,7 +1899,8 @@ void dwellAtTarget() {
       return;  // Exit dwell immediately to handle override
     }
   }
-  
+#endif
+
   // CRITICAL: Safety check - ensure arrivalTime is valid (avoid overflow)
   unsigned long dwellTime = (arrivalTime > 0) ? (millis() - arrivalTime) : 0;
   
@@ -2129,7 +2137,7 @@ void dwellAtTarget() {
   //--------------------------------------------
   // EXIT CONDITION 3: ZOMBIE COMPLETELY GONE
   // CRITICAL FIX: Much more conservative - only mark as GONE if:
-  // 1. Target is beyond lane-specific threshold (85-90% of lane)
+  // 1. Target is beyond lane-specific threshold (~88-92% of lane)
   // 2. Target has been consistently far for extended time
   // 3. Target is moving backward (retreating past the threshold)
   // For short lanes (L2/L3), use even higher threshold (90%+)
@@ -2148,7 +2156,7 @@ void dwellAtTarget() {
   }
   
   // CRITICAL FIX: Much stricter validation - only mark as GONE if zombie is TRULY unreachable
-  // 1. Target must be beyond very conservative threshold (85-90% of lane)
+  // 1. Target must be beyond very conservative threshold (88-92% of lane)
   // 2. Target must be moving backward (retreating past threshold) OR consistently far for extended time
   // 3. Must have dwelt long enough to confirm (prevents false GONE on arrival)
   // 4. For short lanes (L2/L3), require even higher threshold (90%+) since they're critical
@@ -2472,7 +2480,7 @@ void updateLaneStates() {
       nextState = LANE_RECOVERING;
     } else if (dir == FORWARD) {
       nextState = LANE_APPROACHING;
-    } else if (dist <= safeThreshold) {
+    } else if (dist >= safeThreshold) {
       nextState = LANE_SAFE;
     }
 
@@ -2783,8 +2791,8 @@ void updateSensors() {
     }
     
     // NOISE FILTER: Ignore targets below 15% that aren't clearly forward
-    // This prevents false locks on sensor noise
-    if (currentDistance > 0.85f && ProxSensors[i].direction == FORWARD) {
+    // This prevents false locks on sensor noise near the start of the lane
+    if (currentDistance < 0.15f && ProxSensors[i].direction == FORWARD) {
       // Very low signal - require stronger evidence
       if (ProxSensors[i].forwardCount < 3) {
         ProxSensors[i].direction = STOPPED;
