@@ -297,6 +297,7 @@ int targetSequence[SEQUENCE_SIZE] = {-1, -1, -1, -1};  // Ordered list of lanes 
 int sequenceIndex = 0;                    // Current position in sequence
 bool sequenceActive = false;              // Is a sequence currently active?
 bool sequenceLocked = false;              // Is sequence locked? (stick to sequence)
+int laneChangeCounter = 0;                // Track lane changes to force periodic recalcs
 
 // ATTEMPTED LANES TRACKING - Prevent re-engaging lanes already attempted
 bool laneAttempted[4] = {false, false, false, false};  // Track which lanes we've already attempted
@@ -605,12 +606,13 @@ const unsigned long MIN_COMMIT_INTERVAL = 100;  // Minimum 100ms between commits
 
 void commitToTarget(int lane) {
   if (lane < 0 || lane > 3) return;
-  
+
   // Rate limit to prevent spam
   if (millis() - lastCommitTime < MIN_COMMIT_INTERVAL) {
     return;
   }
-  
+
+  int previousLane = committedLane;
   float dist = zombieDistances[lane];
 
   if (ProxSensors[lane].direction == BACKWARD) return;
@@ -714,6 +716,16 @@ void commitToTarget(int lane) {
   DBG_PRINT(F(" @"));
       DBG_PRINT((int)(zombieDistances[lane] * 100));
   DBG_PRINTLN(F("%"));
+
+  // Force a batch refresh every third lane change to keep sequences honest
+  if (previousLane >= 0 && previousLane != lane) {
+    laneChangeCounter++;
+    if (laneChangeCounter >= 3) {
+      calculateNewSequence();
+      logSequence("recalc/3rd-change");
+      laneChangeCounter = 0;
+    }
+  }
 }
 
 //============================================
@@ -3657,14 +3669,34 @@ void runPIDController() {
   if (calibrationActive) {
     desiredPosition = 0;
   }
-  
+
   // OPTIMIZATION: Use cached encoder position
   long currentPos = cachedEncoderPos;
   float positionError = desiredPosition - currentPos;
-  
+
+  // Softened hop for adjacent lanes to reduce gear stress
+  bool adjacentHop = (isCommitted && committedLane >= 0 && previousTargetIndex >= 0 &&
+                      abs(committedLane - previousTargetIndex) == 1);
+  float voltageLimit = SUPPLY_VOLTAGE;
+  float frictionScale = 1.0f;
+  if (adjacentHop) {
+    long hopDistance = labs(targetPositions[committedLane] - targetPositions[previousTargetIndex]);
+    // For small adjacent moves, trim voltage and friction compensation
+    if (hopDistance < 350) {
+      voltageLimit = min(voltageLimit, SUPPLY_VOLTAGE * 0.75f);
+      frictionScale = 0.75f;
+
+      // As we get close to the target, soften further to avoid overshoot and tooth skipping
+      if (abs(positionError) < 200) {
+        voltageLimit = min(voltageLimit, SUPPLY_VOLTAGE * 0.60f);
+        frictionScale = 0.65f;
+      }
+    }
+  }
+
   int effectiveBand = (activeTargetIndex == 3) ? 12 : TARGET_BAND;
   int effectiveVelThreshold = (activeTargetIndex == 3) ? 50 : 80;
-  
+
   if (abs(positionError) <= effectiveBand && abs(motorVelocity) < effectiveVelThreshold) {
     stopMotor(); errorIntegral = 0; return;
   }
@@ -3674,15 +3706,15 @@ void runPIDController() {
   
   float velocityError = 0 - motorVelocity;
   float voltage = KP * positionError + KI * errorIntegral + KD * velocityError;
-  
-  if (positionError < -5) voltage -= FRICTION_LEFT;
-  else if (positionError > 5) voltage += FRICTION_RIGHT;
-  
-  if (abs(voltage) > SUPPLY_VOLTAGE) {
+
+  if (positionError < -5) voltage -= FRICTION_LEFT * frictionScale;
+  else if (positionError > 5) voltage += FRICTION_RIGHT * frictionScale;
+
+  if (abs(voltage) > voltageLimit) {
     errorIntegral -= positionError * (float)executionDuration / 1000000.0;
-    voltage = constrain(voltage, -SUPPLY_VOLTAGE, SUPPLY_VOLTAGE);
+    voltage = constrain(voltage, -voltageLimit, voltageLimit);
   }
-  
+
   setMotorVoltage(voltage);
 }
 
