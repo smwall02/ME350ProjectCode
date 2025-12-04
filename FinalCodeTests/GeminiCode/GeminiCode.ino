@@ -523,6 +523,7 @@ void handleSerial() {
       Serial.println(F("AUTO START (Hardcoded)"));
       autoMode = true;
       systemEnabled = true;
+      homeToLeftLimit();
       state = CHOOSE_TARGET;
       break;
       

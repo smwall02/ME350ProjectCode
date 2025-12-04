@@ -116,7 +116,7 @@ long previousPosition = WAIT_POSITION;  // Track where we came from for correcti
 
 // Dwell timing
 unsigned long arrivalTime = 0;
-const unsigned long DWELL_TIME_MS = 250;  // Fixed time to stay at target
+const unsigned long DWELL_TIME_MS = 450;  // Fixed time to stay at target
 
 // Correction for approach direction (accounts for mechanical slop)
 const int APPROACH_CORRECTION = 3;  // Encoder counts to overshoot
@@ -682,6 +682,7 @@ void handleSerial() {
       autoMode = true;
       systemEnabled = true;
       activeTarget = -1;
+      homeToLeftLimit();
       state = CHOOSE_TARGET;
       break;
       

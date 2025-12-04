@@ -117,7 +117,7 @@ long previousPosition = WAIT_POSITION;  // Track where we came from for correcti
 // Dwell timing
 unsigned long arrivalTime = 0;
 const unsigned long DWELL_TIMEOUT_MS = 1000;
-const unsigned long BACKWARD_CONFIRM_MS = 150;
+const unsigned long BACKWARD_CONFIRM_MS = 50;
 unsigned long backwardStartTime = 0;
 
 // Correction for approach direction (accounts for mechanical slop)
@@ -708,6 +708,7 @@ void handleSerial() {
       autoMode = true;
       systemEnabled = true;
       activeTarget = -1;
+      homeToLeftLimit();
       state = CHOOSE_TARGET;
       break;
       

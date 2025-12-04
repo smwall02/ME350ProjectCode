@@ -55,9 +55,14 @@ const int STOPPED = 0;
 //============================================
 // TARGET POSITIONS (encoder counts)
 //============================================
-long targetPositions[4] = {-73, -341, -594, -1200};
+constexpr long LANE3_BASE_POS = -605;
+constexpr float LANE3_REDUCTION = 0.90f;
+constexpr long LANE3_ADJUSTED_POS = (long)(LANE3_BASE_POS * LANE3_REDUCTION);  // 10% shorter lane 3
+
+long targetPositions[4] = {-101, -357, LANE3_ADJUSTED_POS, -1253};
 const long WAIT_POSITION = -605;
 const int TARGET_BAND = 5;
+const unsigned long TARGET_WAIT_MS = 350;  // Simple dwell timer (ms)
 
 //============================================
 // SENSOR CALIBRATION
@@ -65,10 +70,10 @@ const int TARGET_BAND = 5;
 // [1] = value at 0% (end of lane, near photosensor - LOW reading)
 //============================================
 int ProxRange[4][2] = {
-  {615, 88},   // Lane 1
-  {634, 124},  // Lane 2
-  {622, 147},  // Lane 3
-  {590, 80}    // Lane 4
+  {618, 78},   // Lane 1 (from captured logs)
+  {650, 110},  // Lane 2
+  {636, 139},  // Lane 3
+  {600, 70}    // Lane 4
 };
 
 //============================================
@@ -95,30 +100,35 @@ struct ProxSensor {
   unsigned long prevTime;
   int pin;
   int direction;
+  float velocity;
+  float prevPosition;
+  unsigned long velTime;
 };
 
 ProxSensor sensors[4];
 float zombiePosition[4];  // 0-100 scale (0 = end of lane, 100 = start)
 
-const float ALPHA = 0.92;
-const int STOP_TIMEOUT_MS = 150;
-const int NOISE_LIMIT = 10;
-const int DIR_CONFIRM_COUNT = 3;
+const float ALPHA = 0.85;
+const int STOP_TIMEOUT_MS = 100;
+const int NOISE_LIMIT = 8;
+const int DIR_CONFIRM_COUNT = 2;
 int dirForwardCount[4] = {0, 0, 0, 0};
 int dirBackwardCount[4] = {0, 0, 0, 0};
 
 //============================================
 // TARGETING
 //============================================
+const float DANGER_POSITION = 25.0;
+const float ACTIVE_THRESHOLD = 85.0;
+const float POSITION_WEIGHT = 1.0;
+const float VELOCITY_WEIGHT = 0.5;
+
 int activeTarget = -1;
 long desiredPosition = WAIT_POSITION;
 long previousPosition = WAIT_POSITION;  // Track where we came from for correction
 
 // Dwell timing
 unsigned long arrivalTime = 0;
-const unsigned long DWELL_TIMEOUT_MS = 1000;
-const unsigned long BACKWARD_CONFIRM_MS = 150;
-unsigned long backwardStartTime = 0;
 
 // Correction for approach direction (accounts for mechanical slop)
 const int APPROACH_CORRECTION = 3;  // Encoder counts to overshoot
@@ -173,6 +183,9 @@ void setup() {
     sensors[i].prevVal = sensors[i].currVal;
     sensors[i].prevTime = millis();
     sensors[i].direction = STOPPED;
+    sensors[i].velocity = 0;
+    sensors[i].prevPosition = 50.0;
+    sensors[i].velTime = millis();
   }
   
   stopMotor();
@@ -191,6 +204,7 @@ void loop() {
   computeMotorVelocity();
   updateSensors();
   calculatePositions();
+  calculateZombieVelocities();
   
   // Update calibration if active
   if (calibrationActive) {
@@ -235,10 +249,7 @@ void loop() {
   }
   
   //--- STATUS OUTPUT ---
-  if (autoMode && (millis() - lastPrintTime >= 250)) {
-    lastPrintTime = millis();
-    printStatus();
-  }
+  // Auto-mode logging removed per request
 }
 
 //============================================
@@ -449,37 +460,101 @@ void calculatePositions() {
 }
 
 //============================================
+// ZOMBIE VELOCITY + URGENCY HELPERS
+//============================================
+void calculateZombieVelocities() {
+  unsigned long now = millis();
+  const unsigned long VEL_INTERVAL = 50;
+  
+  for (int i = 0; i < 4; i++) {
+    if (now - sensors[i].velTime >= VEL_INTERVAL) {
+      float dt = (now - sensors[i].velTime) / 1000.0;
+      if (dt > 0) {
+        float newVel = (zombiePosition[i] - sensors[i].prevPosition) / dt;
+        sensors[i].velocity = 0.7f * sensors[i].velocity + 0.3f * newVel;
+      }
+      sensors[i].prevPosition = zombiePosition[i];
+      sensors[i].velTime = now;
+    }
+  }
+}
+
+float calculateUrgency(int lane) {
+  float pos = zombiePosition[lane];
+  float vel = sensors[lane].velocity;
+  float urgency = pos * POSITION_WEIGHT;
+  
+  if (vel < -5.0f) {
+    float timeToEnd = pos / (-vel);
+    urgency += timeToEnd * VELOCITY_WEIGHT * 10.0f;
+  } else if (vel > 5.0f) {
+    urgency += 50.0f;
+  } else {
+    urgency += 20.0f;
+  }
+  
+  if (pos < DANGER_POSITION) {
+    urgency -= 15.0f;
+  }
+  
+  return urgency;
+}
+
+long calculatePrePosition() {
+  float weightedSum = 0;
+  float totalWeight = 0;
+  
+  for (int i = 0; i < 4; i++) {
+    float weight = 0;
+    
+    if (zombiePosition[i] < 95.0f) {
+      weight = (100.0f - zombiePosition[i]) / 100.0f;
+      if (sensors[i].direction == FORWARD) {
+        weight *= 2.0f;
+      }
+    }
+    
+    if (weight > 0) {
+      weightedSum += targetPositions[i] * weight;
+      totalWeight += weight;
+    }
+  }
+  
+  if (totalWeight > 0) {
+    return (long)(weightedSum / totalWeight);
+  }
+  
+  return WAIT_POSITION;
+}
+
+//============================================
 // STATE: CHOOSE TARGET
 // Find the forward-moving zombie with lowest position (furthest down lane)
 //============================================
 void chooseTarget() {
   int bestLane = -1;
-  float lowestPosition = 101.0;
+  float bestUrgency = 9999.0f;
   
   for (int i = 0; i < 4; i++) {
-    if (sensors[i].direction == FORWARD) {
-      if (zombiePosition[i] < lowestPosition) {
-        lowestPosition = zombiePosition[i];
-        bestLane = i;
+    if (zombiePosition[i] < ACTIVE_THRESHOLD) {
+      if (sensors[i].direction == FORWARD || zombiePosition[i] < DANGER_POSITION) {
+        float urgency = calculateUrgency(i);
+        if (urgency < bestUrgency) {
+          bestUrgency = urgency;
+          bestLane = i;
+        }
       }
     }
   }
   
   if (bestLane >= 0) {
     activeTarget = bestLane;
-    previousPosition = encoder.read();  // Save where we're coming from
+    previousPosition = encoder.read();
     desiredPosition = targetPositions[bestLane];
-    
-    Serial.print(F("TARGET L"));
-    Serial.print(bestLane + 1);
-    Serial.print(F(" @ "));
-    Serial.print(lowestPosition, 0);
-    Serial.println(F("%"));
-    
     state = MOVE_TO_TARGET;
   } else {
     activeTarget = -1;
-    desiredPosition = WAIT_POSITION;
+    desiredPosition = calculatePrePosition();
   }
 }
 
@@ -507,18 +582,8 @@ void moveToTarget() {
     desiredPosition = correctedPosition;
     
     arrivalTime = millis();
-    backwardStartTime = 0;
     
-    if (activeTarget >= 0) {
-      Serial.print(F("ARRIVED L"));
-      Serial.print(activeTarget + 1);
-      Serial.print(F(" (corr:"));
-      Serial.print(correctedPosition);
-      Serial.println(F(")"));
-      state = DWELL;
-    } else {
-      state = CHOOSE_TARGET;
-    }
+    state = (activeTarget >= 0) ? DWELL : CHOOSE_TARGET;
   }
 }
 
@@ -526,41 +591,14 @@ void moveToTarget() {
 // STATE: DWELL
 //============================================
 void dwell() {
-  unsigned long now = millis();
-  unsigned long dwellTime = now - arrivalTime;
-  
-  // Check if zombie reversed (HIT!)
-  if (sensors[activeTarget].direction == BACKWARD) {
-    if (backwardStartTime == 0) {
-      backwardStartTime = now;
-    }
-    if (now - backwardStartTime >= BACKWARD_CONFIRM_MS) {
-      Serial.print(F("HIT L"));
-      Serial.println(activeTarget + 1);
-      activeTarget = -1;
-      state = CHOOSE_TARGET;
-      return;
-    }
-  } else {
-    backwardStartTime = 0;
-  }
-  
-  // Check if zombie stopped
-  if (sensors[activeTarget].direction == STOPPED && dwellTime >= 500) {
-    Serial.print(F("STOPPED L"));
-    Serial.println(activeTarget + 1);
-    activeTarget = -1;
+  if (activeTarget < 0) {
     state = CHOOSE_TARGET;
     return;
   }
   
-  // Timeout
-  if (dwellTime >= DWELL_TIMEOUT_MS) {
-    Serial.print(F("TIMEOUT L"));
-    Serial.println(activeTarget + 1);
+  if (millis() - arrivalTime >= TARGET_WAIT_MS) {
     activeTarget = -1;
     state = CHOOSE_TARGET;
-    return;
   }
 }
 
@@ -727,11 +765,13 @@ void handleSerial() {
     case 'G': case 'g':
     case 'T': case 't':
     case 'Y': case 'y':
-      Serial.println(F("AUTO START + CALIBRATION"));
+      Serial.println(F("AUTO START"));
       autoMode = true;
       systemEnabled = true;
       activeTarget = -1;
-      startCalibration();  // This sets state = IDLE and desiredPosition = 0
+      calibrationActive = false;
+      state = CHOOSE_TARGET;
+      desiredPosition = WAIT_POSITION;
       break;
       
     case 'S': case 's':
@@ -779,26 +819,7 @@ void handleSerial() {
       break;
       
     case 'X': case 'x':
-      // Show calibration status
-      Serial.println(F("=== CALIBRATION STATUS ==="));
-      for (int i = 0; i < 4; i++) {
-        Serial.print(F("L"));
-        Serial.print(i + 1);
-        Serial.print(F(": Range["));
-        Serial.print(ProxRange[i][0]);
-        Serial.print(F(","));
-        Serial.print(ProxRange[i][1]);
-        Serial.print(F("] Raw="));
-        Serial.print((int)sensors[i].currVal);
-        Serial.print(F(" Pos="));
-        Serial.print(zombiePosition[i], 0);
-        Serial.println(F("%"));
-      }
-      if (calibrationActive) {
-        Serial.print(F("Calibrating... "));
-        Serial.print((millis() - calibrationStartTime) / 1000);
-        Serial.println(F("s"));
-      }
+      printStatus();
       break;
       
     case 'R': case 'r':
@@ -877,12 +898,12 @@ void printCurrentSettings() {
 
 void printHelp() {
   Serial.println(F("=== COMMANDS ==="));
-  Serial.println(F("  G/T/Y - Start auto + calibration"));
+  Serial.println(F("  G/T/Y - Start auto"));
   Serial.println(F("  S - Stop"));
   Serial.println(F("  H - Home to limit"));
   Serial.println(F("  1-4 - Move to lane"));
   Serial.println(F("  C1-C4 - Capture lane position"));
-  Serial.println(F("  X - Show calibration status"));
+  Serial.println(F("  X - Show status"));
   Serial.println(F("  R - Raw sensor values"));
   Serial.println(F("  P - Print settings"));
   Serial.println(F("  W - Save to EEPROM"));
